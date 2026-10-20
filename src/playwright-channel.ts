@@ -37,8 +37,30 @@ import {
   type ManagedBrowserConnection,
 } from './browser-shared.ts'
 
-/** 频控 toast / 实时增量的轮询间隔。 */
-const POLL_INTERVAL_MS = 800
+/**
+ * 实时增量轮询间隔。
+ *
+ * 这个轮询只读页面里的 `window.__dshWebCapture`（一次 evaluate、几个字段），
+ * 不产生任何网络请求，也不碰 DOM 样式计算，所以可以压到 250ms：
+ * 思考文本几乎跟着网页同步出现，而不是原来 800ms 一跳的“一卡一卡”。
+ */
+const PROGRESS_POLL_MS = 250
+/**
+ * 频控 toast 检测间隔。
+ *
+ * 它要遍历大量 DOM 元素并逐个读 computed style，开销比增量轮询高一个量级，
+ * 因此与增量轮询拆开：保持 800ms 低频，避免高频扫描把页面拖慢。
+ */
+const RATE_LIMIT_POLL_MS = 800
+/**
+ * 从“按下发送”到“看到 HTTP 响应头”的等待上限。
+ *
+ * 网页版正常 1~3 秒就会回响应头；等满 3 分钟还没有，说明消息根本没发出去
+ *（人工发送模式下忘了点、页面弹了遮挡层）或站点异常。
+ * 原来这里直接吃 `streamIdleTimeoutMs`（默认 600 秒）——用户看到的就是
+ * “卡住十分钟、不会重来”。这里压到 3 分钟并给出准确定位，生成阶段不受影响。
+ */
+const SEND_ACK_TIMEOUT_MS = 180_000
 /** 页面网络镜像保留的最近请求数。 */
 const CAPTURE_KEEP = 20
 /**
@@ -51,6 +73,43 @@ const INLINE_UPLOAD_LIMIT_BYTES = 45 * 1024 * 1024
 const ATTACHMENT_PREVIEW_SELECTOR = '.ds-animated-size-item'
 /** 增量里的原始流特征（SSE 帧 / DeepSeek 网页协议字段），出现即说明捕获错了流。 */
 const POLLUTION_PATTERN = /(^|\n)\s*(event:\s*\w+|data:\s*\{)|request_message_id/
+
+/**
+ * 把多条网页流的解析结果按时间顺序合并成一条累计文本。
+ *
+ * 一轮生成里网页可能产生多条对话流：断线重连、超时重发、思考流与正文流分成
+ * 两条连接。只取最后一条会让前半段（通常是思考）凭空消失——这正是“思考到一半
+ * 就没动静、而网页还在输出”的直接原因。简单首尾相接又会把重发的前缀重复一遍，
+ * 所以这里做单调合并：
+ * - 新片以已合并内容开头 → 它是超集，直接替换；
+ * - 新片是已合并内容的前缀 → 重复内容，跳过；
+ * - 其余情况 → 视为真正的新内容追加。
+ */
+export function mergeMonotonic(pieces: readonly string[]): string {
+  let merged = ''
+  for (const piece of pieces) {
+    if (!piece) continue
+    if (merged.length === 0) { merged = piece; continue }
+    if (piece.startsWith(merged)) { merged = piece; continue }
+    if (merged.startsWith(piece)) continue
+    merged += piece
+  }
+  return merged
+}
+
+/**
+ * 从“累计文本”里取出相对上一条已发内容的新增量。
+ *
+ * 累计文本本应单调增长；一旦不是扩展关系（协议变化、流被截断），说明 diff
+ * 失去意义，此时返回空串只对齐基线，宁可少发一批增量也不发错的内容。
+ * 返回空串的另一个含义是“确实没有新内容”，调用方据此直接跳过。
+ */
+export function takeDelta(current: string, emitted: string, kind: 'text' | 'reasoning'): string {
+  if (current === emitted) return ''
+  if (current.startsWith(emitted)) return current.slice(emitted.length)
+  console.warn(`[deepseek-web] 实时${kind === 'text' ? '正文' : '思考'}累计文本非单调增长，已对齐基线（本拍不发增量）。`)
+  return ''
+}
 
 interface ChatCompletionResponse {
   url: string
@@ -999,10 +1058,14 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       if (response.request().method() !== 'POST') return false
       if (!matchesCompletionUrl(response.url())) return false
       return true
-    }, { timeout: this.options.config.streamIdleTimeoutMs }).then(async response => {
+    }, { timeout: Math.min(this.options.config.streamIdleTimeoutMs, SEND_ACK_TIMEOUT_MS) }).then(async response => {
       await this.markPageStatus(page, request.purpose ? `[dsh 内部辅助：${request.purpose} 生成中]` : '[dsh 网页生成中]').catch(() => {})
-      const interrupted = await response.finished().then(error => error !== null, () => true)
-      const body = await response.body().catch(() => '')
+      // finished() 与 body() 并行：body() 内部本来就要等流结束，
+      // 串行 await 等于把“等流结束”做两遍，白多一次往返。
+      const [interrupted, body] = await Promise.all([
+        response.finished().then(error => error !== null, () => true),
+        response.body().catch(() => Buffer.alloc(0)),
+      ])
       if (!waiterActive) return undefined
       return {
         url: response.url(),
@@ -1028,8 +1091,8 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       if (request.signal.aborted) abortListener()
     })
     void aborted.catch(() => {})
-    let progressTimer: NodeJS.Timeout | undefined
-    let toastTimer: NodeJS.Timeout | undefined
+    let progressTimer: ReturnType<typeof setInterval> | undefined
+    let toastTimer: ReturnType<typeof setInterval> | undefined
 
     try {
       request.signal?.throwIfAborted()
@@ -1068,7 +1131,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         void hasRateLimitToast(page).then(hit => {
           if (hit) rateLimitedNow?.()
         })
-      }, POLL_INTERVAL_MS)
+      }, RATE_LIMIT_POLL_MS)
 
       request.signal?.throwIfAborted()
       await editor.click()
@@ -1265,13 +1328,18 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   private async startProgressPolling(
     page: Page,
     request: BrowserTurnRequest,
-  ): Promise<NodeJS.Timeout | undefined> {
+  ): Promise<ReturnType<typeof setInterval> | undefined> {
     if (this.options.config.liveThinking !== true) return undefined
     await this.ensureCapture(page)
     const startedAt = Date.now() - 1_000
     const onProgress = request.onProgress
     let emittedText = ''
     let emittedReasoning = ''
+    /** 已结束的流不会再变，缓存解析结果，避免每 250ms 重复解析几十 KB。 */
+    const settled = new Map<number, { text: string; reasoning: string; reliable: boolean }>()
+    let failureStreak = 0
+    let failureWarned = false
+
     return setInterval(() => {
       void page.evaluate((since) => {
         const state = (window as typeof window & {
@@ -1279,22 +1347,40 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         }).__dshWebCapture
         if (!state) return undefined
         const candidates = state.entries.filter(entry => entry.at >= since && entry.body.length > 0)
-        const latest = candidates.at(-1)
-        return latest === undefined ? undefined : { body: latest.body, done: latest.done }
+        if (candidates.length === 0) return undefined
+        // 返回全部候选流而不是只返回最后一条：一轮生成可能产生多条对话流，
+        // 丢掉前面的那条，思考就会停在半截（而正文片段还在继续长）。
+        return candidates.map(entry => ({ at: entry.at, body: entry.body, done: entry.done }))
       }, startedAt).then((captured) => {
-        if (captured === undefined) return
-        const parsed = parseCompletionBody(captured.body)
-        // 门禁 1：镜像可能捕获到非对话流（状态/心跳通道）。结构化解析一无所获时
-        // parseCompletionBody 会把原始响应体当 text 兜底返回——绝不能把它灌进思考流
-        //（2026-09-25 事故：46KB 原始 SSE 被持久化进 reasoning 块，污染会话日志）。
-        if (parsed.reliable !== true) return
-        // 累计重建应当单调增长；一旦回缩（协议变化）就只对齐基线，不发负增量
-        if (parsed.text.length < emittedText.length) emittedText = parsed.text
-        const reasoning = parsed.reasoning ?? ''
-        if (reasoning.length < emittedReasoning.length) emittedReasoning = reasoning
-        const textDelta = parsed.text.length > emittedText.length ? parsed.text.slice(emittedText.length) : ''
-        const reasoningDelta = reasoning.length > emittedReasoning.length ? reasoning.slice(emittedReasoning.length) : ''
-        emittedText = parsed.text
+        failureStreak = 0
+        failureWarned = false
+        if (!captured || captured.length === 0) return
+        const texts: string[] = []
+        const reasonings: string[] = []
+        for (const entry of [...captured].sort((a, b) => a.at - b.at)) {
+          let parsed = settled.get(entry.at)
+          if (parsed === undefined) {
+            const result = parseCompletionBody(entry.body)
+            parsed = {
+              text: result.text,
+              reasoning: result.reasoning ?? '',
+              reliable: result.reliable === true,
+            }
+            // 只有已结束的流才值得缓存；还在长的流下一拍必须重新解析。
+            if (entry.done) settled.set(entry.at, parsed)
+          }
+          // 门禁 1：镜像可能捕获到非对话流（状态/心跳通道）。结构化解析一无所获时
+          // parseCompletionBody 会把原始响应体当 text 兜底返回——绝不能把它灌进思考流
+          //（2026-09-25 事故：46KB 原始 SSE 被持久化进 reasoning 块，污染会话日志）。
+          if (!parsed.reliable) continue
+          if (parsed.text) texts.push(parsed.text)
+          if (parsed.reasoning) reasonings.push(parsed.reasoning)
+        }
+        const text = mergeMonotonic(texts)
+        const reasoning = mergeMonotonic(reasonings)
+        const textDelta = takeDelta(text, emittedText, 'text')
+        const reasoningDelta = takeDelta(reasoning, emittedReasoning, 'reasoning')
+        emittedText = text
         emittedReasoning = reasoning
         if (textDelta === '' && reasoningDelta === '') return
         // 门禁 2：增量里出现 SSE 原始帧特征一律丢弃（防御性，正常解析不会出现）
@@ -1312,8 +1398,19 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         } catch (error) {
           console.warn('[deepseek-web] 实时思考流回调异常（已忽略）：', error instanceof Error ? error.message : error)
         }
-      }).catch(() => {})
-    }, POLL_INTERVAL_MS)
+      }).catch((error: unknown) => {
+        // 原来这里是静默吞掉：页面导航/崩溃时轮询一直失败却毫无提示，
+        // 用户看到的就是“思考卡住、而网页还在输出”。至少要在第一次连续失败时说一声。
+        failureStreak += 1
+        if (!failureWarned && failureStreak >= 4) {
+          failureWarned = true
+          console.warn(
+            '[deepseek-web] 实时增量读取连续失败，页面可能在导航或已失效（最终回复不受影响）：',
+            error instanceof Error ? error.message : error,
+          )
+        }
+      })
+    }, PROGRESS_POLL_MS)
   }
 
   /** 填入消息 / 首次请求：把网页窗口提到最前（受 config.focus 开关控制）。 */

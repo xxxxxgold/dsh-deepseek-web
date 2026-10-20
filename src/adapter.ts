@@ -308,10 +308,36 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       ])
       if (raced === 'progress') continue
       for (const chunk of pipe.takeAll()) yield chunk
+      if (!raced.ok) {
+        if (opened) {
+          yield { type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: reasoningText } }
+        }
+        throw raced.error
+      }
+      /*
+       * 用最终解析出的完整思考兜底，修两种“思考到一半就没动静”：
+       *
+       * 1. 通道不支持流式思考（Kimi / GLM 走完整解析）：开到“展示思考”却一个块都没有，
+       *    这里整块补上，让用户至少能在结束时看到完整思考。
+       * 2. 流式中途断了或错位（网页重连导致跨 entry 拼接错位）：以最终解析结果为准，
+       *    把缺的尾巴补上，而不是让界面停在半截。
+       */
+      if (this.config.liveThinking === true) {
+        const finalReasoning = raced.value.reasoning ?? ''
+        if (finalReasoning.length > 0 && !opened) {
+          opened = true
+          reasoningText = finalReasoning
+          yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' }
+          yield { type: 'reasoning-delta', index: reasoningIndex, text: finalReasoning }
+        } else if (finalReasoning.length > reasoningText.length && finalReasoning.startsWith(reasoningText)) {
+          const tail = finalReasoning.slice(reasoningText.length)
+          reasoningText = finalReasoning
+          yield { type: 'reasoning-delta', index: reasoningIndex, text: tail }
+        }
+      }
       if (opened) {
         yield { type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: reasoningText } }
       }
-      if (!raced.ok) throw raced.error
       return raced.value
     }
   }
