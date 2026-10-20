@@ -14,7 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Config } from './config.ts'
 import { Config as ConfigSchema, PROVIDER } from './config.ts'
 import { liveConfig } from './live-config.ts'
-import { DeepSeekWebAdapter } from './adapter.ts'
+import { DeepSeekWebAdapter, type ReadImageAttachment } from './adapter.ts'
 import { PlaywrightBrowserChannel } from './playwright-channel.ts'
 import { KimiBrowserChannel } from './kimi-channel.ts'
 import { GLMChannel } from './glm-channel.ts'
@@ -22,6 +22,49 @@ import { DeepSeekSelfReviewer, GlmReviewer, KimiReviewer } from './reviewer.ts'
 
 export const name = 'llm-deepseek-web'
 export const inject = ['llm']
+
+/** 宿主附件服务的最小形状（只用到读图）；不去依赖 dsh-attachment 的类型导出。 */
+interface AttachmentStoreLike {
+  readImage(ref: unknown): Promise<{ data: Uint8Array }>
+}
+
+/** MIME → 扩展名，仅用于给没有原文件名的图片起个可读名字。 */
+function extensionForMediaType(mediaType: string): string {
+  switch (mediaType) {
+    case 'image/jpeg': return 'jpg'
+    case 'image/webp': return 'webp'
+    case 'image/gif': return 'gif'
+    default: return 'png'
+  }
+}
+
+/**
+ * 把宿主的 AttachmentStore 绑成适配层要的读图函数。
+ *
+ * 不写进 `inject`：老宿主（0.1）没有 attachments 服务，加进必需依赖会让整个插件
+ * 不加载；改成运行时探测，拿不到就返回 undefined，图片直传自动退回文本标记。
+ */
+function bindImageReader(ctx: Context): ReadImageAttachment | undefined {
+  let store: AttachmentStoreLike | undefined
+  try {
+    store = (ctx as unknown as { attachments?: AttachmentStoreLike }).attachments
+  } catch {
+    return undefined
+  }
+  if (!store || typeof store.readImage !== 'function') {
+    console.info('[llm-deepseek-web] 宿主未提供附件服务，图片将退回文本标记。')
+    return undefined
+  }
+  const resolved = store
+  return async (ref) => {
+    const stored = await resolved.readImage(ref)
+    return {
+      name: ref.name ?? `image.${extensionForMediaType(ref.mediaType)}`,
+      mimeType: ref.mediaType,
+      data: stored.data,
+    }
+  }
+}
 
 export { ConfigSchema as Config }
 
@@ -58,7 +101,7 @@ export function apply(ctx: Context, config: Config): void {
     console.info(
       `[llm-deepseek-web] 通道 token 累计：${totals.totalTokens} tokens / ${totals.usageTurns} 轮`,
     )
-  })
+  }, bindImageReader(ctx))
 
   ctx.effect(() => {
     const unregister = ctx.llm.registerAdapter([PROVIDER], adapter)
@@ -73,6 +116,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.logger.info(
     `[llm-deepseek-web] provider "${PROVIDER}" registered`
     + ` (browser=${live.browser}, sendMode=${live.sendMode},`
-    + ` review=${live.review.enabled ? live.review.provider : 'off'})`,
+    + ` review=${live.review.enabled ? live.review.provider : 'off'},`
+    + ` imageUpload=${live.enableImageUpload ? 'on' : 'off'})`,
   )
 }

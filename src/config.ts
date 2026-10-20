@@ -128,6 +128,27 @@ export interface Config {
   liveThinking: boolean
   /** 最大回复字节数保护。 */
   maxReplyBytes: number
+  /**
+   * 图片直传：把 Harness 的 image 块真正上传到网页输入框，让网页端原生识图。
+   * 关闭时退回旧行为（图片降级成 `[附图 N: 文件名]` 文本标记，模型看不到图）。
+   */
+  enableImageUpload: boolean
+  /**
+   * 单轮最多上传几张图。网页端实测可收 50 张，但并发上传会同时打满多个
+   * `upload_file` 请求、更容易触发账号级频控，默认 4 张。
+   */
+  maxImagesPerTurn: number
+  /**
+   * 等待网页端把图片解析到 `SUCCESS` 的超时（毫秒）。
+   * 网页端状态机为 PENDING → PARSING → SUCCESS，大图解析可能接近一分钟。
+   */
+  uploadTimeoutMs: number
+  /**
+   * 上传失败时的策略：
+   * - `fallback-text`：退回文本标记继续本轮（模型知道"有图但没看到"）；
+   * - `abort`：直接抛错，宁可停下也不让模型在缺图的情况下猜。
+   */
+  uploadOnError: 'fallback-text' | 'abort'
   /** 多久注入一次控制协议快照（按轮数）。 */
   protocolRefreshEvery: number
   /** 是否每一轮都注入协议与工具清单（默认开，防止网页会话上下文丢失后模型退化成普通聊天）。 */
@@ -225,6 +246,11 @@ const schema = z.object({
   }).default({}),
   liveThinking: markVolatile(z.boolean().default(false)),
   maxReplyBytes: z.number().step(1).min(1024).default(4 * 1024 * 1024),
+  // 图片直传：默认开（本机单人自用，装完即可像网页版一样直接发图）；关闭即退回纯文本标记。
+  enableImageUpload: markVolatile(z.boolean().default(true)),
+  maxImagesPerTurn: markVolatile(z.number().step(1).min(0).max(32).default(4)),
+  uploadTimeoutMs: markVolatile(z.number().step(1).min(1_000).default(60_000)),
+  uploadOnError: markVolatile(z.union(['fallback-text', 'abort']).default('fallback-text')),
   protocolRefreshEvery: markVolatile(z.number().step(1).min(1).default(8)),
   protocolEveryRequest: markVolatile(z.boolean().default(false)),
   toolAllowlist: markVolatile(z.array(z.string()).default([

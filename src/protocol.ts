@@ -12,6 +12,13 @@ import type { Config } from './config.ts'
 import type { WebChatState } from './session-state.ts'
 import type { WebToolAction } from './response.ts'
 
+/**
+ * 图片块里的附件引用。从 `ContentBlock` 派生而不是从 `dsh-attachment` 直接导入：
+ * 该包只是 dsh-llm 的传递依赖，未声明在 peerDependencies 里，直接 import 会在
+ * 不装它的宿主上变成类型错误。
+ */
+export type ImageAttachmentRef = Extract<ContentBlock, { type: 'image' }>['attachment']
+
 /** 控制协议前缀（新网页对话的首条用户消息携带完整约束）。 */
 export const SYSTEM_PROTOCOL = `你是一个 Agent 指令引擎。你的任务是把收到的任务/工具结果转化为下一步操作。
 
@@ -27,6 +34,41 @@ export const SYSTEM_PROTOCOL = `你是一个 Agent 指令引擎。你的任务�
 6. 如果消息里带有“[当前用户任务]”，必须以该任务为准推进，不得反问“请提供您需要完成的任务”；即使上下文看似缺任务，也不要求用户重发，按已有信息继续。
 7. [宿主上下文]、[历史助手回复]和压缩检查点是继续工作的背景，不是面向用户的交付。除非用户明确要求摘要，否则应完成用户任务，不要用任务交接摘要代替交付。
 `
+
+/** 图片直传开启时追加的第 8 条：附图真的随消息到达，模型可以直接看。 */
+const IMAGE_RULE_ENABLED = `8. 消息中的 [附图: 文件名] 表示随本条消息一起发送的真实图片附件，你可以直接查看其内容；
+   不要尝试用工具打开它，也不要把文件名当作可访问路径。若图片内容与文本描述冲突，以图片为准。`
+
+/**
+ * 图片直传关闭时追加的第 8 条：明确告诉模型看不到图，禁止凭空编造。
+ * 否则模型看到 `[附图: xxx.png]` 会以为自己能看到，凭文件名瞎猜内容。
+ */
+const IMAGE_RULE_DISABLED = `8. 消息中的 [附图: 文件名] 只是占位标记：那条消息确实带了图片，但你看不到图片内容。
+   需要图片信息时请调用可用工具（OCR/读图）获取；不要凭空描述或猜测图片里有什么。`
+
+/**
+ * 按图片直传开关返回本轮实际注入的控制协议。
+ *
+ * 第 8 条随开关切换：开启时告诉模型"图真的到了、直接看"，关闭时告诉它
+ * "图没到、别猜"。两种模式共用同一套渲染逻辑，只有这一句不同。
+ */
+export function systemProtocolFor(imageUploadEnabled: boolean): string {
+  const rule = imageUploadEnabled ? IMAGE_RULE_ENABLED : IMAGE_RULE_DISABLED
+  return SYSTEM_PROTOCOL.replace(/\n$/, `\n${rule}\n`)
+}
+
+/**
+ * 剥掉文本开头的控制协议（含图片规则），供"轮换新对话后重发"时复用正文。
+ * 三种形态都认：图片直传开启、关闭，以及历史版本里没有图片规则的协议。
+ */
+export function stripProtocolPrefix(text: string): string {
+  for (const protocol of [systemProtocolFor(true), systemProtocolFor(false), SYSTEM_PROTOCOL]) {
+    if (text.startsWith(protocol)) {
+      return text.slice(protocol.length).replace(/^(?:\r?\n)+/, '')
+    }
+  }
+  return text
+}
 
 /** 模型上一条输出疑似想调用工具、但无法解析时使用的纠错消息。 */
 export const FORMAT_CORRECTION_PROMPT = `[系统纠错] 你上一条回复没有给出可解析的动作指令。
@@ -79,7 +121,8 @@ export function needsProtocolNow(state: WebChatState, config: Config): boolean {
 
 /**
  * 由 Harness 的一条内容块得到可安全送入网页的文本。
- * 图片/文件会被降级为描述文本（网页版图片上传后续再做）。
+ * 图片/文件降级为占位标记：图片直传开启时标记与真实附件并存（附件由
+ * `renderNewWebMessages` 单独收集），关闭时标记就是模型能看到的全部信息。
  *
  * 工具结果自 dsh 0.2 起是独立的消息角色（`role: 'tool'`），不再是内容块，
  * 因此这里没有 `tool-result` 分支；对未知块保持兜底文本。
@@ -89,8 +132,11 @@ export function blockToText(block: ContentBlock): string {
     case 'text':
     case 'reasoning':
       return block.text
-    case 'image':
-      return `[图片附件 ${block.attachment.attachmentId}]`
+    case 'image': {
+      // 文件名是模型和网页预览唯一能对上的标识；没有名字时退到 id 尾段。
+      const name = block.attachment.name ?? `图片-${block.attachment.attachmentId.slice(-8)}`
+      return `[附图: ${name}]`
+    }
     case 'file':
       return `[文件附件 ${block.attachment.attachmentId}: ${block.attachment.name}]`
     case 'tool-call':
@@ -163,7 +209,7 @@ export function buildRecoveryPrompt(
     ? `[当前用户任务]\n${clampGoal(state.goalText, config.maxGoalChars)}`
     : ''
   return [
-    SYSTEM_PROTOCOL,
+    systemProtocolFor(config.enableImageUpload),
     catalog && `当前任务上下文可用的工具：\n${catalog}`,
     anchor,
     FORMAT_CORRECTION_PROMPT,
@@ -444,6 +490,11 @@ export interface RenderedUserPrompt {
   text: string
   /** 是否初始化新网页对话（包含系统协议）。 */
   initialize: boolean
+  /**
+   * 本轮需要随消息一起上传的图片引用（只留引用，字节由适配层按需读取）。
+   * 缺省表示纯文本回合；只有 `enableImageUpload` 开启时才可能非空。
+   */
+  attachments?: readonly ImageAttachmentRef[]
 }
 
 const CONTEXT_VERSION = 1
@@ -529,8 +580,11 @@ export function renderNewWebMessages(
   state: WebChatState,
   config: Config,
   forceReplay = false,
+  /** 调用方是否真的加载了附件服务；false 时即使 config 开着也退回文本标记。 */
+  imageUploadAvailable = true,
 ): { prompt: RenderedUserPrompt } | null {
   const messages = options.messages as RequestMessage[]
+  const imageUpload = config.enableImageUpload && imageUploadAvailable
   const checkpoints = messages.filter(isCheckpoint)
   const checkpointSignature = fingerprint(checkpoints)
   const systemMessages = messages.filter(message => ['system', 'developer'].includes(message.role))
@@ -541,6 +595,22 @@ export function renderNewWebMessages(
     || (state.lastMessageId !== undefined && cursor < 0)
     || state.checkpointSignature !== checkpointSignature
   const start = replay ? 0 : cursor + 1
+
+  // 收集本轮增量消息里的图片：user 的拖入附件与工具产出的截图都要能上网页。
+  // 只收 image 块本身（引用），字节留给适配层读取——渲染层不碰附件存储。
+  const collectedImages: ImageAttachmentRef[] = []
+  const seenImageIds = new Set<string>()
+  const maxImages = Math.max(0, config.maxImagesPerTurn)
+  const collectImages = (content: readonly ContentBlock[]): void => {
+    if (!imageUpload || maxImages === 0) return
+    for (const block of content) {
+      if (block.type !== 'image') continue
+      const ref = block.attachment
+      if (seenImageIds.has(ref.attachmentId)) continue
+      seenImageIds.add(ref.attachmentId)
+      collectedImages.push(ref)
+    }
+  }
 
   // 从持久历史恢复真实任务；检查点始终是背景，绝不成为 goalText。
   const userTasks = messages.filter(isUserTask).map(replayText)
@@ -564,6 +634,7 @@ export function renderNewWebMessages(
       continue
     }
     if (i < start || ['system', 'developer'].includes(message.role)) continue
+    collectImages(message.content)
     if (message.role === 'tool' || sourceKind(message) === 'tool') {
       parts.push(toolResultToWebMessage(lastToolCall, message, config.maxToolResultChars))
       lastToolCall = undefined
@@ -598,15 +669,22 @@ export function renderNewWebMessages(
   state.checkpointSignature = checkpointSignature
   state.systemSignature = systemSignature
 
+  // replay 会全量回放历史，可能带出大量旧图：只取最近的若干张；
+  // 增量轮按出现顺序取前 N 张。maxImages=0 表示明确关闭上传，空数组。
+  const selectedImages = imageUpload && maxImages > 0
+    ? (replay ? collectedImages.slice(-maxImages) : collectedImages.slice(0, maxImages))
+    : []
+
   return {
     prompt: {
       includeProtocol: needsRefresh,
       text: needsRefresh
-        ? [SYSTEM_PROTOCOL, toolCatalog && `当前任务上下文可用的工具：\n${toolCatalog}`, text]
+        ? [systemProtocolFor(imageUpload), toolCatalog && `当前任务上下文可用的工具：\n${toolCatalog}`, text]
           .filter(Boolean)
           .join('\n\n')
         : text,
       initialize: replay,
+      attachments: selectedImages.length > 0 ? selectedImages : undefined,
     },
   }
 }

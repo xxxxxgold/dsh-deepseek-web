@@ -15,7 +15,7 @@ import type {
   LlmResolvedModelInfo,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import type { BrowserChannel, BrowserTurnRequest, BrowserTurnProgress, BrowserTurnResult } from './browser-channel.ts'
+import type { BrowserChannel, BrowserImageAttachment, BrowserTurnRequest, BrowserTurnProgress, BrowserTurnResult } from './browser-channel.ts'
 import type { Config, WebModelId } from './config.ts'
 import { normalizeWebModel, WEB_MODEL_CAPABILITIES, WEB_MODEL_IDS } from './config.ts'
 import type { ActionProblem, WebToolAction } from './response.ts'
@@ -36,8 +36,11 @@ import {
   buildToolCatalog,
   buildAuxiliaryPrompt,
   renderNewWebMessages,
+  stripProtocolPrefix,
+  systemProtocolFor,
   visibleToolsOf,
 } from './protocol.ts'
+import type { ImageAttachmentRef } from './protocol.ts'
 import { buildReviewEvidence } from './protocol.ts'
 import { SessionRegistry, type ChannelTokenTotals, type WebChatState } from './session-state.ts'
 import type { ReviewVerdict } from './reviewer.ts'
@@ -110,6 +113,14 @@ class TurnProgressPipe {
   }
 }
 
+/**
+ * 把一张图片引用读成通道能直接上传的字节。
+ * 由插件入口绑定到宿主的 AttachmentStore；未注入时图片直传自动降级为文本标记。
+ */
+export type ReadImageAttachment = (
+  ref: ImageAttachmentRef,
+) => Promise<{ name: string; mimeType: string; data: Uint8Array } | undefined>
+
 export class DeepSeekWebAdapter extends LlmAdapter {
   private readonly requestLock = new AsyncLock()
   private readonly replaySessions = new Set<string>()
@@ -119,18 +130,22 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   private readonly reviewer?: ReviewerLike
   /** 每轮记账后的总量回调（宿主用于把总计推送到前端展示）。 */
   private readonly onUsage?: (totals: ChannelTokenTotals) => void
+  /** 图片附件读取器；缺省表示宿主没提供附件服务，图片退回文本标记。 */
+  private readonly readImage?: ReadImageAttachment
 
   constructor(
     config: Config,
     channel: BrowserChannel,
     reviewer?: ReviewerLike,
     onUsage?: (totals: ChannelTokenTotals) => void,
+    readImage?: ReadImageAttachment,
   ) {
     super()
     this.config = config
     this.channel = channel
     this.reviewer = reviewer
     this.onUsage = onUsage
+    this.readImage = readImage
     const appDataRoot = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local')
     const defaultStateFile = config.stateFile
       ?? path.join(appDataRoot, 'DshDeepSeekWeb', 'session-state.json')
@@ -155,7 +170,9 @@ export class DeepSeekWebAdapter extends LlmAdapter {
           id,
           name: cap.label,
           description: '通过你的 DeepSeek 网页账号对话；模式（极速/专家/识图、深度思考、联网）由网页端自行选择。',
-          inputModalities: ['text'],
+          // 只在上传可用时声明 image：否则宿主会按"未知能力"照发 ImageBlock，
+          // 我们却只能把它降级成文本标记，模型会误以为看到了图。
+          inputModalities: this.config.enableImageUpload ? ['text', 'image'] : ['text'],
         }
       }),
     )
@@ -238,12 +255,10 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     console.info('[deepseek-web] 网页提示对话长度达到上限，生成任务简报并轮换新对话…')
     const brief = buildHandoffBrief(options, state)
     // 原消息若已带协议前缀则剥掉，避免与新对话首条消息里的协议重复
-    const bodyText = request.text.startsWith(SYSTEM_PROTOCOL)
-      ? request.text.slice(SYSTEM_PROTOCOL.length).replace(/^(?:\r?\n)+/, '')
-      : request.text
+    const bodyText = stripProtocolPrefix(request.text)
     const catalog = buildToolCatalog(visibleToolsOf(options, this.config), this.config.compactToolCatalog)
     const retryText = [
-      SYSTEM_PROTOCOL,
+      systemProtocolFor(this.config.enableImageUpload),
       catalog && `当前任务上下文可用的工具：\n${catalog}`,
       brief,
       bodyText,
@@ -341,6 +356,39 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * 把本轮图片引用读成可以上传的字节。
+   * 单张读失败按 `uploadOnError` 处理：`abort` 直接抛错；`fallback-text` 跳过该张，
+   * 正文里仍留着 `[附图: 文件名]` 标记，但该张确实没上去（不会假装成功）。
+   */
+  private async loadAttachments(
+    refs: readonly ImageAttachmentRef[],
+    signal?: AbortSignal,
+  ): Promise<BrowserImageAttachment[] | undefined> {
+    if (!this.readImage) return undefined
+    const loaded: BrowserImageAttachment[] = []
+    for (const ref of refs) {
+      signal?.throwIfAborted()
+      try {
+        const image = await this.readImage(ref)
+        if (image) loaded.push(image)
+      } catch (error) {
+        if (this.config.uploadOnError === 'abort') {
+          throw new LlmError(
+            `deepseek-web: 读取图片附件失败（${ref.attachmentId.slice(0, 24)}）：`
+            + `${error instanceof Error ? error.message : String(error)}`,
+            'WEB_IMAGE_READ_FAILED',
+            { cause: error },
+          )
+        }
+        console.warn(
+          `[deepseek-web] 跳过一张读不出的图片附件：${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+    return loaded.length > 0 ? loaded : undefined
+  }
+
   private checkReplyEnd(reply: BrowserTurnResult): void {
     if (reply.finishReason === 'interrupted') throw new LlmError('网页明确报告回复被中断，请重试当前任务。', 'WEB_REPLY_INTERRUPTED')
     if (reply.finishReason === 'max-tokens') throw new LlmError('网页回复达到输出上限，未作为完整交付提交，请缩小单次任务后重试。', 'WEB_REPLY_TRUNCATED')
@@ -368,7 +416,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const goalBefore = state.goalText
     const forceReplay = this.replaySessions.has(sessionId)
       || this.channel.isConversationActive?.(sessionId) === false
-    const rendered = renderNewWebMessages(options, state, this.config, forceReplay)
+    const rendered = renderNewWebMessages(options, state, this.config, forceReplay, this.readImage !== undefined)
     if (state.goalText !== goalBefore) {
       // 新的用户任务：重置审核计数
       state.reviewRoundsUsed = 0
@@ -379,6 +427,13 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       yield { type: 'finish', reason: { kind: 'stop' } }
       return
     }
+
+    // 图片直传：把本轮引用读成字节，随请求交给通道上传。
+    // 读不出时按 uploadOnError 决定抛错还是跳过（跳过则文本里仍有 [附图] 标记，
+    // 模型不会假装看过——那个标记在开关开启时不代表"已上传成功"）。
+    const attachments = rendered.prompt.attachments?.length
+      ? await this.loadAttachments(rendered.prompt.attachments, options.signal)
+      : undefined
 
     // 初始化只更新本轮快照；完整结果被消费后再提交持久状态。
     if (rendered.prompt.initialize) {
@@ -400,6 +455,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         sessionId,
         model,
         text: rendered.prompt.text,
+        attachments,
         initialize: rendered.prompt.initialize,
         autoSend,
         signal: options.signal,

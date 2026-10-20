@@ -1,5 +1,15 @@
 # 更新记录
 
+## 未发布
+
+- **新增图片直传**：消息里的图片不再被压成 `[图片附件 sha256:…]` 文本标记，而是真正放进网页输入框，由 DeepSeek 网页端自己完成上传并随消息带 `ref_file_ids`，模型直接看到原图。默认开启（`enableImageUpload`），关掉即退回文本标记。
+- 系统协议第 8 条随开关切换：开启时告诉模型「附图随本条消息到达、可以直接查看」；关闭时明确「看不到图片内容、需要时调工具、不要猜」，避免模型凭文件名编造内容。
+- 上传实现：总字节 ≤45MB 走 Playwright `setInputFiles` 内联传输，更大则落临时文件走 CDP `DOM.setFileInputFiles`（Playwright 跨进程内联有 50MB 硬上限）；等网页端把 `fetch_files` 解析到 `SUCCESS` 才输入文字并发送；同名附件幂等跳过，频控重发不会重复上传；半自动模式下附件在窗口置顶前挂好，避免用户看到输入框就回车导致本轮丢图。
+- 附件收集在渲染层完成：本轮增量消息里的 image 块去重后随 prompt 一起返回，replay 全量回放时只取最近若干张，避免重建对话时重传一大堆旧图。
+- 新增配置：`enableImageUpload`（默认开）、`maxImagesPerTurn`（默认 4）、`uploadTimeoutMs`（默认 60 秒）、`uploadOnError`（`fallback-text` 默认／`abort`），配置页可直接改。
+- 适配器 `listModels` 按开关声明 `inputModalities`（开启时含 `image`），宿主据此放行 ImageBlock；宿主没有附件服务时自动退回文本标记，不影响插件加载。
+- 新增离线回归 `tools/image-upload-check.ts`（占位文本、协议分支、收集去重与上限、增量/replay 选择），并入 `npm run test:parsers`。
+
 ## 0.2.14 — 2026-10-13
 
 - 默认工具白名单仅包含通用本地工具，移除个人 MCP 工具预设。

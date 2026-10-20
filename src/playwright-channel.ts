@@ -14,8 +14,11 @@
  */
 
 import { type Browser, type BrowserContext, type Page } from 'playwright-core'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import type { BrowserChannel, BrowserTurnRequest, BrowserTurnResult } from './browser-channel.ts'
+import type { BrowserChannel, BrowserImageAttachment, BrowserTurnRequest, BrowserTurnResult } from './browser-channel.ts'
 import type { Config, WebModelId } from './config.ts'
 import { WEB_MODEL_CAPABILITIES } from './config.ts'
 import { AsyncLock } from './async-lock.ts'
@@ -38,6 +41,14 @@ import {
 const POLL_INTERVAL_MS = 800
 /** 页面网络镜像保留的最近请求数。 */
 const CAPTURE_KEEP = 20
+/**
+ * Playwright `setInputFiles` 单次内联传输的硬上限（50MB）。
+ * 超过时必须走 CDP `DOM.setFileInputFiles`（浏览器按本地路径读文件），
+ * 否则会抛 "Cannot transfer files larger than 50Mb to a browser not co-located with the server"。
+ */
+const INLINE_UPLOAD_LIMIT_BYTES = 45 * 1024 * 1024
+/** 网页端输入框里已挂附件的预览容器。 */
+const ATTACHMENT_PREVIEW_SELECTOR = '.ds-animated-size-item'
 /** 增量里的原始流特征（SSE 帧 / DeepSeek 网页协议字段），出现即说明捕获错了流。 */
 const POLLUTION_PATTERN = /(^|\n)\s*(event:\s*\w+|data:\s*\{)|request_message_id/
 
@@ -61,6 +72,12 @@ function matchesCompletionUrl(url: string): boolean {
   return /\/chat\/completion\b/i.test(url)
     || /\/chat\/completions?$/i.test(url)
     || /\/conversation\/(chat|completion)/i.test(url)
+}
+
+/** 临时文件名：只留安全字符，保留扩展名，避免超长路径。 */
+function sanitizeFileName(name: string): string {
+  const cleaned = name.replace(/[^\w.\-\u4e00-\u9fa5]/g, '_').slice(-80)
+  return cleaned || 'image'
 }
 
 /** 从 SSE / JSON body 里抽取模型可见正文与思考内容。 */
@@ -555,6 +572,129 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
    * 返回 rate-limited，由 turn() 的重发循环接手；其余情况返回完整响应。
    * 同时把网页端的流式增量经 onProgress 回调上抛（实时思考流）。
    */
+  /**
+   * 把本轮的图片挂到网页输入框（由网页端自己完成上传并回填 `ref_file_ids`）。
+   *
+   * 顺序很重要：必须在键盘输入文本之前完成——半自动模式一把窗口置顶，用户可能
+   * 看到输入框就立刻回车；附件没挂上就发出去，本轮图片会静默丢失。
+   *
+   * 复用的两条上传路径：
+   * - 总字节 ≤ 45MB：`setInputFiles` 内联传 buffer；
+   * - 超过则先落临时文件，再走 CDP `DOM.setFileInputFiles`（浏览器按本地路径读）。
+   *
+   * 失败处理遵循 `uploadOnError`：`abort` 抛 `WEB_IMAGE_UPLOAD_FAILED`；
+   * `fallback-text` 只告警并继续，正文里的 `[附图: …]` 标记不因此变成"已上传"。
+   */
+  private async attachAttachments(page: Page, request: BrowserTurnRequest): Promise<void> {
+    const files = request.attachments ?? []
+    if (files.length === 0) return
+    const { config } = this.options
+
+    try {
+      const input = page.locator('input[type="file"]').first()
+      if (await input.count().catch(() => 0) === 0) {
+        this.handleUploadFailure(request, new Error('页面上没有找到 input[type="file"]'))
+        return
+      }
+
+      // 幂等：频控重发会再次走到这里，已挂上的同名预览不再传一遍。
+      const attached = await page
+        .locator(`${ATTACHMENT_PREVIEW_SELECTOR} img`)
+        .evaluateAll(nodes => nodes.map(node => node.getAttribute('alt') ?? ''))
+        .catch(() => [] as string[])
+      if (files.every(file => attached.includes(file.name))) {
+        console.info('[deepseek-web] 本轮图片已在输入框里，跳过重复上传。')
+        return
+      }
+
+      const before = await page.locator(ATTACHMENT_PREVIEW_SELECTOR).count().catch(() => 0)
+      // 网页端自己的上传状态机：upload_file → fetch_files（PENDING → PARSING → SUCCESS）。
+      // 预览缩略图出现只说明"文件被接住"，PARSING 完成才能发送，否则模型看不到图。
+      const parsed = page.waitForResponse(async response => {
+        if (!response.url().includes('/api/v0/file/fetch_files')) return false
+        const body = await response.json().catch(() => undefined) as
+          { data?: { biz_data?: { files?: Array<{ status?: string }> } } } | undefined
+        const list = body?.data?.biz_data?.files
+        return Array.isArray(list) && list.length > 0 && list.every(item => item.status === 'SUCCESS')
+      }, { timeout: config.uploadTimeoutMs }).then(response => response != null, () => false)
+
+      const totalBytes = files.reduce((sum, file) => sum + file.data.byteLength, 0)
+      if (totalBytes > INLINE_UPLOAD_LIMIT_BYTES) {
+        console.info(`[deepseek-web] 图片总计 ${Math.round(totalBytes / 1024 / 1024)}MB，走 CDP 路径上传。`)
+        await this.attachViaCdp(page, files)
+      } else {
+        await input.setInputFiles(files.map(file => ({
+          name: file.name,
+          mimeType: file.mimeType,
+          buffer: Buffer.from(file.data),
+        })))
+      }
+
+      const previewed = await page.waitForFunction(
+        ({ selector, count }) => document.querySelectorAll(selector).length > count,
+        { selector: ATTACHMENT_PREVIEW_SELECTOR, count: before },
+        { timeout: 15_000 },
+      ).then(() => true, () => false)
+      if (!previewed) {
+        this.handleUploadFailure(request, new Error('上传后 15 秒内没有出现附件预览'))
+        return
+      }
+
+      if (!(await parsed)) {
+        this.handleUploadFailure(request, new Error(`等待图片解析超时（${config.uploadTimeoutMs}ms）`))
+        return
+      }
+      console.info(`[deepseek-web] 已上传 ${files.length} 张图片，网页端解析完成。`)
+    } catch (error) {
+      if (error instanceof LlmError) throw error
+      this.handleUploadFailure(request, error instanceof Error ? error : new Error(String(error)))
+    }
+  }
+
+  /** 上传失败出口：按配置抛错或降级（降级只告警，不改正文，也不谎报成功）。 */
+  private handleUploadFailure(request: BrowserTurnRequest, error: Error): void {
+    if (this.options.config.uploadOnError === 'abort') {
+      throw new LlmError(
+        `deepseek-web: 图片上传失败（会话 ${request.sessionId}）：${error.message}`,
+        'WEB_IMAGE_UPLOAD_FAILED',
+        { cause: error },
+      )
+    }
+    console.warn(`[deepseek-web] 图片上传失败，本轮退回文本标记继续：${error.message}`)
+  }
+
+  /**
+   * >45MB 的图片走 CDP：先落临时文件，再让浏览器按绝对路径读。
+   * Playwright 的 `setInputFiles` 不适合大文件（跨进程传 buffer 有 50MB 硬上限）。
+   */
+  private async attachViaCdp(page: Page, files: readonly BrowserImageAttachment[]): Promise<void> {
+    const dir = await mkdtemp(path.join(tmpdir(), 'dsh-web-upload-'))
+    try {
+      const absolute: string[] = []
+      for (const [index, file] of files.entries()) {
+        const target = path.join(dir, `${index}-${sanitizeFileName(file.name)}`)
+        await writeFile(target, Buffer.from(file.data))
+        absolute.push(target)
+      }
+      const session = await page.context().newCDPSession(page)
+      try {
+        const { root } = await session.send('DOM.getDocument') as { root: { nodeId: number } }
+        const { nodeId } = await session.send('DOM.querySelector', {
+          nodeId: root.nodeId,
+          selector: 'input[type="file"]',
+        }) as { nodeId: number }
+        if (!nodeId) throw new Error('未找到 input[type="file"] 节点')
+        await session.send('DOM.setFileInputFiles', { files: absolute, nodeId })
+      } finally {
+        await session.detach().catch(() => {})
+      }
+      // 浏览器是异步读文件的：留出拷贝窗口再清理临时目录。
+      await this.sleep(3_000)
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => {})
+    }
+  }
+
   private async sendAndWait(
     page: Page,
     request: BrowserTurnRequest,
@@ -648,6 +788,10 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       // 清掉可能残留的内容
       await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
       await page.keyboard.press('Backspace')
+      // 先把图片挂上去，再打字、再发送：顺序反了（尤其半自动置顶后）用户可能
+      // 在附件还没挂好时提前回车，导致本轮图片静默丢失。
+      await this.attachAttachments(page, request)
+      request.signal?.throwIfAborted()
       await page.keyboard.insertText(request.text)
       if (page === this.page) this.conversationStarted = true
       if (autoSend) {

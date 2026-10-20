@@ -66,6 +66,9 @@ const FIELDS: readonly FieldSpec[] = [
   { path: ['model'], label: '网页版模型入口', kind: 'select', options: ['deepseek-web', 'deepseek-web-auto'] },
   { path: ['sendMode'], label: '发送模式', hint: 'manual = 每条消息填入后由你点击发送；approved 为预留。', kind: 'select', options: ['manual', 'approved'] },
   { path: ['liveThinking'], label: '显示网页思考过程', hint: '默认关闭，只返回最终正文或工具调用；开启后展示网页真实思考，不重复展示正文。此设置不改变网页的思考模式。', kind: 'boolean' },
+  { path: ['enableImageUpload'], label: '图片直传', hint: '开启后把图片附件真正上传到网页输入框，由网页端原生识图；关闭则退回 [附图] 文本标记（模型看不到图片内容）。', kind: 'boolean' },
+  { path: ['maxImagesPerTurn'], label: '单轮图片上限（张）', hint: '一轮最多上传几张图；0 表示关闭上传。', kind: 'number', min: 0, max: 32 },
+  { path: ['uploadTimeoutMs'], label: '图片解析超时（毫秒）', hint: '等待网页端把图片解析为 SUCCESS 的上限；大图可调大。', kind: 'number', min: 1000 },
   { path: ['compactionLanguage'], label: '压缩摘要语言', hint: 'task 跟随用户任务；host 保留宿主要求；zh 中文；en 英文。只调整官方压缩模板。', kind: 'select', options: ['task', 'host', 'zh', 'en'] },
 
   { path: ['rateLimit', 'enabled'], label: '频控自动重发', hint: '网页提示「发送过于频繁」时等待后自动重发同一条。', kind: 'boolean' },
