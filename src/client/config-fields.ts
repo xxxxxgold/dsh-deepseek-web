@@ -392,6 +392,27 @@ export const FIELDS: readonly FieldSpec[] = [
     max: 10,
     hint: { zh: '未通过时回注意见修正，最多这么多轮。', en: 'When review fails, send comments back for fixes, up to this many rounds.' },
   },
+  {
+    path: ['review', 'autoSend'],
+    group: 'review',
+    kind: 'boolean',
+    label: { zh: '全自动发送审核请求', en: 'Fully automatic review sending' },
+    hint: {
+      zh: '开（默认）= 全自动：填入后自动发送并确认真的发出，发不出去当场报错。关 = 半自动：只填入并聚焦审核窗口，等你自己点发送，超时同样会明确报错。',
+      en: 'On (default) = fully automatic: fill, send, and confirm it really went out; failure errors out immediately. Off = semi-automatic: fill and focus the review window, then wait for you to click send.',
+    },
+  },
+  {
+    path: ['review', 'conversationMode'],
+    group: 'review',
+    kind: 'select',
+    label: { zh: '审核对话模式', en: 'Review conversation mode' },
+    options: ['fresh', 'reuse'],
+    hint: {
+      zh: 'fresh（默认）：每次审核前新开对话，上下文干净、不会越审越慢。reuse：复用同一个对话，历史会累积，可能被上一轮结论带偏。',
+      en: 'fresh (default): open a new conversation before each review, keeping context clean and speed stable. reuse: keep one conversation, so history accumulates and can bias later rounds.',
+    },
+  },
 
   {
     path: ['rateLimit', 'enabled'],

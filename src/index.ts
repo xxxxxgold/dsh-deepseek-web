@@ -88,11 +88,16 @@ export function apply(ctx: Context, config: Config): void {
     get needsEvidence(): boolean {
       return live.review.provider !== 'deepseek-web'
     },
-    review: (evidence: { task: string; artifact: string; files: string[] }) => {
+    // 必须把第二个参数原样转发：同对话自审靠它把文本写回发起审阅的那个网页对话，
+    // 这里吞掉会导致多会话并行时自审写进子代理的页（表现为“审的内容对不上”）。
+    review: (
+      evidence: { task: string; artifact: string; files: string[] },
+      options?: { conversationSessionId?: string },
+    ) => {
       switch (live.review.provider) {
-        case 'kimi': return kimiReviewer.review(evidence)
-        case 'glm': return glmReviewer.review(evidence)
-        default: return selfReviewer.review(evidence)
+        case 'kimi': return kimiReviewer.review(evidence, options)
+        case 'glm': return glmReviewer.review(evidence, options)
+        default: return selfReviewer.review(evidence, options)
       }
     },
   }

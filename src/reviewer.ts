@@ -120,14 +120,25 @@ export class KimiReviewer {
     this.config = config
   }
 
-  /** 提交一次审核；需要用户在 Kimi 页面人工点击发送。 */
+  /**
+   * 提交一次审核。
+   *
+   * 两个配置决定行为：
+   * - `review.autoSend`：`true`（全自动，默认）自动发送并确认发出；`false`（半自动）
+   *   只填入并聚焦窗口，等你点发送。
+   * - `review.conversationMode`：`fresh`（默认）每次审核前新开对话，避免历史累积；
+   *   `reuse` 复用同一个对话。
+   */
   async review(evidence: ReviewEvidence, _options: ReviewOptions = {}): Promise<ReviewVerdict> {
     await this.channel.ensureReady()
+    const fresh = this.config.conversationMode !== 'reuse'
+    if (fresh) this.channel.resetConversationGate?.(KIMI_REVIEW_SESSION)
     const result = await this.channel.turn({
       sessionId: KIMI_REVIEW_SESSION,
       model: 'kimi-web',
       text: buildReviewPrompt(evidence, this.config.maxEvidenceChars),
-      initialize: false,
+      initialize: fresh,
+      autoSend: this.config.autoSend !== false,
     })
     return parseReviewVerdict(result.text)
   }
@@ -145,14 +156,17 @@ export class GlmReviewer {
     this.config = config
   }
 
-  /** 提交一次审核；需要用户在 GLM 页面人工点击发送。 */
+  /** 提交一次审核；自动化程度与对话模式同样由 `review.autoSend` / `review.conversationMode` 决定。 */
   async review(evidence: ReviewEvidence, _options: ReviewOptions = {}): Promise<ReviewVerdict> {
     await this.channel.ensureReady()
+    const fresh = this.config.conversationMode !== 'reuse'
+    if (fresh) this.channel.resetConversationGate?.(GLM_REVIEW_SESSION)
     const result = await this.channel.turn({
       sessionId: GLM_REVIEW_SESSION,
       model: 'glm-web',
       text: buildReviewPrompt(evidence, this.config.maxEvidenceChars),
-      initialize: false,
+      initialize: fresh,
+      autoSend: this.config.autoSend !== false,
     })
     return parseReviewVerdict(result.text)
   }

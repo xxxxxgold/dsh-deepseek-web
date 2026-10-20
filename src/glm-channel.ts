@@ -22,6 +22,7 @@ import {
   looksSendBlocked,
   markPageTitle,
   type TitleMarkerState,
+  withTimeout,
 } from './browser-shared.ts'
 import type { BrowserChannel, BrowserTurnRequest, BrowserTurnResult } from './browser-channel.ts'
 import type { ReviewConfig } from './config.ts'
@@ -167,14 +168,20 @@ export class GLMChannel implements BrowserChannel {
       response => response.request().method() === 'POST' && matchesGlmCompletion(response.url()),
       { timeout: this.options.config.streamIdleTimeoutMs },
     ).then(async response => {
-      await markPageTitle(page, '[dsh GLM 审核生成中]', this.titleState)
-      await response.finished().catch(() => {})
-      return {
-        url: response.url(),
-        status: response.status(),
-        body: await response.body().catch(() => Buffer.alloc(0)),
-      }
+      await markPageTitle(page, '[dsh GLM 审核生成中]', this.titleState).catch(() => {})
+      // body() / finished() 自带“等到流结束”的语义但没有超时参数：
+      // 流一旦卡住线程就永远等下去（表现为“卡住、不会重新获取”）。
+      // 这里给一个明确上限，并并行等两者，别把“等流结束”做两遍。
+      const [, body] = await Promise.all([
+        withTimeout(response.finished().catch(() => undefined), this.options.config.streamIdleTimeoutMs,
+          'GLM_STREAM_STALLED', 'glm: 等待回复流结束超时'),
+        withTimeout(response.body().catch(() => Buffer.alloc(0)), this.options.config.streamIdleTimeoutMs,
+          'GLM_STREAM_STALLED', 'glm: 读取回复体超时'),
+      ])
+      return { url: response.url(), status: response.status(), body }
     })
+    // 取消/超时后可能没人再 await 它，先挂空 catch 避免 unhandled rejection。
+    completionPromise.catch(() => {})
 
     const editor = locateEditor(page)
     if (!(await editor.isVisible().catch(() => false))) {
@@ -216,6 +223,8 @@ export class GLMChannel implements BrowserChannel {
       completion = await completionPromise
       console.info('[glm] 已收到 GLM 完整回复，正在解析…')
     } catch (error) {
+      // 已经是带明确错误码的失败（流卡住等）就原样上抛，保留定位信息。
+      if (error instanceof LlmError) throw error
       if (page.isClosed()) throw new LlmError('glm: 浏览器页面被关闭', 'GLM_PAGE_CLOSED')
       throw new LlmError(
         request.autoSend

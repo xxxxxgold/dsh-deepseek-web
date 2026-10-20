@@ -41,11 +41,39 @@ export interface ReviewConfig {
   enabled: boolean
   /**
    * 审核器：
-   * - `kimi`：独立第三方审核（Kimi 窗口、独立上下文，需要人工点击发送）
-   * - `glm`：独立第三方审核（chat.z.ai 窗口、独立上下文，需要人工点击发送）
+   * - `kimi`：独立第三方审核（Kimi 窗口、独立上下文）
+   * - `glm`：独立第三方审核（chat.z.ai 窗口、独立上下文）
    * - `deepseek-web`：在同一个 DeepSeek 对话里自审（不开新窗口、不复制文件内容，更快但独立性弱）
    */
   provider: ReviewProvider
+  /**
+   * 审核请求的自动化程度（全自动 / 半自动，二选一）：
+   * - `true`（**全自动**，默认）：填入后自动回车发送，并确认真的发出去了；
+   *   发不出去会当场报错，不会悄悄停在输入框里。
+   * - `false`（**半自动**）：只填入并聚焦审核窗口，由你点发送；等待超会明确报错。
+   *
+   * 审核是自动化流程，默认全自动：每次都要人工点一下，等于把整轮自动审核
+   * 拖成人工值守，忘了点就会空等到超时。
+   */
+  autoSend: boolean
+  /**
+   * 每次审核要不要新开对话：
+   * - `fresh`（默认）：每次审核前新开一个对话，上下文干净。
+   * - `reuse`：复用同一个对话（旧行为）。审核 prompt 自带全部证据，复用并不会更准，
+   *   反而会让审核窗口的上下文越积越长、越审越慢，还容易被上一轮的结论带偏。
+   */
+  conversationMode: 'fresh' | 'reuse'
+  /** 自动发送后确认“已发出”的等待窗口（毫秒）；窗口内没等到信号才视为没发出去。 */
+  sendVerifyMs: number
+  /** 自动发送未确认时的重试轮数（每轮 = 回车 + 点发送按钮兜底）。 */
+  sendRetries: number
+  /**
+   * 获取回复失败后的自动重试次数（0 = 不重试）。
+   *
+   * 覆盖“等回复超时 / 拿到空响应 / 页面或连接断开 / 发送没被确认”这几类环境抖动；
+   * 每次重试前都会丢弃旧连接并重新连浏览器，不会复用已经死掉的页面。
+   */
+  fetchRetries: number
   /** Kimi 审核网页版地址。 */
   url: string
   /** 常驻 Kimi 审核浏览器的 CDP 端口。 */
@@ -328,6 +356,13 @@ const schema = z.object({
   review: z.object({
     enabled: markVolatile(z.boolean().default(false)),
     provider: markVolatile(z.union(['kimi', 'deepseek-web', 'glm']).default('kimi')),
+    // 审核默认全自动发送：审核是自动化流程，要求人工点发送会让整轮审核空等。
+    autoSend: markVolatile(z.boolean().default(true)),
+    // 审核默认每次新开对话：审核 prompt 自带全部证据，复用历史只会越审越慢。
+    conversationMode: markVolatile(z.union(['fresh', 'reuse']).default('fresh')),
+    sendVerifyMs: markVolatile(z.number().step(1).min(100).default(1_500)),
+    sendRetries: markVolatile(z.number().step(1).min(1).max(5).default(2)),
+    fetchRetries: markVolatile(z.number().step(1).min(0).max(3).default(1)),
     url: z.string().default('https://www.kimi.com/'),
     debugPort: z.number().step(1).min(1024).max(65535).default(9334),
     profileDir: z.string(),
