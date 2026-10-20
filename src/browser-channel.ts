@@ -52,6 +52,12 @@ export interface BrowserTurnRequest {
   onProgress?: (progress: BrowserTurnProgress) => void
   /** 同对话自审不能改变工作页面所属的正常 session。 */
   preserveConversation?: boolean
+  /**
+   * 复用对话时，明确指定要落到哪个 dsh 会话的网页页（同对话自审用）。
+   * 比"最近用过的页"可靠：多会话并行（主会话 + 子代理）时，子代理在父会话审阅阶段
+   * 启动会刷新"最近使用"的归属，导致自审文本写进子代理的网页对话。
+   */
+  conversationSessionId?: string
   /** 临时内部请求用途，用于浏览器标题提示。 */
   purpose?: string
 }
@@ -77,16 +83,31 @@ export interface BrowserTurnResult {
 export interface BrowserChannel {
   /** 打开/连接浏览器并确保已登录 chat.deepseek.com。 */
   ensureReady(): Promise<void>
-  /** 全新 dsh 会话开始前调用：允许通道再次执行“开启新对话”。 */
-  resetConversationGate(): void
+  /**
+   * 全新 dsh 会话开始前调用：允许通道再次执行"开启新对话"。
+   * 传 sessionId 时只重置该会话的状态；不传则重置所有会话（兼容旧实现）。
+   */
+  resetConversationGate(sessionId?: string): void
   /** 发起一轮网页对话并等待最终回复。 */
   turn(request: BrowserTurnRequest): Promise<BrowserTurnResult>
   /** 内部摘要/标题调用：独立临时页面，不能复用正常工作的网页对话。 */
   turnIsolated?(request: BrowserTurnRequest): Promise<BrowserTurnResult>
   /** 正常会话是否仍占用当前工作页面；否则 adapter 必须回放宿主上下文。 */
   isConversationActive?(sessionId: string): boolean
-  /** 轮换到全新网页对话（可选；仅主对话通道需要）。 */
-  startNewConversation?(): Promise<void>
+  /** 轮换到全新网页对话（可选；仅主对话通道需要）。传 sessionId 时只轮换该会话的页面。 */
+  startNewConversation?(sessionId?: string): Promise<void>
+  /**
+   * 取消指定会话（不传则全部）当前挂在网页上的回合。
+   * 宿主放弃本次生成时必须调用：否则后台回合会一直占着该会话的网页标签页，
+   * 让该会话后续请求只能等它自然超时（这是"卡住"的另一半原因）。
+   */
+  cancelTurn?(sessionId?: string): Promise<void>
+  /**
+   * 记录"当前正在跑的是哪个 dsh 会话"。
+   * 同对话自审等 preserveConversation 请求要落到这个会话的网页页上，
+   * 而不是"最近用过的任意会话页"（多会话并行时后者可能是子代理的页）。
+   */
+  setConversationFocus?(sessionId: string): void
   /** 当前连接状态，供 UI/日志展示。 */
   status(): Promise<{ ready: boolean; url?: string; message?: string }>
   /** 把网页窗口提到最前（填入消息 / 首次请求时）。 */

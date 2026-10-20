@@ -343,14 +343,40 @@ export function parseCompletionBody(body: string): {
   }
 }
 
+/** 单个 dsh 会话在浏览器里的独占工作页。 */
+interface SessionPageState {
+  sessionId: string
+  page: Page
+  /** 该页面是否已经承载过 agent 对话（原全局 conversationStarted 的按会话版）。 */
+  started: boolean
+  /** 同一会话的网页回合必须串行；不同会话各用自己的锁，因此可以并行。 */
+  readonly lock: AsyncLock
+  /** 当前正在跑的网页回合；cancelTurn 用它立即中止。 */
+  abort?: AbortController
+  /** 最近一次使用时间（用于回收最久未用的会话页）。 */
+  lastUsedAt: number
+}
+
 export class PlaywrightBrowserChannel implements BrowserChannel {
   private browser: Browser | undefined
   private context: BrowserContext | undefined
+  /** 锚点页面：第一个会话直接复用这个已登录的标签页，也供状态展示/聚焦使用。 */
   private page: Page | undefined
-  private readonly turnLock = new AsyncLock()
-  private activeSessionId: string | undefined
-  /** 当前页面是否已经承载过 agent 对话；同一浏览器进程内只新建一次对话。 */
-  private conversationStarted = false
+  /**
+   * 每个 dsh 会话独占一个网页标签页 + 一把会话锁。
+   *
+   * 关键点：主会话和它派生的子代理是两个不同 sessionId，各自拿到自己的标签页，
+   * 因此不会再互相等对方那个"最长 10 分钟"的网页回合；同一会话的多个网页回合仍然串行。
+   */
+  private readonly sessionPages = new Map<string, SessionPageState>()
+  /** 会话工作页创建的单飞（同一会话并发进入时只建一次）。 */
+  private readonly creatingPages = new Map<string, Promise<SessionPageState>>()
+  /** 正在创建、尚未登记进 sessionPages 的标签页：清理残留标签时必须避开它们。 */
+  private readonly pendingPages = new Set<Page>()
+  /** ensureReady 的单飞：并发请求不会重复拉起浏览器。 */
+  private ensureReadyTask: Promise<void> | undefined
+  /** 当前正在跑的主 agent 会话（由 adapter 每次 streamTask 开始时打点）。 */
+  private focusSessionId: string | undefined
   /** 页面原始标题，用于状态标记前缀的清除/还原。 */
   private readonly originalTitles = new WeakMap<Page, string>()
   private readonly options: PlaywrightChannelOptions
@@ -364,13 +390,27 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       ?? defaultProfileDir('edge-profile')
   }
 
+  /** 打开/连接浏览器并确保已登录；并发进入时只执行一次（单飞）。 */
   async ensureReady(): Promise<void> {
-    if (this.browser && this.page && !this.page.isClosed()) return
+    const running = this.ensureReadyTask
+    if (running) return running
+    const task = this.ensureReadyCore().finally(() => {
+      if (this.ensureReadyTask === task) this.ensureReadyTask = undefined
+    })
+    this.ensureReadyTask = task
+    return task
+  }
+
+  private async ensureReadyCore(): Promise<void> {
     if (this.browser?.isConnected() && this.context) {
-      this.page = await this.context.newPage()
-      this.conversationStarted = false
-      this.activeSessionId = undefined
-      await ensureChatPage(this.page, this.options.config.url)
+      // 浏览器还活着：只补齐锚点页，绝不重复拉起浏览器，也不动其它会话的标签页。
+      this.pruneClosedStates()
+      if (!this.page || this.page.isClosed()) {
+        const pages = this.context.pages().filter(candidate => !candidate.isClosed())
+        this.page = pages.find(candidate => candidate.url().startsWith(new URL(this.options.config.url).origin))
+          ?? await this.context.newPage()
+        await ensureChatPage(this.page, this.options.config.url)
+      }
       return
     }
 
@@ -405,9 +445,11 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       ?? await this.context.newPage()
     // managed profile 只由本插件使用：保留一个工作标签，关闭启动器或旧版本
     // 残留的空白/重复标签，避免首次请求同时出现两个网页。attach 模式不碰
-    // 用户自己打开的其他标签。
+    // 用户自己打开的其他标签；已分配给 dsh 会话的标签页一律保留。
     if (this.options.config.browser === 'managed') {
-      await Promise.all(pages.filter(page => page !== this.page).map(page => page.close().catch(() => {})))
+      await Promise.all(pages
+        .filter(page => !page.isClosed() && !this.ownedPage(page))
+        .map(page => page.close().catch(() => {})))
     }
 
     await ensureChatPage(this.page, this.options.config.url)
@@ -423,23 +465,36 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     }
   }
 
-  resetConversationGate(): void {
-    // 新的 dsh 会话开始时由 adapter 调用；仅解除“同一页面已开始对话”限制。
-    this.conversationStarted = false
+  resetConversationGate(sessionId?: string): void {
+    // 新的 dsh 会话开始时由 adapter 调用；只解除该会话"已开始对话"的标记。
+    if (sessionId === undefined) {
+      for (const state of this.sessionPages.values()) state.started = false
+      return
+    }
+    const state = this.sessionPages.get(sessionId)
+    if (state) state.started = false
   }
 
   isConversationActive(sessionId: string): boolean {
-    return this.activeSessionId === sessionId && this.page !== undefined && !this.page.isClosed()
+    const state = this.sessionPages.get(sessionId)
+    if (!state) return false
+    if (state.page.isClosed()) {
+      this.sessionPages.delete(sessionId)
+      return false
+    }
+    return state.started
   }
 
   /** 轮换到全新网页对话（上下文长度达到上限时由 adapter 调用）。 */
-  async startNewConversation(): Promise<void> {
-    // 只切换当前 Page 内的网页会话；不要创建新 Browser、BrowserContext 或 Page。
-    if (!this.page) await this.ensureReady()
-    const page = this.page!
-    this.originalTitles.delete(page)
-    await this.startFreshConversation(page)
-    this.conversationStarted = true
+  async startNewConversation(sessionId?: string): Promise<void> {
+    // 只切换目标会话自己那个标签页里的网页会话；不创建新 Browser/Context/Page。
+    const state = sessionId !== undefined
+      ? await this.stateFor(sessionId)
+      : this.mostRecentState() ?? await this.stateFor('anonymous')
+    this.originalTitles.delete(state.page)
+    await this.startFreshConversation(state.page)
+    state.started = true
+    state.lastUsedAt = Date.now()
   }
 
   /**
@@ -455,7 +510,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     await page.waitForTimeout(800)
     // 某些网页版本会把“新对话”按钮实现成新标签。插件要求所有 dsh 对话
     // 复用同一个网页标签，因此关闭点击产生的额外标签并回退到当前页面。
-    await Promise.all(page.context().pages().filter(candidate => candidate !== page && !existingPages.has(candidate))
+    await Promise.all(page.context().pages().filter(candidate => candidate !== page
+      && !existingPages.has(candidate)
+      && !this.ownedPage(candidate))
       .map(candidate => candidate.close().catch(() => {})))
     if (clicked && page.url() !== beforeUrl) {
       console.info('[deepseek-web] 已切换到新对话。')
@@ -479,32 +536,114 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   }
 
   async turn(request: BrowserTurnRequest): Promise<BrowserTurnResult> {
-    const release = await this.turnLock.acquire(request.signal)
-    try {
-      if (!this.page) await this.ensureReady()
-      const page = this.page!
-
-      console.info(
-        `[deepseek-web] turn 入口 session=${request.sessionId} initialize=${String(request.initialize)} conversationStarted=${String(this.conversationStarted)}`,
-      )
-
-      if (request.initialize && !this.conversationStarted) {
-        await this.startFreshConversation(page)
-        this.conversationStarted = true
+    await this.ensureReady()
+    // 同对话自审（preserveConversation）必须落回"发起审阅的那个会话"的网页页：
+    // 优先用请求里显式指定的 conversationSessionId（不受并发子会话影响），
+    // 其次才回落 adapter 打点的 focusSessionId，最后才是"最近用过的页"。
+    // 否则主会话审阅阶段一旦有子代理启动，自审文本就会写进子代理的网页对话。
+    const explicitTarget = request.conversationSessionId
+      ?? (request.preserveConversation ? this.focusSessionId : undefined)
+    const targeted = explicitTarget !== undefined ? this.sessionPages.get(explicitTarget) : undefined
+    let state: SessionPageState
+    if (request.preserveConversation) {
+      if (targeted !== undefined && !targeted.page.isClosed()) {
+        state = targeted
+      } else if (explicitTarget !== undefined) {
+        state = await this.stateFor(explicitTarget)
+      } else {
+        state = this.mostRecentState() ?? await this.stateFor(request.sessionId)
       }
-      if (!request.preserveConversation) this.activeSessionId = request.sessionId
-      return await this.turnOnPage(page, request)
+    } else {
+      state = await this.stateFor(request.sessionId)
+    }
+    if (state.page.isClosed()) {
+      throw new LlmError('deepseek-web: 会话工作页已被关闭，请重试本轮任务（会重新回放宿主上下文）。', 'WEB_PAGE_CLOSED')
+    }
+
+    const release = await state.lock.acquire(request.signal, {
+      maxHoldMs: this.options.config.lockLeaseMs,
+      onLeak: info => console.warn(
+        `[deepseek-web] 会话回合锁被强制回收：session=${state.sessionId} 已持有 ${Math.round(info.heldMs / 1000)}s。`
+        + '该回合仍在后台收尾，但不会再永久阻塞这个会话的后续请求。',
+      ),
+    })
+
+    // 内部中止源：cancelTurn（宿主放弃生成）与单回合超时都走这里，和宿主 signal 并联，
+    // 谁先触发都能让网页回合立刻结束，不再出现"没人等它但页面还在生成"的幽灵回合。
+    const abort = new AbortController()
+    state.abort = abort
+    let relay: (() => void) | undefined
+    if (request.signal) {
+      relay = () => abort.abort(request.signal?.reason)
+      if (request.signal.aborted) relay()
+      else request.signal.addEventListener('abort', relay, { once: true })
+    }
+    let timedOut = false
+    const timeoutMs = this.options.config.turnTimeoutMs
+    const timer = timeoutMs && timeoutMs > 0
+      ? setTimeout(() => {
+        timedOut = true
+        abort.abort(new Error('turn timeout'))
+      }, timeoutMs)
+      : undefined
+    if (timer) (timer as unknown as { unref?: () => void }).unref?.()
+    const inner: BrowserTurnRequest = { ...request, signal: abort.signal }
+
+    try {
+      console.info(
+        `[deepseek-web] turn 入口 session=${request.sessionId} initialize=${String(request.initialize)} `
+        + `页面会话=${state.sessionId} started=${String(state.started)} 会话页=${this.sessionPages.size}`,
+      )
+      request.signal?.throwIfAborted()
+      if (request.initialize && !state.started) {
+        await this.startFreshConversation(state.page)
+        state.started = true
+      }
+      return await this.turnOnPage(state.page, inner)
+    } catch (error) {
+      if (timedOut) {
+        throw new LlmError(
+          `deepseek-web: 本次网页回合超过单回合上限（${Math.round(timeoutMs / 1000)}s），已主动中止，避免长期占用网页与会话锁。`
+          + '请检查网页是否卡在生成中，或调大 turnTimeoutMs 后重试。',
+          'WEB_TURN_TIMEOUT',
+        )
+      }
+      if (abort.signal.aborted && !request.signal?.aborted) {
+        throw new LlmError('网页回合已被主动取消（宿主已放弃本次生成）。', 'WEB_TURN_ABORTED')
+      }
+      throw error
     } finally {
+      if (timer) clearTimeout(timer)
+      if (relay) request.signal?.removeEventListener('abort', relay)
+      if (state.abort === abort) state.abort = undefined
+      state.lastUsedAt = Date.now()
       release()
     }
   }
 
+  /** 取消指定会话（不传则全部）当前挂在网页上的回合。 */
+  async cancelTurn(sessionId?: string): Promise<void> {
+    const targets = sessionId === undefined
+      ? [...this.sessionPages.values()]
+      : [this.sessionPages.get(sessionId)]
+        .filter((state): state is SessionPageState => state !== undefined)
+    for (const state of targets) {
+      const abort = state.abort
+      if (!abort || abort.signal.aborted) continue
+      console.info(
+        `[deepseek-web] 取消会话回合 session=${state.sessionId}：宿主已放弃本次生成，`
+        + '立即结束网页回合，避免该会话后续请求排队等待。',
+      )
+      abort.abort(new Error('cancelled'))
+    }
+  }
+
   async turnIsolated(request: BrowserTurnRequest): Promise<BrowserTurnResult> {
-    const release = await this.turnLock.acquire(request.signal)
+    // 隔离辅助请求用一次性标签页：不占任何会话锁，多个会话的摘要/标题因此可以真并行。
+    await this.ensureReady()
+    request.signal?.throwIfAborted()
     let page: Page | undefined
     try {
-      await this.ensureReady()
-      request.signal?.throwIfAborted()
       page = await this.context!.newPage()
       const entryUrl = new URL('/', this.options.config.url).href
       await page.goto(entryUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 })
@@ -513,7 +652,6 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     } finally {
       await page?.close().catch(() => {})
       await this.setWebWindowTopmost(request.sessionId, false).catch(() => {})
-      release()
     }
   }
 
@@ -564,6 +702,121 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       await this.markPageStatus(page, `[dsh 频控：${Math.round(delayMs / 1000)}s 后自动重发]`)
       await this.sleep(delayMs, request.signal)
       await this.markPageStatus(page, undefined).catch(() => {})
+    }
+  }
+
+  /** 该页面是否由本通配给某个 dsh 会话（清理残留标签页时判断归属）。 */
+  private ownedPage(page: Page): boolean {
+    if (page === this.page) return true
+    return this.assignedPage(page)
+  }
+
+  /** 该页面是否已分配给某个会话（不算"锚点页"这一层身份，供复用判断）。 */
+  private assignedPage(page: Page): boolean {
+    if (this.pendingPages.has(page)) return true
+    for (const state of this.sessionPages.values()) if (state.page === page) return true
+    return false
+  }
+
+  private markPageStarted(page: Page): void {
+    for (const state of this.sessionPages.values()) {
+      if (state.page === page) {
+        state.started = true
+        return
+      }
+    }
+  }
+
+  private mostRecentState(): SessionPageState | undefined {
+    let best: SessionPageState | undefined
+    for (const state of this.sessionPages.values()) {
+      if (state.page.isClosed()) continue
+      if (!best || state.lastUsedAt > best.lastUsedAt) best = state
+    }
+    return best
+  }
+
+  /** 取（必要时创建）会话独占的工作页；同一会话并发进入只会创建一次。 */
+  private stateFor(sessionId: string): Promise<SessionPageState> {
+    const existing = this.sessionPages.get(sessionId)
+    if (existing && !existing.page.isClosed()) return Promise.resolve(existing)
+    if (existing) {
+      this.sessionPages.delete(sessionId)
+      void existing.page.close().catch(() => {})
+    }
+    const running = this.creatingPages.get(sessionId)
+    if (running) return running
+    const task = this.createState(sessionId).finally(() => {
+      if (this.creatingPages.get(sessionId) === task) this.creatingPages.delete(sessionId)
+    })
+    this.creatingPages.set(sessionId, task)
+    return task
+  }
+
+  private async createState(sessionId: string): Promise<SessionPageState> {
+    await this.ensureReady()
+    // 首个会话直接复用已登录的锚点页；后续会话各自新开一个标签页。
+    const anchor = this.page
+    const anchorFree = anchor !== undefined && !anchor.isClosed() && !this.assignedPage(anchor)
+    let page: Page
+    if (anchorFree) {
+      page = anchor!
+    } else {
+      await this.makeRoomForPage()
+      page = await this.context!.newPage()
+      // 新标签页在登记进 sessionPages 之前也要算"本插件占用"：
+      // 否则同时进行的"开启新对话"清理残留标签时可能把它当野标签关掉。
+      this.pendingPages.add(page)
+      try {
+        const entryUrl = new URL('/', this.options.config.url).href
+        await page.goto(entryUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {})
+        await ensureChatPage(page, this.options.config.url).catch(() => {})
+        await page.waitForTimeout(500)
+      } finally {
+        this.pendingPages.delete(page)
+      }
+    }
+    const state: SessionPageState = {
+      sessionId,
+      page,
+      started: false,
+      lock: new AsyncLock(),
+      lastUsedAt: Date.now(),
+    }
+    this.sessionPages.set(sessionId, state)
+    console.info(
+      `[deepseek-web] 会话工作页就绪 session=${sessionId} 会话页=${this.sessionPages.size}/${this.options.config.maxSessionPages}`
+      + `${page === anchor ? '（复用锚点页）' : '（新开标签页）'}`,
+    )
+    return state
+  }
+
+  /** 达到标签页上限时回收最久未用且当前空闲的会话页。 */
+  private async makeRoomForPage(): Promise<void> {
+    const max = Math.max(1, this.options.config.maxSessionPages)
+    let guard = 0
+    while (this.sessionPages.size >= max && guard++ < 16) {
+      let victim: SessionPageState | undefined
+      for (const state of this.sessionPages.values()) {
+        if (state.abort || state.page.isClosed()) continue
+        if (!victim || state.lastUsedAt < victim.lastUsedAt) victim = state
+      }
+      if (!victim) break
+      console.info(
+        `[deepseek-web] 会话页达到上限 ${max}，回收最久未用的工作页 session=${victim.sessionId}`
+        + '（该会话下次请求会重新回放宿主上下文）。',
+      )
+      this.sessionPages.delete(victim.sessionId)
+      await victim.page.close().catch(() => {})
+      // 被回收的可能正是复用过锚点页的那个会话：锚点指针要跟着失效，
+      // 下次 ensureReady 会挑一个存活页或新开一个，避免后续操作落在已关闭页上。
+      if (this.page === victim.page) this.page = undefined
+    }
+  }
+
+  private pruneClosedStates(): void {
+    for (const [sessionId, state] of this.sessionPages) {
+      if (state.page.isClosed()) this.sessionPages.delete(sessionId)
     }
   }
 
@@ -793,7 +1046,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       await this.attachAttachments(page, request)
       request.signal?.throwIfAborted()
       await page.keyboard.insertText(request.text)
-      if (page === this.page) this.conversationStarted = true
+      if (page === this.page) this.markPageStarted(page)
       if (autoSend) {
         // 全自动：输入框已聚焦（editor.click），模拟回车发送；不动窗口焦点，dsh 全程在前
         await editor.focus()
@@ -1020,6 +1273,15 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     this.autoSendSessions.set(sessionId, auto)
   }
 
+  /**
+   * 记录"当前 agent 会话"。
+   * 同对话自审（preserveConversation）用它定位要写入的网页页：
+   * 多会话并行时，"最近用过的页"可能是子代理的页，审稿内容就会串进子代理的对话。
+   */
+  setConversationFocus(sessionId: string): void {
+    this.focusSessionId = sessionId
+  }
+
   /** 置顶/取消置顶插件专用的 Edge 窗口（按 profile 目录定位）。 */
   async setWebWindowTopmost(_sessionId: string, topmost: boolean): Promise<void> {
     const focus = this.options.config.focus
@@ -1028,19 +1290,34 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   }
 
   async status(): Promise<{ ready: boolean; url?: string; message?: string }> {
-    if (!this.browser || !this.page) {
+    if (!this.browser || !this.context) {
       return { ready: false, message: '浏览器尚未启动' }
     }
+    const anchor = this.page && !this.page.isClosed()
+      ? this.page
+      : this.mostRecentState()?.page
     const modelLabel = WEB_MODEL_CAPABILITIES[this.options.config.model as WebModelId]?.label
+    const tabs = this.sessionPages.size
     return {
-      ready: !this.page.isClosed(),
-      url: this.page.url(),
-      message: `浏览器已连接${modelLabel ? `，目标模型：${modelLabel}` : ''}`,
+      ready: anchor !== undefined && !anchor.isClosed(),
+      ...anchor ? { url: anchor.url() } : {},
+      message: `浏览器已连接${modelLabel ? `，目标模型：${modelLabel}` : ''}`
+        + `${tabs > 0 ? `，并行会话页 ${tabs}/${this.options.config.maxSessionPages}` : ''}`,
     }
   }
 
   async dispose(): Promise<void> {
-    if (this.options.config.browser === 'attach') return
+    if (this.options.config.browser === 'attach') {
+      this.sessionPages.clear()
+      this.creatingPages.clear()
+      this.pendingPages.clear()
+      this.page = undefined
+      return
+    }
+    await Promise.all([...this.sessionPages.values()].map(state => state.page.close().catch(() => {})))
+    this.sessionPages.clear()
+    this.creatingPages.clear()
+    this.pendingPages.clear()
     const managed = this.managedConnection
     this.managedConnection = undefined
     await managed?.browser.close().catch(() => {})
@@ -1050,7 +1327,6 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     this.browser = undefined
     this.context = undefined
     this.page = undefined
-    this.conversationStarted = false
-    this.activeSessionId = undefined
+    this.focusSessionId = undefined
   }
 }

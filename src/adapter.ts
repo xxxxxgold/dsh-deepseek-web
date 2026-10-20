@@ -29,7 +29,6 @@ import {
   replyChunks,
 } from './response.ts'
 import {
-  SYSTEM_PROTOCOL,
   buildDelegationPrompt,
   buildHandoffBrief,
   buildRecoveryPrompt,
@@ -76,7 +75,11 @@ function reviewSignature(goal: string, artifact: string): string {
 /** 审核器最小接口；KimiReviewer / GlmReviewer / DeepSeekSelfReviewer 均满足该结构。 */
 type ReviewerLike = {
   readonly needsEvidence: boolean
-  review: (evidence: { task: string; artifact: string; files: string[] }) => Promise<ReviewVerdict>
+  review: (
+    evidence: { task: string; artifact: string; files: string[] },
+    /** 同对话自审要落回发起审阅的会话页（多会话并行时不能靠"最近用过的页"）。 */
+    options?: { conversationSessionId?: string },
+  ) => Promise<ReviewVerdict>
 }
 
 /**
@@ -122,7 +125,15 @@ export type ReadImageAttachment = (
 ) => Promise<{ name: string; mimeType: string; data: Uint8Array } | undefined>
 
 export class DeepSeekWebAdapter extends LlmAdapter {
-  private readonly requestLock = new AsyncLock()
+  /**
+   * 会话级锁（不是全局锁）。
+   *
+   * 旧实现用一把 `requestLock` 包住整次 stream：主会话与其派生的子代理是两个不同
+   * sessionId，却要排队共用同一把锁，谁先拿到就独占整轮网页生成（人工模式/频控
+   * 时最长十分钟），另一方只能干等——这就是"其中一个卡住"的直接成因。
+   * 现在按会话分锁，不同会话并行；同一会话仍串行（它们共用同一个网页对话）。
+   */
+  private readonly sessionLocks = new Map<string, AsyncLock>()
   private readonly replaySessions = new Set<string>()
   private readonly sessions: SessionRegistry
   private readonly config: Config
@@ -150,6 +161,57 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const defaultStateFile = config.stateFile
       ?? path.join(appDataRoot, 'DshDeepSeekWeb', 'session-state.json')
     this.sessions = new SessionRegistry({ file: defaultStateFile })
+    this.warnAboutTimeoutConfig()
+  }
+
+  /**
+   * 超时/租约三件套的交叉校验：配错了不会崩，但防护会失效，所以在启动时明确告警。
+   * 约束：turnTimeoutMs ≤ maxStreamMs，且 lockLeaseMs ≥ maxStreamMs + turnTimeoutMs。
+   * 理由：一条 llm.stream 会串联多个网页回合（纠错 / 委托 / 多轮审核），人工模式
+   * 每回合都可能等满 streamIdleTimeoutMs 600s；租约必须比"最大合法整轮"更长，
+   * 否则会在回合仍正常进行时强行放锁，让同一会话的两条流交替写同一个网页对话。
+   */
+  private warnAboutTimeoutConfig(): void {
+    const { turnTimeoutMs, maxStreamMs, lockLeaseMs, sendMode } = this.config
+    if (lockLeaseMs === 0) {
+      console.warn('[deepseek-web] lockLeaseMs=0：锁租约防护已关闭，一旦有回合泄漏将永久占住该会话队列。')
+    } else if (maxStreamMs === 0) {
+      console.warn(
+        `[deepseek-web] maxStreamMs=0（整轮无上限）但 lockLeaseMs=${lockLeaseMs}ms：`
+        + '一旦单条流超出租约就会被强制放锁，建议同时把 maxStreamMs 设为有限值。',
+      )
+    } else if (lockLeaseMs < maxStreamMs + Math.max(0, turnTimeoutMs)) {
+      const need = maxStreamMs + Math.max(0, turnTimeoutMs)
+      console.warn(
+        `[deepseek-web] lockLeaseMs(${lockLeaseMs}ms) 小于 maxStreamMs + turnTimeoutMs(${need}ms)：`
+        + '多回合（纠错/委托/审核）的合法请求可能在租约到点时被强拆，建议 lockLeaseMs ≥ 该和。',
+      )
+    }
+    if (turnTimeoutMs > 0 && maxStreamMs > 0 && turnTimeoutMs > maxStreamMs) {
+      console.warn(
+        `[deepseek-web] turnTimeoutMs(${turnTimeoutMs}ms) 大于 maxStreamMs(${maxStreamMs}ms)：`
+        + '单回合上限永远不会触发，建议 turnTimeoutMs ≤ maxStreamMs。',
+      )
+    }
+    if (turnTimeoutMs === 0) {
+      // 单回合上限关掉后，卡住的网页回合不会被收尾（Playwright 动作本身没有默认超时），
+      // 到点只能靠租约强拆，两条流就会交替写同一个网页对话——所以这里不分发送模式都要告警。
+      console.warn(
+        '[deepseek-web] turnTimeoutMs=0：单个网页回合没有上限，'
+        + `${sendMode === 'manual' ? '人工等待可能无限长' : '卡住的回合不会被收尾'}，`
+        + '一旦超出租约会被强制放锁，建议保留有限的 turnTimeoutMs。',
+      )
+    }
+  }
+
+  /** 按会话取锁：首次使用时创建，进程内长期复用（锁本身无状态，只有排队链）。 */
+  private lockFor(key: string): AsyncLock {
+    let lock = this.sessionLocks.get(key)
+    if (!lock) {
+      lock = new AsyncLock()
+      this.sessionLocks.set(key, lock)
+    }
+    return lock
   }
 
   /** 读取通道 token 用量总计（宿主注册设置命名空间时用作初始值）。 */
@@ -264,7 +326,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       bodyText,
     ].filter(Boolean).join('\n\n')
 
-    await this.channel.startNewConversation?.()
+    await this.channel.startNewConversation?.(request.sessionId)
     // 新网页对话从零累计：token 基线清零；协议已随重发注入
     state.usageBaseline = 0
     state.roundsSinceProtocol = 0
@@ -296,14 +358,63 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    const sessionId = options.sessionId ?? 'anonymous'
+    // 锁粒度 = 会话。不同会话（主会话 vs 它派生的子代理）各自持锁、各自用网页标签页，
+    // 可以真并行；同一会话的多个网页回合仍然串行，因为共用一个网页对话。
+    // 辅助请求（compaction / session-title）走一次性临时标签页，锁键再带上 purpose：
+    // 既不排在主请求整轮生成后面，也不挡住同一会话的后续请求。
+    const lockKey = options.purpose !== undefined ? `${sessionId}::${options.purpose}` : sessionId
+    const lock = this.lockFor(lockKey)
     let release: (() => void) | undefined
+    let completed = false
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+    let queueLog: ReturnType<typeof setTimeout> | undefined
+    const releaseOnce = (): void => {
+      const fn = release
+      release = undefined
+      fn?.()
+    }
     try {
-      release = await this.requestLock.acquire(options.signal)
+      // 排队超过 3 秒才打印：同会话的上一个网页回合还没结束（网页对话必须串行，属预期），
+      // 让用户能区分"在排队"与"卡死了"。
+      queueLog = setTimeout(() => {
+        console.info(
+          `[deepseek-web] 会话 ${sessionId} 排队中：该会话上一个网页回合仍未结束（同一网页对话必须串行）。`,
+        )
+      }, 3_000)
+      ;(queueLog as unknown as { unref?: () => void }).unref?.()
+      release = await lock.acquire(options.signal, {
+        maxHoldMs: this.config.lockLeaseMs,
+        onLeak: info => console.warn(
+          `[deepseek-web] 会话锁超过租约被强制回收：key=${lockKey} 已持有 ${Math.round(info.heldMs / 1000)}s，`
+          + `仍有 ${info.waiters} 个请求在排队。强制释放以恢复服务。`,
+        ),
+      })
+
+      if (queueLog) {
+        clearTimeout(queueLog)
+        queueLog = undefined
+      }
+
+      // 整条流的兜底上限：无论卡在人工发送、频控重试还是网页不响应，
+      // 到点主动取消网页回合，让这次请求以明确错误结束，而不是永远"生成中"。
+      const maxStreamMs = this.config.maxStreamMs
+      if (maxStreamMs && maxStreamMs > 0) {
+        watchdog = setTimeout(() => {
+          console.warn(
+            `[deepseek-web] 本次请求超过 ${Math.round(maxStreamMs / 60_000)} 分钟仍未结束，`
+            + `主动取消网页回合（session=${sessionId}）。可用 maxStreamMs 调整，设为 0 关闭。`,
+          )
+          const cancelling = this.channel.cancelTurn?.(sessionId)
+          if (cancelling) void cancelling.catch(() => {})
+        }, maxStreamMs)
+        ;(watchdog as unknown as { unref?: () => void }).unref?.()
+      }
+
       if (options.purpose !== undefined) {
         yield* this.streamAuxiliary(options)
+        completed = true
       } else {
-        const sessionId = options.sessionId ?? 'anonymous'
-        let completed = false
         try {
           yield* this.streamTask(options)
           completed = true
@@ -313,7 +424,15 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         }
       }
     } finally {
-      release?.()
+      if (queueLog) clearTimeout(queueLog)
+      if (watchdog) clearTimeout(watchdog)
+      if (!completed && options.purpose === undefined) {
+        // 宿主放弃本次生成（取消 / 切换会话 / 迭代器被 return）时，主动结束仍挂在
+        // 网页上的回合：否则后台 turn 会一直占着该会话的网页标签页，让后续请求干等。
+        const cancelling = this.channel.cancelTurn?.(sessionId)
+        if (cancelling) void cancelling.catch(() => {})
+      }
+      releaseOnce()
     }
   }
 
@@ -406,6 +525,9 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const autoSend = model === 'deepseek-web-auto'
     this.channel.setSessionAutoSend?.(sessionId, autoSend)
     this.channel.setSessionAutoSend?.('deepseek-self-review', autoSend)
+    // 记录"当前 agent 会话"：同对话自审（preserveConversation）要落回这个会话的网页页，
+    // 多会话并行时不能落到"最近用过的页"（那可能是子代理的页）。
+    this.channel.setConversationFocus?.(sessionId)
 
     await this.channel.ensureReady()
 
@@ -438,7 +560,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     // 初始化只更新本轮快照；完整结果被消费后再提交持久状态。
     if (rendered.prompt.initialize) {
       if (savedState.initialized) console.info('[deepseek-web] 宿主上下文或页面归属变化，重建工作网页对话并回放检查点；继续原 dsh 会话。')
-      this.channel.resetConversationGate()
+      this.channel.resetConversationGate(sessionId)
       state.initialized = true
       state.usageBaseline = 0
     }
@@ -641,7 +763,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
           : { task: state.goalText ?? '', artifact: '', files: [] }
         let verdict: ReviewVerdict
         try {
-          verdict = await this.reviewer.review(evidence)
+          verdict = await this.reviewer.review(evidence, { conversationSessionId: sessionId })
         } catch (error) {
           console.warn(`[deepseek-web] ${reviewLabel} 审核失败，跳过本轮审核：`, error instanceof Error ? error.message : error)
           break

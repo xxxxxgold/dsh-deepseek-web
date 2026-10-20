@@ -149,6 +149,21 @@ export interface Config {
    * - `abort`：直接抛错，宁可停下也不让模型在缺图的情况下猜。
    */
   uploadOnError: 'fallback-text' | 'abort'
+  /**
+   * 同时保留的网页标签页上限（每个并发会话独占一个标签页）。
+   * 主会话与它派生的子代理是两个不同会话，各自拿自己的标签页，互不遮挡；
+   * 超出上限时回收最久未使用的会话页（该会话下次请求会重新回放宿主上下文）。
+   */
+  maxSessionPages: number
+  /** 单个网页回合（一次"填入 → 发送 → 等回复"）的硬上限（毫秒）；超时中止并报错，0 表示不限制。 */
+  turnTimeoutMs: number
+  /**
+   * 会话锁租约（毫秒）。持有者超过该时长仍未释放时强制回收，
+   * 防止宿主放弃生成器后后续请求永久排队。0 表示不启用。
+   */
+  lockLeaseMs: number
+  /** 单次模型请求（整条流，可能包含多轮网页回合）的硬上限（毫秒）；超时主动取消，0 表示不限制。 */
+  maxStreamMs: number
   /** 多久注入一次控制协议快照（按轮数）。 */
   protocolRefreshEvery: number
   /** 是否每一轮都注入协议与工具清单（默认开，防止网页会话上下文丢失后模型退化成普通聊天）。 */
@@ -251,6 +266,10 @@ const schema = z.object({
   maxImagesPerTurn: markVolatile(z.number().step(1).min(0).max(32).default(4)),
   uploadTimeoutMs: markVolatile(z.number().step(1).min(1_000).default(60_000)),
   uploadOnError: markVolatile(z.union(['fallback-text', 'abort']).default('fallback-text')),
+  maxSessionPages: z.number().step(1).min(1).max(8).default(3),
+  turnTimeoutMs: z.number().step(1).min(0).default(900_000),
+  lockLeaseMs: z.number().step(1).min(0).default(4_500_000),
+  maxStreamMs: z.number().step(1).min(0).default(3_600_000),
   protocolRefreshEvery: markVolatile(z.number().step(1).min(1).default(8)),
   protocolEveryRequest: markVolatile(z.boolean().default(false)),
   toolAllowlist: markVolatile(z.array(z.string()).default([

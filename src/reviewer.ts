@@ -103,6 +103,11 @@ export function parseReviewVerdict(text: string): ReviewVerdict {
   return { ok: false, issues: ['审核回复无法解析为 JSON'], suggestions: [], raw: text }
 }
 
+/** 审核请求的可选上下文：同对话自审要落回发起审阅的那个 dsh 会话。 */
+export interface ReviewOptions {
+  conversationSessionId?: string
+}
+
 export class KimiReviewer {
   /** Kimi 审核需要外部证据（任务 + 产出 + 文件内容）。 */
   readonly needsEvidence = true
@@ -116,7 +121,7 @@ export class KimiReviewer {
   }
 
   /** 提交一次审核；需要用户在 Kimi 页面人工点击发送。 */
-  async review(evidence: ReviewEvidence): Promise<ReviewVerdict> {
+  async review(evidence: ReviewEvidence, _options: ReviewOptions = {}): Promise<ReviewVerdict> {
     await this.channel.ensureReady()
     const result = await this.channel.turn({
       sessionId: KIMI_REVIEW_SESSION,
@@ -141,7 +146,7 @@ export class GlmReviewer {
   }
 
   /** 提交一次审核；需要用户在 GLM 页面人工点击发送。 */
-  async review(evidence: ReviewEvidence): Promise<ReviewVerdict> {
+  async review(evidence: ReviewEvidence, _options: ReviewOptions = {}): Promise<ReviewVerdict> {
     await this.channel.ensureReady()
     const result = await this.channel.turn({
       sessionId: GLM_REVIEW_SESSION,
@@ -167,14 +172,17 @@ export class DeepSeekSelfReviewer {
     this.channel = channel
   }
 
-  async review(evidence: ReviewEvidence): Promise<ReviewVerdict> {
+  async review(evidence: ReviewEvidence, options: ReviewOptions = {}): Promise<ReviewVerdict> {
     const goal = evidence.task.trim().slice(0, 300)
     const text = goal
       ? `${SELF_REVIEW_PROTOCOL}\n\n[任务目标（供对照）]\n${goal}`
       : SELF_REVIEW_PROTOCOL
+    // 显式指定发起审阅的会话：并发子代理刷新"最近使用页"也不会把自审写进子代理的网页对话。
+    const target = options.conversationSessionId
     const result = await this.channel.turn({
       sessionId: 'deepseek-self-review',
       preserveConversation: true,
+      ...target !== undefined ? { conversationSessionId: target } : {},
       model: 'deepseek-web',
       text,
       initialize: false,
