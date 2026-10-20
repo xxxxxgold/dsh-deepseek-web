@@ -170,6 +170,21 @@ export interface Config {
    * 默认 2：不同会话能并行，又不会因为并发过高触发账号级频控。
    */
   maxConcurrentTurns: number
+  /**
+   * 消息填入输入框后、按下发送之前的随机停留区间（毫秒，取 [min, max] 内随机值）。
+   * 真人不会打完字就立刻回车；固定延迟方差≈0 反而是机器特征，所以用区间随机。
+   * 两者都为 0 即关闭停顿。
+   */
+  sendPauseMinMs: number
+  sendPauseMaxMs: number
+  /**
+   * 连续发满多少轮后强制长休（0 表示关闭）。真人不会连着几十轮零休息地发消息，
+   * 长任务中途插一段静默能明显降低"机器密度"判定。区间见 longRunPauseMinMs/MaxMs。
+   * "连续" 按 10 分钟内仍有请求活动判定：超过 10 分钟没有请求即视为断开并重新计数。
+   */
+  longRunAfterSends: number
+  longRunPauseMinMs: number
+  longRunPauseMaxMs: number
   /** 多久注入一次控制协议快照（按轮数）。 */
   protocolRefreshEvery: number
   /** 是否每一轮都注入协议与工具清单（默认开，防止网页会话上下文丢失后模型退化成普通聊天）。 */
@@ -250,12 +265,16 @@ function markVolatile<T extends { volatile?: () => unknown; extra?: (key: 'volat
 const schema = z.object({
   url: markVolatile(z.string().default('https://chat.deepseek.com')),
   // 默认由插件启动独立浏览器；attach 保留给需要复用外部 CDP 浏览器的高级用户。
-  browser: z.union(['managed', 'attach']).default('managed'),
-  channel: z.union(['msedge', 'chrome']).default('msedge'),
+  // browser/channel/profileDir 在通道构造时读取（见 playwright-channel.ts），
+  // 因此设置页改完要重启 DSH 才生效；标 volatile 是为了让它们可写进 profile patch。
+  browser: markVolatile(z.union(['managed', 'attach']).default('managed')),
+  channel: markVolatile(z.union(['msedge', 'chrome']).default('msedge')),
   debugPort: markVolatile(z.number().step(1).min(1024).max(65535).default(9333)),
   autoStartKeeper: z.boolean().default(true),
   stateFile: z.string(),
-  profileDir: z.string(),
+  // 空串 = 用运行时默认目录（%LOCALAPPDATA%\DshDeepSeekWeb\edge-profile）。
+  // 必须带默认值：设置表单的 schema 里必填字段缺失会让客户端 decode 失败。
+  profileDir: markVolatile(z.string().default('')),
   sendMode: markVolatile(z.union(['manual', 'approved']).default('manual')),
   model: markVolatile(z.union([...WEB_MODEL_IDS]).default('deepseek-web')),
   selectors: z.dict(z.string()),
@@ -277,6 +296,11 @@ const schema = z.object({
   lockLeaseMs: z.number().step(1).min(0).default(4_500_000),
   maxStreamMs: z.number().step(1).min(0).default(3_600_000),
   maxConcurrentTurns: z.number().step(1).min(0).max(64).default(2),
+  sendPauseMinMs: z.number().step(1).min(0).max(60_000).default(2_000),
+  sendPauseMaxMs: z.number().step(1).min(0).max(60_000).default(4_000),
+  longRunAfterSends: z.number().step(1).min(0).max(10_000).default(15),
+  longRunPauseMinMs: z.number().step(1).min(0).max(3_600_000).default(60_000),
+  longRunPauseMaxMs: z.number().step(1).min(0).max(3_600_000).default(180_000),
   protocolRefreshEvery: markVolatile(z.number().step(1).min(1).default(8)),
   protocolEveryRequest: markVolatile(z.boolean().default(false)),
   toolAllowlist: markVolatile(z.array(z.string()).default([

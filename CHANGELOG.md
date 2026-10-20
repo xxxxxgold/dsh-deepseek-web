@@ -2,6 +2,13 @@
 
 ## 未发布
 
+- **防风控：填入消息后随机停顿再发送**。全自动发送路径在 `insertText` 之后、回车之前插入一段随机停留（`sendPauseMinMs` 默认 2000、`sendPauseMaxMs` 默认 4000，两者为 0 即关闭），页面标题同步显示"已填入，X.Xs 后发送"。固定延迟的方差≈0 本身就是机器特征，所以取区间随机值。
+- **防风控：连续请求满 N 轮强制长休**。`longRunAfterSends`（默认 15，0 关闭）配合 `longRunPauseMinMs`/`longRunPauseMaxMs`（默认 60~180 秒）：同一通道连续发满 N 轮后静默一段再继续，模拟"真人不会连轴转几十轮"；连续计数在 10 分钟无请求后自动断开重算，不会让隔天的零散请求累计触发。
+- 新增「设置 → DeepSeek 网页」菜单：8 组 27 个可写参数一页配置，走宿主 `configForms` 的原子提交写回 profile 的 `cordis.patch.yml`；草稿态（保存／放弃修改／重新读取）、`Ctrl+S`／`⌘+S`、逐字段校验、逐字段「恢复默认」、保存后回读核对与冲突报错俱全；导航项顺序排在「内置插件」之后。
+- 插件管理器的行配置页与设置菜单共用同一份字段规格（`src/client/config-fields.ts`），差量提交与校验逻辑统一：清空的字段用 `unset` 回落默认值，非法值直接拦在页面内。
+- 修复插件管理器行配置页误判「当前部署不接受写入」并把全部控件置灰的问题：`ConfigFormSnapshot` 没有 `mode` 字段，原判据 `state.writable === true && state.mode === 'host'` 恒为假；改为只看 `state.writable`。
+- `browser`、`channel`、`profileDir` 补标 `volatile`，三者在设置菜单里可改（前两项与 profile 目录重启后生效）；`profileDir` 留空串时回落到运行时默认目录。
+- 设置页对老版本 DSH 做了降级：没有 `configForms`／`locale` 服务的宿主里，菜单不出现，插件其余功能照常工作。
 - **新增图片直传**：消息里的图片不再被压成 `[图片附件 sha256:…]` 文本标记，而是真正放进网页输入框，由 DeepSeek 网页端自己完成上传并随消息带 `ref_file_ids`，模型直接看到原图。默认开启（`enableImageUpload`），关掉即退回文本标记。
 - 系统协议第 8 条随开关切换：开启时告诉模型「附图随本条消息到达、可以直接查看」；关闭时明确「看不到图片内容、需要时调工具、不要猜」，避免模型凭文件名编造内容。
 - 上传实现：总字节 ≤45MB 走 Playwright `setInputFiles` 内联传输，更大则落临时文件走 CDP `DOM.setFileInputFiles`（Playwright 跨进程内联有 50MB 硬上限）；等网页端把 `fetch_files` 解析到 `SUCCESS` 才输入文字并发送；同名附件幂等跳过，频控重发不会重复上传；半自动模式下附件在窗口置顶前挂好，避免用户看到输入框就回车导致本轮丢图。

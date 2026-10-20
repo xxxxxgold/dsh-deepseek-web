@@ -22,7 +22,7 @@ dsh-deepseek-web-littlecar30@0.2.14
 再按上面步骤安装并重启。0.2.12 及以前包名为 `dsh-deepseek-web`，
 0.2.13 起包名为 `dsh-deepseek-web-littlecar30`，不要同时启用两者。
 卸载保留 `%LOCALAPPDATA%\DshDeepSeekWeb\` 中的浏览器登录态和运行数据；不用删除状态文件。
-安装后在新插件详情的 `llm-deepseek-web` 行点击 **配置**，检查自定义设置。
+安装后打开 **设置 → DeepSeek 网页** 检查自定义设置（插件详情里 `llm-deepseek-web` 行的 **配置** 是同一份表单）。
 
 ## 其他安装入口与常见问题
 
@@ -76,7 +76,7 @@ node node_modules/dsh-deepseek-web-littlecar30/tools/open-login-glm.mjs
 
 ## 验证安装
 
-插件页应出现 **DeepSeek 网页版通道**，其 `llm-deepseek-web` 行应启用，能打开中文配置页。
+插件页应出现 **DeepSeek 网页版通道**，其 `llm-deepseek-web` 行应启用；设置侧栏应出现 **DeepSeek 网页** 菜单。
 模型列表应出现 `deepseek-web` 与 `deepseek-web-auto`。先发送一句简单问候，
 确认 Edge 中可以提交消息，dsh 收到最终正文；半自动模式需要你在网页点发送。
 

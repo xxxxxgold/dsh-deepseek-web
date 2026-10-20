@@ -382,12 +382,17 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   private readonly options: PlaywrightChannelOptions
   private readonly profileDir: string
   private managedConnection: ManagedBrowserConnection | undefined
+  /** 连续请求计数与最后一次请求时间（防风控长休用，见 maybeTakeLongRunPause）。 */
+  private consecutiveSends = 0
+  private lastSendAt = 0
 
   constructor(options: PlaywrightChannelOptions) {
     this.options = options
+    // 空串等价于「用默认目录」：设置页里清空 profileDir 就是在表达这个意思，
+    // 而 Config 里该字段的默认值也是空串，所以这里按 falsy 兜底。
     this.profileDir = options.profileDir
-      ?? options.config.profileDir
-      ?? defaultProfileDir('edge-profile')
+      || options.config.profileDir
+      || defaultProfileDir('edge-profile')
   }
 
   /** 打开/连接浏览器并确保已登录；并发进入时只执行一次（单飞）。 */
@@ -980,6 +985,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   ): Promise<
     { kind: 'completed'; completion: ChatCompletionResponse } | { kind: 'rate-limited' }
   > {
+    // 连续发满 N 轮先静默一阵（防风控），再进入本轮。
+    await this.maybeTakeLongRunPause(page, request.signal)
+
     const autoSend = request.autoSend
       ?? this.autoSendSessions.get(request.sessionId)
       ?? this.options.config.sendMode === 'approved'
@@ -1073,7 +1081,13 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       await page.keyboard.insertText(request.text)
       if (page === this.page) this.markPageStarted(page)
       if (autoSend) {
-        // 全自动：输入框已聚焦（editor.click），模拟回车发送；不动窗口焦点，dsh 全程在前
+        // 全自动：输入框已聚焦（editor.click），先随机停一段再回车发送。
+        // 真人打完字不会立刻回车；固定延迟的方差≈0 反而是明显的机器特征。
+        const pause = this.pickPause(this.options.config.sendPauseMinMs, this.options.config.sendPauseMaxMs)
+        if (pause >= 1) {
+          await this.markPageStatus(page, `[dsh 已填入，${(pause / 1000).toFixed(1)}s 后发送]`)
+          await this.sleep(pause, request.signal)
+        }
         await editor.focus()
         await page.keyboard.press('Enter')
         await this.markPageStatus(page, request.purpose ? `[dsh 内部辅助：${request.purpose} 自动发送]` : '[dsh 自动发送中]')
@@ -1132,6 +1146,35 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       }
       await new Promise(resolve => setTimeout(resolve, Math.min(step, ms - waited)))
     }
+  }
+
+  /** 在 [min, max] 区间内取一个随机毫秒数；任何一端非法就按另一端处理。 */
+  private pickPause(min: number, max: number): number {
+    const lo = Math.max(0, Math.min(min, max))
+    const hi = Math.max(0, Math.max(min, max))
+    return lo + Math.random() * (hi - lo)
+  }
+
+  /**
+   * 连续请求过多时强制长休：真人不会连着几十轮零休息地发消息。
+   * 计数按"账号/通道实例"累积，10 分钟内没有新请求即视为断开、重新从 0 数。
+   */
+  private async maybeTakeLongRunPause(page: Page, signal?: AbortSignal): Promise<void> {
+    const { longRunAfterSends, longRunPauseMinMs, longRunPauseMaxMs } = this.options.config
+    if (!longRunAfterSends || longRunAfterSends <= 0) return
+    const now = Date.now()
+    if (now - this.lastSendAt > 10 * 60_000) this.consecutiveSends = 0
+    this.consecutiveSends += 1
+    this.lastSendAt = now
+    if (this.consecutiveSends <= longRunAfterSends) return
+    const pause = this.pickPause(longRunPauseMinMs, longRunPauseMaxMs)
+    this.consecutiveSends = 0
+    if (pause < 1) return
+    console.info(
+      `[deepseek-web] 连续 ${longRunAfterSends} 轮请求，按防风控策略静默 ${(pause / 1000).toFixed(1)}s…`,
+    )
+    await this.markPageStatus(page, `[dsh 防风控静默 ${(pause / 1000).toFixed(0)}s]`).catch(() => {})
+    await this.sleep(pause, signal)
   }
 
   /**

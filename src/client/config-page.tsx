@@ -19,6 +19,7 @@
 import { useState } from 'react'
 import type { JSX } from 'react'
 import type { PluginConfigViewProps } from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
+import { FIELDS, diffOps, errorMessageZh, fieldKey, parseList, readPath, validateField, type FieldErrorCode, type FieldPath } from './config-fields.ts'
 
 /** 本包在 profile 里的 npm 包名。 */
 export const PACKAGE_NAME = 'dsh-deepseek-web-littlecar30'
@@ -28,87 +29,6 @@ export const ROW_ENTRY_ID = 'llm-deepseek-web'
 
 /** 本插件在 Plugin Manager 里的 `plugins.row.config` 槽位 key。 */
 export const ROW_CONFIG_KEY = `${PACKAGE_NAME}#${ROW_ENTRY_ID}`
-
-/** 一步路径，对应 `SettingsPathOpView.path`。 */
-type FieldPath = readonly string[]
-
-/** 配置页暴露的一个字段。 */
-interface FieldSpec {
-  /** 相对配置根对象的路径；嵌套段逐级展开。 */
-  readonly path: FieldPath
-  /** 行标签。 */
-  readonly label: string
-  /** 补充说明。 */
-  readonly hint?: string
-  /** 控件类型。 */
-  readonly kind: 'boolean' | 'number' | 'text' | 'select' | 'list'
-  /** `select` 的可选值。 */
-  readonly options?: readonly string[]
-  /** `number` 的上下界。 */
-  readonly min?: number
-  readonly max?: number
-}
-
-/**
- * 配置页暴露的字段集合。
- *
- * 只列真正需要在部署间调整的项；安全不变量（如协议常量）与纯代码常量不在此列。
- * 未在此列出的字段仍可通过 profile 的 `cordis.patch.yml` 覆盖。
- */
-const FIELDS: readonly FieldSpec[] = [
-  { path: ['browser'], label: '浏览器连接模式', hint: 'managed = 插件启动独立浏览器；attach = 连接外部 CDP 浏览器。', kind: 'select', options: ['managed', 'attach'] },
-  { path: ['channel'], label: '独立浏览器类型', hint: '仅 managed 模式生效；使用已安装的真实 Edge 或 Chrome。', kind: 'select', options: ['msedge', 'chrome'] },
-  { path: ['profileDir'], label: '独立浏览器 profile', hint: '留空使用 %LOCALAPPDATA%\\DshDeepSeekWeb\\edge-profile。', kind: 'text' },
-  { path: ['review', 'enabled'], label: '启用审核', hint: '交付前用审核器复核最终正文；中间工具轮次不审。', kind: 'boolean' },
-  { path: ['review', 'provider'], label: '审核器', hint: '独立窗口审核（Kimi / GLM）需要对应浏览器已登录。', kind: 'select', options: ['deepseek-web', 'kimi', 'glm'] },
-  { path: ['review', 'maxRounds'], label: '单任务审核轮数', hint: '未通过时回注意见修正，最多这么多轮。', kind: 'number', min: 0, max: 10 },
-
-  { path: ['model'], label: '网页版模型入口', kind: 'select', options: ['deepseek-web', 'deepseek-web-auto'] },
-  { path: ['sendMode'], label: '发送模式', hint: 'manual = 每条消息填入后由你点击发送；approved 为预留。', kind: 'select', options: ['manual', 'approved'] },
-  { path: ['liveThinking'], label: '显示网页思考过程', hint: '默认关闭，只返回最终正文或工具调用；开启后展示网页真实思考，不重复展示正文。此设置不改变网页的思考模式。', kind: 'boolean' },
-  { path: ['enableImageUpload'], label: '图片直传', hint: '开启后把图片附件真正上传到网页输入框，由网页端原生识图；关闭则退回 [附图] 文本标记（模型看不到图片内容）。', kind: 'boolean' },
-  { path: ['maxImagesPerTurn'], label: '单轮图片上限（张）', hint: '一轮最多上传几张图；0 表示关闭上传。', kind: 'number', min: 0, max: 32 },
-  { path: ['uploadTimeoutMs'], label: '图片解析超时（毫秒）', hint: '等待网页端把图片解析为 SUCCESS 的上限；大图可调大。', kind: 'number', min: 1000 },
-  { path: ['compactionLanguage'], label: '压缩摘要语言', hint: 'task 跟随用户任务；host 保留宿主要求；zh 中文；en 英文。只调整官方压缩模板。', kind: 'select', options: ['task', 'host', 'zh', 'en'] },
-
-  { path: ['rateLimit', 'enabled'], label: '频控自动重发', hint: '网页提示「发送过于频繁」时等待后自动重发同一条。', kind: 'boolean' },
-  { path: ['rateLimit', 'retryDelayMs'], label: '重发等待（毫秒）', kind: 'number', min: 1000 },
-  { path: ['rateLimit', 'maxRetries'], label: '单轮最大重发次数', kind: 'number', min: 0, max: 20 },
-
-  { path: ['toolAllowlist'], label: '工具白名单', hint: '每行一个；支持 `mcp__xxx__*` 前缀通配。留空表示不限制。', kind: 'list' },
-  { path: ['excludeToolNames'], label: '工具排除名单', hint: '每行一个；在白名单之后生效。', kind: 'list' },
-  { path: ['delegatedTools'], label: '委托工具', hint: '每行一个；只写进提示词交给网页端自带能力，不在本地执行。', kind: 'list' },
-
-  { path: ['focus', 'enabled'], label: '窗口自动聚焦', kind: 'boolean' },
-  { path: ['focus', 'webWindow'], label: '　└ 填入时聚焦网页窗口', kind: 'boolean' },
-  { path: ['focus', 'dshWindow'], label: '　└ 回合结束时聚焦 dsh 窗口', kind: 'boolean' },
-
-  { path: ['protocolEveryRequest'], label: '每轮都注入协议', hint: '开启后每条消息都带完整控制协议；代价是提示词更长。', kind: 'boolean' },
-  { path: ['protocolRefreshEvery'], label: '协议刷新间隔（轮）', hint: '未开启「每轮都注入」时，每隔这么多轮重新注入一次控制协议快照。', kind: 'number', min: 1 },
-  { path: ['maxToolResultChars'], label: '工具结果输入上限（字符）', hint: '只限制送入网页模型的工具结果；最终正文和网页委托结果完整展示。', kind: 'number', min: 256 },
-  { path: ['url'], label: 'DeepSeek 网页地址', kind: 'text' },
-  { path: ['debugPort'], label: 'CDP 调试端口', hint: 'attach 模式使用此端口；managed 模式把它作为首选端口，冲突时自动选择空闲端口。', kind: 'number', min: 1024, max: 65535 },
-]
-
-/** 按路径读取嵌套值；任一段缺失返回 undefined。 */
-function readPath(source: unknown, path: FieldPath): unknown {
-  let node: unknown = source
-  for (const key of path) {
-    if (node === null || typeof node !== 'object') return undefined
-    node = (node as Record<string, unknown>)[key]
-  }
-  return node
-}
-
-/** 把列表字段的草稿写回数组。 */
-function parseList(raw: string): string[] {
-  return raw.split('\n').map(line => line.trim()).filter(Boolean)
-}
-
-/** 是否相等（配置值都是 JSON 形状，按序列化比较足够）。 */
-function sameValue(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null)
-}
 
 const labelStyle = { display: 'block', fontSize: 13, lineHeight: '20px', marginBottom: 4 } as const
 const hintStyle = { fontSize: 12, lineHeight: '18px', opacity: 0.7, margin: '2px 0 0' } as const
@@ -131,9 +51,18 @@ export function DeepSeekWebConfigPage({ view, form }: PluginConfigViewProps): JS
   }
 
   const accepted = (form?.state.value ?? {}) as Record<string, unknown>
+  const user = (form?.state.user ?? {}) as Record<string, unknown>
   const revision = form?.state.revision
-  const writable = form?.state.writable === true && form?.state.mode === 'host'
+  // ConfigFormSnapshot 只有 writable（宿主是否接受写入），没有 `mode`；
+  // 0.2 的 Host 持久化永远给 true，非 Host 部署给 false。
+  const writable = form?.state.writable === true
   const current = draft ?? accepted
+  const errors = new Map<string, FieldErrorCode>()
+  for (const field of FIELDS) {
+    const code = validateField(field, readPath(current, field.path))
+    if (code !== undefined) errors.set(fieldKey(field), code)
+  }
+  const blocked = errors.size > 0
 
   /** 暂存一次字段修改。 */
   const edit = (path: FieldPath, value: unknown): void => {
@@ -155,12 +84,11 @@ export function DeepSeekWebConfigPage({ view, form }: PluginConfigViewProps): JS
   /** 提交与本页字段相关的全部改动。 */
   const save = async (): Promise<void> => {
     if (!form || draft === null) return
-    const ops = FIELDS.flatMap((field) => {
-      const next = readPath(draft, field.path)
-      const previous = readPath(accepted, field.path)
-      if (sameValue(next, previous)) return []
-      return [{ op: 'set' as const, path: [...field.path], value: (next ?? null) as never }]
-    })
+    if (blocked) {
+      setNotice('有非法值，未保存。')
+      return
+    }
+    const ops = diffOps(draft, accepted, user)
     if (ops.length === 0) {
       setNotice('没有改动。')
       return
@@ -202,10 +130,12 @@ export function DeepSeekWebConfigPage({ view, form }: PluginConfigViewProps): JS
 
       {FIELDS.map((field) => {
         const value = readPath(current, field.path)
-        const id = field.path.join('.')
+        const id = `dsweb-row-${fieldKey(field)}`
+        const error = errors.get(fieldKey(field))
+        const invalid = error !== undefined
         return (
           <div key={id} style={rowStyle}>
-            <label style={labelStyle} htmlFor={id}>{field.label}</label>
+            <label style={labelStyle} htmlFor={id}>{field.label.zh}</label>
             {field.kind === 'boolean' && (
               <input
                 id={id}
@@ -260,13 +190,14 @@ export function DeepSeekWebConfigPage({ view, form }: PluginConfigViewProps): JS
                 onChange={event => edit(field.path, parseList(event.target.value))}
               />
             )}
-            {field.hint !== undefined && <p style={hintStyle}>{field.hint}</p>}
+            {field.hint !== undefined && <p style={hintStyle}>{field.hint.zh}</p>}
+            {invalid && <p style={{ ...hintStyle, color: 'var(--dsw-alias-label-error)' }}>{errorMessageZh(field, error as FieldErrorCode)}</p>}
           </div>
         )
       })}
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 20 }}>
-        <button type="button" disabled={!writable || busy || draft === null} onClick={() => { void save() }}>
+        <button type="button" disabled={!writable || busy || draft === null || blocked} onClick={() => { void save() }}>
           {busy ? '保存中…' : '保存'}
         </button>
         <button type="button" disabled={busy || draft === null} onClick={() => { setDraft(null); setNotice(null) }}>

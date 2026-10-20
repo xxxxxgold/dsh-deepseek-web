@@ -70,8 +70,10 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 
 ## 配置
 
-配置入口通常是桌面版的“插件”页面 → `dsh-deepseek-web-littlecar30` →
-`llm-deepseek-web` → “配置”。也可以在 patch 的 `config` 中写入同样的字段。
+配置入口有两个：**设置 → DeepSeek 网页**（8 组 27 项常用参数，保存即写回 profile 的
+`cordis.patch.yml`），以及桌面版“插件”页面 → `dsh-deepseek-web-littlecar30` →
+`llm-deepseek-web` → “配置”（同一份表单）。下表的进阶字段（超时、并发、防风控停顿等）
+没有表单入口，直接在 patch 的 `config` 中写入。
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
@@ -87,6 +89,9 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `streamIdleTimeoutMs` | `600000` | 网页流空闲超时 |
 | `maxSessionPages` | `3` | 同时保留的会话标签页上限（每个并发会话独占一页）；超出按“最久未用且当前没在跑”的页回收，`1`–`8` |
 | `maxConcurrentTurns` | `2` | 全局并发上限：同一时刻最多几条请求真在网页上跑（主会话/子代理/辅助请求一起算）；超出的按先进先出排队，`0` 表示不限制 |
+| `sendPauseMinMs` / `sendPauseMaxMs` | `2000` / `4000` | 全自动发送时，消息填入输入框之后、按回车之前的随机停留区间（毫秒）；真人不会打完字立刻回车，固定延迟方差≈0 反而是机器特征。两者为 `0` 即关闭 |
+| `longRunAfterSends` | `15` | 连续发满多少轮后强制静默一段（防风控），`0` 关闭；10 分钟内无请求即视为断开、重新计数 |
+| `longRunPauseMinMs` / `longRunPauseMaxMs` | `60000` / `180000` | 上面那次强制静默的随机区间（毫秒） |
 | `turnTimeoutMs` | `900000` | 单个网页回合上限，超时中止并报错，`0` 表示不限制 |
 | `lockLeaseMs` | `4500000` | 会话锁租约，持有者泄漏时到点强制回收；必须大于“最大合法整轮” |
 | `maxStreamMs` | `3600000` | 单次请求（整条流，含纠错/委托/多轮审核）上限，超时主动取消网页回合，`0` 表示不限制 |
