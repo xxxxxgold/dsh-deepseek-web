@@ -3,3 +3,13 @@ profile/
 node_modules/
 *.tgz
 *.log
+
+# 临时工作目录（排查/实验产物，不入库）
+.tmp-*/
+
+# Trellis 本地产物（不入库）
+.trellis/
+.agents/
+.dsh/
+AGENTS.md
+.gitattributes
