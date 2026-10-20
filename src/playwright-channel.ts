@@ -826,6 +826,25 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
    * 同时把网页端的流式增量经 onProgress 回调上抛（实时思考流）。
    */
   /**
+   * 清掉输入框里残留的附件预览。
+   *
+   * 用户取消上一轮、或发送前抛错时，网页输入框里可能还挂着上次的图；不清掉就会
+   * 串到本轮（发一条纯文本却带上旧图）。每轮发送前统一清一次，无附件时零开销
+   * （找不到预览就直接返回）。
+   */
+  private async clearAttachments(page: Page): Promise<void> {
+    // 删除按钮是预览块里唯一"直接子元素是 .ds-icon"的 div（class 名是构建哈希，不可依赖）。
+    const remove = page.locator(`${ATTACHMENT_PREVIEW_SELECTOR} div:has(> .ds-icon)`)
+    for (let guard = 0; guard < 40; guard += 1) {
+      const count = await remove.count().catch(() => 0)
+      if (count === 0) return
+      const clicked = await remove.first().click({ timeout: 2_000 }).then(() => true, () => false)
+      if (!clicked) return
+      await this.sleep(150).catch(() => {})
+    }
+  }
+
+  /**
    * 把本轮的图片挂到网页输入框（由网页端自己完成上传并回填 `ref_file_ids`）。
    *
    * 顺序很重要：必须在键盘输入文本之前完成——半自动模式一把窗口置顶，用户可能
@@ -840,10 +859,15 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
    */
   private async attachAttachments(page: Page, request: BrowserTurnRequest): Promise<void> {
     const files = request.attachments ?? []
-    if (files.length === 0) return
     const { config } = this.options
 
     try {
+      if (files.length === 0) {
+        // 纯文本轮：清掉可能残留的旧附件，避免上一轮取消后留在输入框里的图串到本轮。
+        await this.clearAttachments(page)
+        return
+      }
+
       const input = page.locator('input[type="file"]').first()
       if (await input.count().catch(() => 0) === 0) {
         this.handleUploadFailure(request, new Error('页面上没有找到 input[type="file"]'))
@@ -860,6 +884,8 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         return
       }
 
+      // 只留本轮的图：先清掉残留（上一次取消/失败留下的），再挂新的。
+      await this.clearAttachments(page)
       const before = await page.locator(ATTACHMENT_PREVIEW_SELECTOR).count().catch(() => 0)
       // 网页端自己的上传状态机：upload_file → fetch_files（PENDING → PARSING → SUCCESS）。
       // 预览缩略图出现只说明"文件被接住"，PARSING 完成才能发送，否则模型看不到图。
@@ -1041,8 +1067,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       // 清掉可能残留的内容
       await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
       await page.keyboard.press('Backspace')
-      // 先把图片挂上去，再打字、再发送：顺序反了（尤其半自动置顶后）用户可能
-      // 在附件还没挂好时提前回车，导致本轮图片静默丢失。
+      // 先清掉可能残留的旧附件，避免上一轮取消后留在输入框里的图串到本轮。
       await this.attachAttachments(page, request)
       request.signal?.throwIfAborted()
       await page.keyboard.insertText(request.text)
