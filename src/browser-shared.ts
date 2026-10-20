@@ -103,6 +103,175 @@ export async function looksSendBlocked(page: Page): Promise<boolean> {
 }
 
 /**
+ * 给一个 promise 加超时，超时抛出带稳定错误码的 LlmError。
+ *
+ * `response.body()` / `response.finished()` 都没有 timeout 参数：网页流一旦卡住，
+ * 这两个 promise 会一直挂着，整轮就“卡死、不会重新获取”。包一层超时后，
+ * 卡住会变成一次明确的失败，上层才有机会重连重试。
+ */
+export function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  code: string,
+  message: string,
+): Promise<T> {
+  if (!(ms > 0)) return promise
+  return new Promise<T>((resolve, reject) => {
+    const timer: ReturnType<typeof setTimeout> = setTimeout(() => reject(new LlmError(message, code)), ms)
+    // 不 unref：这里必须保证超时一定能触发。unref 会让事件循环在“只剩这个定时器”
+    // 时直接退出（独立脚本里表现为函数永不返回、await 悬空）。promise 落定时一定会
+    // clearTimeout，正常路径不会留下悬挂定时器。
+    promise.then(
+      value => { clearTimeout(timer); resolve(value) },
+      error => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+/** 发送按钮候选选择器（点击发送的兜底路径，与 looksSendBlocked 共用语义）。 */
+export const SEND_BUTTON_CANDIDATES = [
+  'button[class*="sendMessage" i]',
+  'button[aria-label*="发送"]',
+  'button[aria-label*="send" i]',
+  'button[title*="发送"]',
+  'button[title*="send" i]',
+  '[role="button"][aria-label*="发送"]',
+  '[role="button"][aria-label*="send" i]',
+  '[data-testid*="send" i]',
+]
+
+/** 定位发送按钮（不可用/不存在时返回未命中的 locator）。 */
+export function locateSendButton(page: Page): Locator {
+  return page.locator(SEND_BUTTON_CANDIDATES.join(', ')).first()
+}
+
+/**
+ * 读取输入框当前文本。
+ *
+ * textarea/input 走 `inputValue()`；contenteditable 走 `innerText`。
+ * 两者都要能读到，否则“发送后是否清空”的判断在 Kimi（contenteditable）
+ * 与部分站点（textarea）上会有一半失效。
+ */
+export async function readEditorText(editor: Locator): Promise<string> {
+  const tagName = await editor.evaluate(element => element.tagName.toLowerCase()).catch(() => '')
+  if (tagName === 'textarea' || tagName === 'input') {
+    return (await editor.inputValue().catch(() => '')).trim()
+  }
+  return (await editor.innerText().catch(() => '')).trim()
+}
+
+/** 一次发送尝试的结果，用于日志与最终错误信息。 */
+export interface SendOutcome {
+  /** 是否确认发送成功（输入框已被清空，或外部信号表明请求已发出）。 */
+  sent: boolean
+  /** 最终生效的方式；`none` 表示所有尝试都没能确认发出。 */
+  via: 'enter' | 'button' | 'none'
+  /** 每次尝试的简述（按发生顺序），便于定位站点差异。 */
+  attempts: string[]
+}
+
+export interface SendEditorMessageOptions {
+  /** 单次尝试后等待“已发送”信号的窗口（毫秒）。 */
+  verifyTimeoutMs?: number
+  /** 最多尝试几轮（每轮 = 回车 + 按钮兜底）。 */
+  maxAttempts?: number
+  /** 回车前的随机停顿区间（毫秒）；两者都为 0 即关闭。 */
+  pauseMinMs?: number
+  pauseMaxMs?: number
+  /** 外部信号：网页请求是否已经发出（已发出即视为发送成功，不再纠结输入框状态）。 */
+  hasResponse?: () => boolean
+  /** 该回合是否已被取消；取消后不再继续尝试发送。 */
+  isCancelled?: () => boolean
+}
+
+/**
+ * 把输入框里已填好的内容真正发出去，并**确认**它发出去了。
+ *
+ * 这是“文字填进去了、但没发送、必须人工点一下”这个问题的根治点：
+ * 只按一次回车是不够的——不同站点/不同版本对回车键的处理不同（有的发送、
+ * 有的换行、有的被输入法或焦点吃掉），所以流程是
+ * `回车 → 观察输入框是否清空 → 没清空就点发送按钮 → 再观察 → 仍不行才报失败`。
+ *
+ * 判定“已发送”的信号（任一命中即可）：
+ * 1. 输入框被清空（绝大多数站点发送后清空输入区）；
+ * 2. 外部 `hasResponse()` 返回 true（网络层已经看到本轮请求）；
+ * 3. 发送按钮从“可用”变成“不可用/消失”（生成中按钮态）。
+ *
+ * 整个过程受 `isCancelled()` 约束：宿主取消回合时立刻停止尝试，不拖时间。
+ */
+export async function sendEditorMessage(
+  page: Page,
+  editor: Locator,
+  options: SendEditorMessageOptions = {},
+): Promise<SendOutcome> {
+  const verifyTimeoutMs = options.verifyTimeoutMs ?? 1_500
+  const maxAttempts = Math.max(1, options.maxAttempts ?? 2)
+  const pauseMinMs = Math.max(0, options.pauseMinMs ?? 0)
+  const pauseMaxMs = Math.max(pauseMinMs, options.pauseMaxMs ?? 0)
+  const isCancelled = options.isCancelled ?? (() => false)
+  const hasResponse = options.hasResponse ?? (() => false)
+  const attempts: string[] = []
+
+  const before = await readEditorText(editor)
+  if (before.length === 0) {
+    return { sent: false, via: 'none', attempts: ['输入框为空，没有可发送的内容'] }
+  }
+
+  /** 等待“已发送”信号；命中返回 true。 */
+  const waitSent = async (): Promise<boolean> => {
+    const deadline = Date.now() + verifyTimeoutMs
+    while (Date.now() < deadline) {
+      if (isCancelled()) return false
+      if (hasResponse()) return true
+      const current = await readEditorText(editor).catch(() => before)
+      // 发送后站点会清空输入区；只要内容变空（或大幅缩短）就认为消息已提交。
+      if (current.length === 0 || current.length < before.length / 2) return true
+      await page.waitForTimeout(80)
+    }
+    return false
+  }
+
+  const randomPause = async (): Promise<void> => {
+    if (pauseMaxMs <= 0) return
+    const span = pauseMaxMs - pauseMinMs
+    const delay = pauseMinMs + (span > 0 ? Math.floor(Math.random() * span) : 0)
+    await page.waitForTimeout(delay)
+  }
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (isCancelled()) break
+
+    // 路径一：回车。先聚焦，确保按键落到输入框而不是页面其它元素。
+    await editor.focus().catch(() => {})
+    await randomPause()
+    if (isCancelled()) break
+    const pressed = await page.keyboard.press('Enter').then(() => true).catch(() => false)
+    attempts.push(`第 ${attempt} 轮回车：${pressed ? '已按下' : '按键失败'}`)
+    if (pressed && await waitSent()) return { sent: true, via: 'enter', attempts }
+
+    // 路径二：点发送按钮。回车被当成“换行”或焦点丢失时，这一步是主要兜底。
+    if (isCancelled()) break
+    const button = locateSendButton(page)
+    const visible = await button.isVisible().catch(() => false)
+    if (visible) {
+      const enabled = await button.evaluate(element => !element.hasAttribute('disabled')
+        && element.getAttribute('aria-disabled') !== 'true').catch(() => false)
+      if (enabled) {
+        const clicked = await button.click({ timeout: 3_000 }).then(() => true).catch(() => false)
+        attempts.push(`第 ${attempt} 轮点发送按钮：${clicked ? '已点击' : '点击失败'}`)
+        if (clicked && await waitSent()) return { sent: true, via: 'button', attempts }
+      } else {
+        attempts.push(`第 ${attempt} 轮点发送按钮：按钮不可用`)
+      }
+    } else {
+      attempts.push(`第 ${attempt} 轮点发送按钮：未找到发送控件`)
+    }
+  }
+
+  return { sent: false, via: 'none', attempts }
+}
+
+/**
  * 登录墙判定：URL 命中登录标记，或“输入框可见 + 页面有登录入口 + 发送控件被禁用”。
  *
  * 只按 URL 判断会漏掉 chat.z.ai 这类站点：未登录时停在首页、输入框照样可见，
@@ -328,8 +497,15 @@ export async function connectBrowser(options: {
   } catch (error) {
     if (!options.autoStartKeeper) throw error
     spawnKeeper({ profileDir: options.profileDir, port: options.port, url: options.url })
-    for (let attempt = 0; attempt < 60; attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 1_000))
+    // 守护拉起浏览器通常 1~2 秒就绪。原来是固定 1 秒一跳、最多 60 跳：
+    // 已经就绪的情况下也要白等最多 1 秒。改成前 3 秒密集探测（150ms 一跳），
+    // 之后就绪概率降低后再放慢到 500ms —— 总时长仍是 60 秒，但常见情况能快 3~6 倍。
+    const deadline = Date.now() + 60_000
+    let waited = 0
+    while (Date.now() < deadline) {
+      const delay = waited < 3_000 ? 150 : 500
+      await new Promise(resolve => setTimeout(resolve, delay))
+      waited += delay
       try {
         const browser = await chromium.connectOverCDP(endpoint)
         const context = browser.contexts()[0]
