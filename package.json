@@ -55,7 +55,7 @@
     "build": "npm run build:host && npm run build:client",
     "build:host": "tsdown --config tsdown.host.config.ts --config-loader tsx",
     "build:client": "tsdown --config tsdown.config.ts --config-loader tsx",
-    "test:parsers": "tsx tools/synthetic-parse-check.ts && tsx tools/kimi-parse-check.ts && tsx tools/kimi-gzip-check.ts && tsx tools/glm-parse-check.ts && tsx tools/action-repair-check.ts && tsx tools/image-upload-check.ts && tsx tools/review-evidence-check.ts && tsx tools/rate-limit-check.ts && tsx tools/usage-check.ts && tsx tools/handoff-check.ts && tsx tools/adapter-output-check.ts && tsx tools/compaction-check.ts && tsx tools/dsml-check.ts && tsx tools/concurrency-check.ts && node tools/compaction-config-check.mjs",
+    "test:parsers": "tsx tools/synthetic-parse-check.ts && tsx tools/kimi-parse-check.ts && tsx tools/kimi-gzip-check.ts && tsx tools/glm-parse-check.ts && tsx tools/action-repair-check.ts && tsx tools/image-upload-check.ts && tsx tools/image-attach-check.ts && tsx tools/review-evidence-check.ts && tsx tools/rate-limit-check.ts && tsx tools/usage-check.ts && tsx tools/handoff-check.ts && tsx tools/adapter-output-check.ts && tsx tools/compaction-check.ts && tsx tools/dsml-check.ts && tsx tools/concurrency-check.ts && node tools/compaction-config-check.mjs",
     "pack": "npm pack"
   },
   "devDependencies": {
