@@ -26,6 +26,7 @@ export interface FieldText {
 export type FieldGroupId =
   | 'connection'
   | 'model'
+  | 'risk'
   | 'image'
   | 'review'
   | 'ratelimit'
@@ -80,6 +81,14 @@ export const GROUPS: readonly FieldGroup[] = [
     hint: {
       zh: '网页端模型入口、消息如何发出，以及控制协议怎么注入。',
       en: 'Model entry, how messages leave the page, and how the control protocol is injected.',
+    },
+  },
+  {
+    id: 'risk',
+    label: { zh: '风控模式', en: 'Risk control' },
+    hint: {
+      zh: '整体防封档位 + 细粒度参数。一键套用档位会把下面几个值成套写入；选「自定义」才逐项手调。',
+      en: 'Overall anti-ban profile plus fine-grained knobs. Picking a profile writes the values below in one shot; choose “Custom” to tune them by hand.',
     },
   },
   {
@@ -245,6 +254,84 @@ export const FIELDS: readonly FieldSpec[] = [
       zh: '只限制送入网页模型的工具结果；最终正文与委托结果完整展示。',
       en: 'Limits only what reaches the web model; final text and delegated output stay complete.',
     },
+  },
+  {
+    path: ['maxConcurrentTurns'],
+    group: 'risk',
+    kind: 'number',
+    label: { zh: '同账号并发上限', en: 'Concurrent turns per account' },
+    min: 0,
+    max: 64,
+    hint: {
+      zh: '同一时刻最多几条请求真的在网页上跑。要「一号两并发」填 2；填 1 即完全串行。0 = 不限（不建议，容易撞账号级频控）。',
+      en: 'How many requests may run on the page at once. Use 2 for two concurrent turns on one account; 1 fully serializes. 0 = unlimited (not recommended).',
+    },
+  },
+  {
+    path: ['maxSessionPages'],
+    group: 'risk',
+    kind: 'number',
+    label: { zh: '会话标签页上限', en: 'Session tab limit' },
+    min: 1,
+    max: 8,
+    hint: {
+      zh: '同时保留几个网页标签页（每个并发会话独占一个）。开得越多，服务端「同账号多开」的判定风险越高，建议与并发上限持平。',
+      en: 'How many page tabs stay open (one per concurrent session). More tabs raise the multi-window risk; keep it close to the concurrency limit.',
+    },
+  },
+  {
+    path: ['sendPauseMinMs'],
+    group: 'risk',
+    kind: 'number',
+    label: { zh: '发送前停顿下限（毫秒）', en: 'Pre-send pause min (ms)' },
+    min: 0,
+    max: 60_000,
+    hint: {
+      zh: '消息填进输入框后、按发送前的随机停顿下限。默认 2000；与上限同为 0 则关闭停顿。',
+      en: 'Lower bound of the random pause between filling the composer and sending. Default 2000; set both bounds to 0 to disable.',
+    },
+  },
+  {
+    path: ['sendPauseMaxMs'],
+    group: 'risk',
+    kind: 'number',
+    label: { zh: '发送前停顿上限（毫秒）', en: 'Pre-send pause max (ms)' },
+    min: 0,
+    max: 60_000,
+    hint: {
+      zh: '停顿上限，默认 4000。必须在下限与上限之间随机取值——固定间隔方差为零，是最明显的机器特征。',
+      en: 'Upper bound, default 4000. Always pick randomly inside the range: a fixed interval has zero variance and is the clearest bot signature.',
+    },
+  },
+  {
+    path: ['longRunAfterSends'],
+    group: 'risk',
+    kind: 'number',
+    label: { zh: '连发多少轮后长休', en: 'Long pause after N sends' },
+    min: 0,
+    max: 10_000,
+    hint: {
+      zh: '连续发送满这么多轮就强制休息一段，打断「稳定节拍」。默认 15；0 = 关闭。10 分钟没有任何请求会重新计数。',
+      en: 'After this many consecutive sends, take a long pause to break the metronome rhythm. Default 15; 0 = off. The counter resets after 10 idle minutes.',
+    },
+  },
+  {
+    path: ['longRunPauseMinMs'],
+    group: 'risk',
+    kind: 'number',
+    label: { zh: '长休下限（毫秒）', en: 'Long pause min (ms)' },
+    min: 0,
+    max: 3_600_000,
+    hint: { zh: '触发长休后的最短休息时长，默认 60000（60 秒）。', en: 'Minimum long-pause duration; default 60000 (60s).' },
+  },
+  {
+    path: ['longRunPauseMaxMs'],
+    group: 'risk',
+    kind: 'number',
+    label: { zh: '长休上限（毫秒）', en: 'Long pause max (ms)' },
+    min: 0,
+    max: 3_600_000,
+    hint: { zh: '长休上限，与下限之间随机，默认 180000（3 分钟）。', en: 'Maximum long-pause duration; randomized with the minimum. Default 180000 (3 min).' },
   },
 
   {
@@ -557,3 +644,88 @@ export function errorMessageZh(field: FieldSpec, code: FieldErrorCode): string {
       return ''
   }
 }
+
+/** 风控档位的 id。档位只是这几个字段的一组预设值，不是独立的运行时配置。 */
+export type RiskPresetId = 'off' | 'balanced' | 'strict'
+
+/** 当前取值命中的档位；与任何档位都不全等时为 `custom`。 */
+export type RiskTier = RiskPresetId | 'custom'
+
+/** 一个风控档位：几个字段成套写入的一组值。 */
+export interface RiskPreset {
+  readonly id: RiskPresetId
+  readonly label: FieldText
+  readonly hint: FieldText
+  /**
+   * 套用该档位时写入的字段值。
+   * 并发上限与标签页上限不进档位——用户明确要「一号两并发」，属手工决策项。
+   */
+  readonly values: readonly { readonly path: FieldPath; readonly value: unknown }[]
+}
+
+/** 三档风控预设，按「越靠前越宽松」排列。 */
+export const RISK_PRESETS: readonly RiskPreset[] = [
+  {
+    id: 'off',
+    label: { zh: '关闭', en: 'Off' },
+    hint: {
+      zh: '不插入发送前停顿、也不做长休：节奏最像脚本，只在你明确接受风险时用。',
+      en: 'No pre-send pause and no long pause; the rhythm looks scripted. Use only if you accept the risk.',
+    },
+    values: [
+      { path: ['sendPauseMinMs'], value: 0 },
+      { path: ['sendPauseMaxMs'], value: 0 },
+      { path: ['longRunAfterSends'], value: 0 },
+    ],
+  },
+  {
+    id: 'balanced',
+    label: { zh: '均衡（推荐）', en: 'Balanced (recommended)' },
+    hint: {
+      zh: '每轮随机停 2~4 秒，连发 15 轮休 1~3 分钟。同源社区项目长期使用、未触发封禁的一组值，也是默认值。',
+      en: 'Random 2–4s before each send, long pause of 1–3 min after 15 sends. Sourced from a long-lived peer project; also the defaults.',
+    },
+    values: [
+      { path: ['sendPauseMinMs'], value: 2_000 },
+      { path: ['sendPauseMaxMs'], value: 4_000 },
+      { path: ['longRunAfterSends'], value: 15 },
+      { path: ['longRunPauseMinMs'], value: 60_000 },
+      { path: ['longRunPauseMaxMs'], value: 180_000 },
+    ],
+  },
+  {
+    id: 'strict',
+    label: { zh: '严格', en: 'Strict' },
+    hint: {
+      zh: '每轮随机停 5~9 秒，连发 10 轮休 2~5 分钟。已经被限流过、或正在跑长链路自动化时用。',
+      en: 'Random 5–9s before each send, long pause of 2–5 min after 10 sends. Use after a rate-limit hit or for long tool chains.',
+    },
+    values: [
+      { path: ['sendPauseMinMs'], value: 5_000 },
+      { path: ['sendPauseMaxMs'], value: 9_000 },
+      { path: ['longRunAfterSends'], value: 10 },
+      { path: ['longRunPauseMinMs'], value: 120_000 },
+      { path: ['longRunPauseMaxMs'], value: 300_000 },
+    ],
+  },
+]
+
+/** 按当前值判断落在哪个档位；任一项不符即算 `custom`。 */
+export function matchRiskPreset(source: unknown): RiskTier {
+  for (const preset of RISK_PRESETS) {
+    if (preset.values.every(item => sameValue(readPath(source, item.path), item.value))) return preset.id
+  }
+  return 'custom'
+}
+
+/** 把某档位的全部值写进草稿，返回新草稿（不改动并发与标签页上限）。 */
+export function applyRiskPreset(
+  draft: Record<string, unknown> | null,
+  accepted: Record<string, unknown>,
+  preset: RiskPreset,
+): Record<string, unknown> {
+  let next = draft
+  for (const item of preset.values) next = withEdit(next, accepted, item.path, item.value)
+  return next ?? accepted
+}
+

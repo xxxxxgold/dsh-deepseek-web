@@ -2,9 +2,11 @@
 
 ## 未发布
 
+- **新增「风控模式」菜单**：把防风控参数整组搬进设置页，共 7 项可写——`maxConcurrentTurns`（同账号并发上限）、`maxSessionPages`（会话标签页上限）、`sendPauseMinMs`/`sendPauseMaxMs`（发送前随机停顿）、`longRunAfterSends`/`longRunPauseMinMs`/`longRunPauseMaxMs`（连续多轮后的长休）。顶部另有**一键档位**：关闭 / 均衡（推荐）/ 严格——点一下就把相关参数成套写进草稿，手动改其中任一项即显示「自定义」，当前命中的档位会高亮。并发与标签页上限不受档位影响，保持「一号两并发」。插件管理器的行配置页同步支持档位切换。
+- 新增离线回归 `tools/risk-config-check.ts`（字段路径与配置 schema 齐平、volatile 标记齐全、三档 apply→match 往返一致、档位不碰并发上限），并入 `npm run test:parsers`。
 - **防风控：填入消息后随机停顿再发送**。全自动发送路径在 `insertText` 之后、回车之前插入一段随机停留（`sendPauseMinMs` 默认 2000、`sendPauseMaxMs` 默认 4000，两者为 0 即关闭），页面标题同步显示"已填入，X.Xs 后发送"。固定延迟的方差≈0 本身就是机器特征，所以取区间随机值。
 - **防风控：连续请求满 N 轮强制长休**。`longRunAfterSends`（默认 15，0 关闭）配合 `longRunPauseMinMs`/`longRunPauseMaxMs`（默认 60~180 秒）：同一通道连续发满 N 轮后静默一段再继续，模拟"真人不会连轴转几十轮"；连续计数在 10 分钟无请求后自动断开重算，不会让隔天的零散请求累计触发。
-- 新增「设置 → DeepSeek 网页」菜单：8 组 27 个可写参数一页配置，走宿主 `configForms` 的原子提交写回 profile 的 `cordis.patch.yml`；草稿态（保存／放弃修改／重新读取）、`Ctrl+S`／`⌘+S`、逐字段校验、逐字段「恢复默认」、保存后回读核对与冲突报错俱全；导航项顺序排在「内置插件」之后。
+- 新增「设置 → DeepSeek 网页」菜单：9 组 34 个可写参数一页配置，走宿主 `configForms` 的原子提交写回 profile 的 `cordis.patch.yml`；草稿态（保存／放弃修改／重新读取）、`Ctrl+S`／`⌘+S`、逐字段校验、逐字段「恢复默认」、保存后回读核对与冲突报错俱全；导航项顺序排在「内置插件」之后。
 - 插件管理器的行配置页与设置菜单共用同一份字段规格（`src/client/config-fields.ts`），差量提交与校验逻辑统一：清空的字段用 `unset` 回落默认值，非法值直接拦在页面内。
 - 修复插件管理器行配置页误判「当前部署不接受写入」并把全部控件置灰的问题：`ConfigFormSnapshot` 没有 `mode` 字段，原判据 `state.writable === true && state.mode === 'host'` 恒为假；改为只看 `state.writable`。
 - `browser`、`channel`、`profileDir` 补标 `volatile`，三者在设置菜单里可改（前两项与 profile 目录重启后生效）；`profileDir` 留空串时回落到运行时默认目录。

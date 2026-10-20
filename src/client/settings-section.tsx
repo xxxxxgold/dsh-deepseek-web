@@ -22,11 +22,14 @@ import type { JSX } from 'react'
 import {
   FIELDS,
   GROUPS,
+  RISK_PRESETS,
+  applyRiskPreset,
   diffOps,
   fieldDomId,
   fieldKey,
   formatList,
   hasPath,
+  matchRiskPreset,
   parseList,
   readPath,
   sameValue,
@@ -36,6 +39,7 @@ import {
   type FieldErrorCode,
   type FieldOp,
   type FieldSpec,
+  type RiskPreset,
 } from './config-fields.ts'
 import { ROW_ENTRY_ID } from './config-page.tsx'
 
@@ -109,6 +113,9 @@ const STATIC_COPY = {
     unavailableHint: '仍可直接编辑 profile 的 cordis.patch.yml 覆盖 config。',
     missingForm: '宿主未提供配置表单句柄，无法在此编辑。',
     readonly: '当前部署不接受设置写入，字段仅供参考。',
+    riskTier: '风控模式（整体档位）',
+    riskTierHint: '点一个档位就把相关的发送节奏参数成套写进草稿，再按「保存」生效；手动改下面任一项即变成「自定义」。',
+    riskCustom: '自定义',
     custom: '已自定义',
     restart: '重启生效',
     reset: '恢复默认',
@@ -145,6 +152,9 @@ const STATIC_COPY = {
     unavailableHint: 'You can still override config in the profile’s cordis.patch.yml.',
     missingForm: 'The host did not provide a settings form handle, so this page cannot edit anything.',
     readonly: 'This deployment does not accept settings writes; fields are read-only.',
+    riskTier: 'Risk control profile',
+    riskTierHint: 'Picking a profile writes the related send-pacing values into the draft; press Save to apply. Editing any value by hand shows “Custom”.',
+    riskCustom: 'Custom',
     custom: 'Customized',
     restart: 'Restart to apply',
     reset: 'Reset to default',
@@ -191,6 +201,12 @@ function buildDictionaries(): { zh: Record<string, string>; en: Record<string, s
       zh[`field.${key}.hint`] = field.hint.zh
       en[`field.${key}.hint`] = field.hint.en
     }
+  }
+  for (const preset of RISK_PRESETS) {
+    zh[`risk.${preset.id}`] = preset.label.zh
+    en[`risk.${preset.id}`] = preset.label.en
+    zh[`risk.${preset.id}.hint`] = preset.hint.zh
+    en[`risk.${preset.id}.hint`] = preset.hint.en
   }
   return { zh, en }
 }
@@ -302,6 +318,20 @@ function SettingsSectionBody({ form, useSettingsForm, t, reload }: BodyProps): J
     return found
   }, [valueOf])
 
+  /** 草稿优先的「当前生效值」，供档位匹配用（草稿没碰过的字段取宿主值）。 */
+  const effective = useMemo(() => {
+    let merged = accepted
+    if (draft !== null) {
+      for (const field of FIELDS) {
+        if (hasPath(draft, field.path)) merged = withEdit(merged, accepted, field.path, readPath(draft, field.path))
+      }
+    }
+    return merged
+  }, [draft, accepted])
+
+  /** 当前落在哪个风控档位；与任何档位都不全等即「自定义」。 */
+  const riskTier = useMemo(() => matchRiskPreset(effective), [effective])
+
   const pendingOps = useMemo(() => diffOps(draft, accepted, user), [draft, accepted, user])
   const dirty = pendingOps.length > 0
   const blocked = errors.size > 0
@@ -316,6 +346,12 @@ function SettingsSectionBody({ form, useSettingsForm, t, reload }: BodyProps): J
     edit(field, parseList(raw))
     setListText(previous => ({ ...previous, [fieldKey(field)]: raw }))
   }, [edit])
+
+  /** 套用某个风控档位：把该档位的值成套写进草稿（仍要按「保存」才落盘）。 */
+  const applyTier = useCallback((preset: RiskPreset): void => {
+    setNotice(null)
+    setDraft(previous => applyRiskPreset(previous, accepted, preset))
+  }, [accepted])
 
   const discard = useCallback((): void => {
     setDraft(null)
@@ -485,6 +521,32 @@ function SettingsSectionBody({ form, useSettingsForm, t, reload }: BodyProps): J
           <section className="dsweb-group" key={group.id} aria-labelledby={`dsweb-group-${group.id}`}>
             <h3 className="dsweb-group-title" id={`dsweb-group-${group.id}`}>{t(`group.${group.id}`)}</h3>
             <p className="dsweb-group-hint">{t(`group.${group.id}.hint`)}</p>
+            {group.id === 'risk' && (
+              <div className="dsweb-row dsweb-row-wide" data-field="risk-tier">
+                <div className="dsweb-row-text">
+                  <span className="dsweb-row-label">{t('riskTier')}</span>
+                  <p className="dsweb-row-hint">{t('riskTierHint')}</p>
+                </div>
+                <div
+                  className="dsweb-row-control"
+                  style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'flex-end', alignItems: 'center' }}
+                >
+                  {RISK_PRESETS.map(preset => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      className={`dsweb-button ${riskTier === preset.id ? 'dsweb-button-primary' : 'dsweb-button-secondary'}`}
+                      disabled={!writable || busy}
+                      title={t(`risk.${preset.id}.hint`)}
+                      onClick={() => applyTier(preset)}
+                    >
+                      {t(`risk.${preset.id}`)}
+                    </button>
+                  ))}
+                  {riskTier === 'custom' && <span className="dsweb-badge dsweb-badge-warn">{t('riskCustom')}</span>}
+                </div>
+              </div>
+            )}
             {fields.map(field => (
               <FieldRow
                 key={fieldKey(field)}

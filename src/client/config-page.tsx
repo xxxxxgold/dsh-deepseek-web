@@ -19,7 +19,7 @@
 import { useState } from 'react'
 import type { JSX } from 'react'
 import type { PluginConfigViewProps } from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
-import { FIELDS, diffOps, errorMessageZh, fieldKey, parseList, readPath, validateField, type FieldErrorCode, type FieldPath } from './config-fields.ts'
+import { FIELDS, RISK_PRESETS, diffOps, errorMessageZh, fieldKey, matchRiskPreset, parseList, readPath, validateField, type FieldErrorCode, type FieldPath } from './config-fields.ts'
 
 /** 本包在 profile 里的 npm 包名。 */
 export const PACKAGE_NAME = 'dsh-deepseek-web-littlecar30'
@@ -127,6 +127,33 @@ export function DeepSeekWebConfigPage({ view, form }: PluginConfigViewProps): JS
           当前部署不接受写入（只读或非 Host 持久化），字段仅供参考；请改用 profile 的 cordis.patch.yml。
         </p>
       )}
+
+      <div style={rowStyle}>
+        <span style={labelStyle}>风控模式（整体档位）</span>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+          {RISK_PRESETS.map((preset) => {
+            const active = matchRiskPreset(current) === preset.id
+            return (
+              <button
+                key={preset.id}
+                type="button"
+                disabled={!writable || busy}
+                title={preset.hint.zh}
+                style={active ? { fontWeight: 600 } : undefined}
+                onClick={() => {
+                  for (const item of preset.values) edit(item.path, item.value)
+                }}
+              >
+                {active ? `● ${preset.label.zh}` : preset.label.zh}
+              </button>
+            )
+          })}
+          {matchRiskPreset(current) === 'custom' && <span style={hintStyle}>当前：自定义</span>}
+        </div>
+        <p style={hintStyle}>
+          点档位会把发送节奏参数成套写进草稿，再按「保存」生效；手动改下面任一项即变成「自定义」。并发上限与标签页上限不受档位影响。
+        </p>
+      </div>
 
       {FIELDS.map((field) => {
         const value = readPath(current, field.path)

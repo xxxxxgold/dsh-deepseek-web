@@ -70,10 +70,11 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 
 ## 配置
 
-配置入口有两个：**设置 → DeepSeek 网页**（8 组 27 项常用参数，保存即写回 profile 的
+配置入口有两个：**设置 → DeepSeek 网页**（9 组 34 项常用参数，保存即写回 profile 的
 `cordis.patch.yml`），以及桌面版“插件”页面 → `dsh-deepseek-web-littlecar30` →
-`llm-deepseek-web` → “配置”（同一份表单）。下表的进阶字段（超时、并发、防风控停顿等）
-没有表单入口，直接在 patch 的 `config` 中写入。
+`llm-deepseek-web` → “配置”（同一份表单）。下表的进阶字段（回合/流超时、锁租约等）
+仍没有表单入口，直接在 patch 的 `config` 中写入；**并发上限、标签页上限与防风控停顿**
+已并入表单的「风控模式」分组，并带「关闭 / 均衡 / 严格」一键档位。
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
