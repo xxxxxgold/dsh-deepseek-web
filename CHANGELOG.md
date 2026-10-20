@@ -9,6 +9,15 @@
 - 新增配置：`enableImageUpload`（默认开）、`maxImagesPerTurn`（默认 4）、`uploadTimeoutMs`（默认 60 秒）、`uploadOnError`（`fallback-text` 默认／`abort`），配置页可直接改。
 - 适配器 `listModels` 按开关声明 `inputModalities`（开启时含 `image`），宿主据此放行 ImageBlock；宿主没有附件服务时自动退回文本标记，不影响插件加载。
 - 新增离线回归 `tools/image-upload-check.ts`（占位文本、协议分支、收集去重与上限、增量/replay 选择），并入 `npm run test:parsers`。
+- 修复主会话与子代理并发请求时互相卡住：请求锁从"全进程一把"改为按 dsh 会话隔离，不同会话（主会话与它派生的子代理）各自使用独立网页标签页，可以真正并行；同一会话的多个网页回合仍然串行，保持共用一个网页对话的语义（回归自 0.2.13 的 `requestLock`）。
+- 修复三类会导致**永久**卡住的结构缺陷：宿主放弃生成（取消/切换会话/丢弃迭代器）后主动取消仍挂在网页上的回合（`channel.cancelTurn`）；锁增加租约看门狗（`lockLeaseMs`），泄漏的锁到点强制回收并告警；新增单回合上限（`turnTimeoutMs`）与整条流上限（`maxStreamMs`），超时以 `WEB_TURN_TIMEOUT`/`WEB_TURN_ABORTED` 明确失败，不再无限"生成中"。
+- 修复网页对话被"每轮重建 + 全量上下文回放"的问题：`conversationStarted`/`activeSessionId` 由全局改为每会话页记账，子代理切换标签页不再让主会话下一轮强制重建网页对话并重放检查点。
+- 内部辅助请求（压缩摘要、会话标题）改用一次性临时标签页且不再排队等待主请求整轮生成，标题请求可与主请求并行。
+- 同对话自审显式落在发起审阅的会话网页页上（`BrowserTurnRequest.conversationSessionId`），不再依赖"最近用过的页"或全局 focus（多会话并行时会写进子代理的网页对话）。
+- 新增配置：`maxSessionPages`（默认 3）、`turnTimeoutMs`（默认 15 分钟）、`maxStreamMs`（默认 60 分钟）、`lockLeaseMs`（默认 75 分钟）；启动时对超时/租约做交叉校验告警（租约须 ≥ 整轮上限 + 单回合上限，否则多回合请求可能被强拆）。
+- 新增全局并发网关 `maxConcurrentTurns`（默认 2）：同一时刻最多允许 N 条请求真正在网页上跑，超出的请求按到达顺序先进先出排队，每结束一条放行一条；`0` 表示不限制。名额池实现为 `src/concurrency-gate.ts`，排队可被取消且不泄露名额，`release` 幂等；先拿会话锁再抢名额，避免同一会话的排队请求白占全局名额。
+- 新增可观测日志：会话页建立/回收、`turn` 入口（会话、`initialize`、页面归属）、同会话排队超过 3 秒、并发上限排队与取得名额、锁租约回收、取消在飞回合。
+- 新增离线并发回归 `tools/concurrency-check.ts`（8 条契约：跨会话并行、同会话串行、放弃生成回收、辅助请求并行、锁租约、并发上限 FIFO 排队、上限放开、名额池单元契约），并入 `npm run test:parsers`。
 
 ## 0.2.14 — 2026-10-13
 
