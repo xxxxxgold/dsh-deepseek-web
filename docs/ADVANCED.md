@@ -104,6 +104,11 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `review.provider` | 发行 patch 为 `deepseek-web`；schema 为 `kimi` | `deepseek-web`、`kimi` 或 `glm` |
 | `review.debugPort` | `9334` | Kimi 审核浏览器 CDP 端口 |
 | `review.glmDebugPort` | `9335` | GLM 审核浏览器 CDP 端口 |
+| `review.autoSend` | `true` | 审核自动化程度：`true` = 全自动（填入后自动发送并确认真的发出，发不出去当场报错）；`false` = 半自动（只填入并聚焦窗口，等你点发送） |
+| `review.conversationMode` | `fresh` | `fresh` 每次审核前新开对话，上下文干净、不会越审越慢；`reuse` 复用同一个对话（历史累积，容易被上一轮结论带偏） |
+| `review.sendVerifyMs` | `1500` | 自动发送后确认“已发出”的等待窗口（毫秒）；窗口内没等到信号才视为没发出去 |
+| `review.sendRetries` | `2` | 发送未被确认时的重试轮数（每轮 = 回车 + 点发送按钮兜底） |
+| `review.fetchRetries` | `1` | 获取回复失败后的自动重试次数（`0` 关闭）；每次重试前都会丢弃旧连接并重新连浏览器 |
 
 完整字段和默认值见 [`src/config.ts`](https://github.com/LittleCar30/dsh-deepseek-web/blob/main/src/config.ts)。配置文件中的 profile、状态和
 校准数据默认保存在 `%LOCALAPPDATA%\DshDeepSeekWeb\`，不会写入插件安装目录。
@@ -156,6 +161,45 @@ node node_modules/dsh-deepseek-web-littlecar30/tools/glm-status.mjs --turn
 
 审核证据会优先读取工具实际写入的文件，并在达到 `maxEvidenceChars` 时标注截断。
 内部摘要和标题请求不进入交付审核，也不会附加“审核通过”等文字。
+
+### 审核消息怎么发出去
+
+`kimi` / `glm` 走的是真实网页，插件把审核内容填进输入框之后必须让页面真正发出这条消息。
+`review.autoSend` 把这里明确成两档，没有中间态：
+
+- **全自动（`true`，默认）**：填完自动发送，并且**确认真的发出去了**才继续等回复。确认流程是
+  「回车 → 看输入框是否清空 → 没清空就点发送按钮 → 再看」，命中任一信号即算发出
+  （输入框清空 / 网络层已看到本轮请求 / 发送按钮转为生成态）。没确认就按
+  `review.sendRetries` 重试，仍失败则报 `KIMI_SEND_FAILED` 并把每次尝试写进错误信息。
+  只按一次回车是不够的：有的版本回车会换行、有的会被输入法吞掉，这就是「填进去了却没发出去」的来源。
+- **半自动（`false`）**：填完停住，把窗口提到最前，等你自己点发送。适合想先看一眼审核内容再发的场景；
+  等待超过 `review.streamIdleTimeoutMs` 会明确报超时，不会静默挂住。
+
+### 审核对话怎么复用
+
+`review.conversationMode` 决定每次审核要不要新开对话：
+
+- `fresh`（默认）：每次审核前先清会话门控，让本轮带 `initialize` 新开一个对话。
+  审核 prompt 自带全部证据（协议 + 任务目标 + 产出 + 文件清单），不依赖历史；
+  而复用会让 Kimi 侧上下文越积越长，表现为**越审越慢**，还容易被上一轮的结论带偏。
+- `reuse`：复用同一个对话，不新开。只有当你明确希望审核器记得前几轮上下文时才用。
+
+补充一个容易踩的点：Kimi 通道的「已初始化对话」标记（`conversationStarted`）一旦置位就
+不会再新建对话，所以光传 `initialize: true` 是不够的——必须在每轮审核前调
+`resetConversationGate()` 把它清掉。`fresh` 模式的实现就依赖这一点。
+
+### 审核卡住时会发生什么
+
+获取回复阶段的每一段等待都有明确上限，不会无限挂住：
+
+- `response.finished()` / `response.body()` 的超时是 `review.streamIdleTimeoutMs`（默认 10 分钟），
+  超时抛 `KIMI_STREAM_STALLED` / `GLM_STREAM_STALLED`，而不是一直等。
+- 页面或浏览器已经失效（窗口被关掉、连接断掉）时立刻丢弃旧连接，下次请求重新连，
+  不在死页面上反复操作。
+- 等回复超时、空响应、页面断开、发送未确认这几类「环境抖动」会自动重试
+  `review.fetchRetries` 次（默认 1），重试前先重新连接浏览器。
+- 没登录、发送按钮被禁用、找不到输入框、用户取消这些**认得出根因**的失败直接报错，
+  不用重试把明确的错误拖成更长的等待。
 
 <a id="context-recovery"></a>
 ## 0.2.12：上下文压缩与任务接续
