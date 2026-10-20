@@ -164,6 +164,12 @@ export interface Config {
   lockLeaseMs: number
   /** 单次模型请求（整条流，可能包含多轮网页回合）的硬上限（毫秒）；超时主动取消，0 表示不限制。 */
   maxStreamMs: number
+  /**
+   * 全局并发上限：同一时刻最多允许多少条请求真正在网页上跑（主会话、子代理、辅助请求一起算）。
+   * 超出的请求按先进先出排队，一个一个放行；0 表示不限制（只观测不排队）。
+   * 默认 2：不同会话能并行，又不会因为并发过高触发账号级频控。
+   */
+  maxConcurrentTurns: number
   /** 多久注入一次控制协议快照（按轮数）。 */
   protocolRefreshEvery: number
   /** 是否每一轮都注入协议与工具清单（默认开，防止网页会话上下文丢失后模型退化成普通聊天）。 */
@@ -270,6 +276,7 @@ const schema = z.object({
   turnTimeoutMs: z.number().step(1).min(0).default(900_000),
   lockLeaseMs: z.number().step(1).min(0).default(4_500_000),
   maxStreamMs: z.number().step(1).min(0).default(3_600_000),
+  maxConcurrentTurns: z.number().step(1).min(0).max(64).default(2),
   protocolRefreshEvery: markVolatile(z.number().step(1).min(1).default(8)),
   protocolEveryRequest: markVolatile(z.boolean().default(false)),
   toolAllowlist: markVolatile(z.array(z.string()).default([

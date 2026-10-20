@@ -42,6 +42,7 @@ import {
 import type { ImageAttachmentRef } from './protocol.ts'
 import { buildReviewEvidence } from './protocol.ts'
 import { SessionRegistry, type ChannelTokenTotals, type WebChatState } from './session-state.ts'
+import { ConcurrencyGate } from './concurrency-gate.ts'
 import type { ReviewVerdict } from './reviewer.ts'
 import os from 'node:os'
 import path from 'node:path'
@@ -134,6 +135,12 @@ export class DeepSeekWebAdapter extends LlmAdapter {
    * 现在按会话分锁，不同会话并行；同一会话仍串行（它们共用同一个网页对话）。
    */
   private readonly sessionLocks = new Map<string, AsyncLock>()
+  /**
+   * 全局并发网关：所有会话共用一个"同时最多 N 条真在网页上跑"的名额池，
+   * 超出的请求按到达顺序排队。会话锁解决的是"不同会话不该互相排队"，
+   * 网关解决的是"并发太高会一起吃账号频控"——两者互补：先拿会话锁，再抢并发名额。
+   */
+  private readonly gate: ConcurrencyGate
   private readonly replaySessions = new Set<string>()
   private readonly sessions: SessionRegistry
   private readonly config: Config
@@ -161,6 +168,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const defaultStateFile = config.stateFile
       ?? path.join(appDataRoot, 'DshDeepSeekWeb', 'session-state.json')
     this.sessions = new SessionRegistry({ file: defaultStateFile })
+    this.gate = new ConcurrencyGate(() => this.config.maxConcurrentTurns)
     this.warnAboutTimeoutConfig()
   }
 
@@ -200,6 +208,13 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         '[deepseek-web] turnTimeoutMs=0：单个网页回合没有上限，'
         + `${sendMode === 'manual' ? '人工等待可能无限长' : '卡住的回合不会被收尾'}，`
         + '一旦超出租约会被强制放锁，建议保留有限的 turnTimeoutMs。',
+      )
+    }
+    const { maxConcurrentTurns, maxSessionPages } = this.config
+    if (maxConcurrentTurns > 0 && maxConcurrentTurns > maxSessionPages) {
+      console.warn(
+        `[deepseek-web] maxConcurrentTurns(${maxConcurrentTurns}) 大于 maxSessionPages(${maxSessionPages})：`
+        + '并发名额比可用的会话标签页还多，多出来的请求会先等页面回收，建议让两者一致或把 maxSessionPages 调大。',
       )
     }
   }
@@ -366,6 +381,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const lockKey = options.purpose !== undefined ? `${sessionId}::${options.purpose}` : sessionId
     const lock = this.lockFor(lockKey)
     let release: (() => void) | undefined
+    let gateRelease: (() => void) | undefined
     let completed = false
     let watchdog: ReturnType<typeof setTimeout> | undefined
     let queueLog: ReturnType<typeof setTimeout> | undefined
@@ -394,6 +410,25 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       if (queueLog) {
         clearTimeout(queueLog)
         queueLog = undefined
+      }
+
+      // 会话锁只保证"同一会话串行"；名额池保证"同时打网页的请求不超过 maxConcurrentTurns"。
+      // 顺序必须是先会话锁后名额：反过来的话，同一会话的第 2、3 个请求会抱着全局名额
+      // 等自己的会话锁，白白占住名额把别的会话饿死。
+      const gateStartedAt = Date.now()
+      gateRelease = await this.gate.acquire(options.signal, {
+        onWait: info => console.info(
+          `[deepseek-web] 并发上限 ${info.limit} 已满，会话 ${sessionId} 排队中：`
+          + `前面还有 ${Math.max(0, info.pending - 1)} 条请求，已等 ${Math.round(info.waitedMs / 1000)}s（先进先出逐个放行）。`,
+        ),
+      })
+      const gateWaitedMs = Date.now() - gateStartedAt
+      const gateStats = this.gate.stats()
+      if (gateWaitedMs >= 500 || gateStats.pending > 0) {
+        console.info(
+          `[deepseek-web] 取得并发名额 session=${sessionId}（active=${gateStats.active}/${gateStats.limit || '∞'}，`
+          + `排队=${gateStats.pending}，本次等待 ${Math.round(gateWaitedMs / 1000)}s）。`,
+        )
       }
 
       // 整条流的兜底上限：无论卡在人工发送、频控重试还是网页不响应，
@@ -432,6 +467,9 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         const cancelling = this.channel.cancelTurn?.(sessionId)
         if (cancelling) void cancelling.catch(() => {})
       }
+      const releaseGate = gateRelease
+      gateRelease = undefined
+      releaseGate?.()
       releaseOnce()
     }
   }
