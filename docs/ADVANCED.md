@@ -105,7 +105,9 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `review.debugPort` | `9334` | Kimi 审核浏览器 CDP 端口 |
 | `review.glmDebugPort` | `9335` | GLM 审核浏览器 CDP 端口 |
 | `review.autoSend` | `true` | 审核自动化程度：`true` = 全自动（填入后自动发送并确认真的发出，发不出去当场报错）；`false` = 半自动（只填入并聚焦窗口，等你点发送） |
-| `review.url` | `https://www.kimi.com/?chat_enter_method=new_chat` | 审核窗口新标签页打开的链接。缺 `chat_enter_method` 时自动补上，已有则原样使用；可填企业版域名、带自有查询参数的地址，或项目页 `/project/<id>`（对话会归属该项目） |
+| `review.kimiMode` | `normal` | Kimi 审核模式：`normal` = 正常模式，每轮开一个普通对话；`project` = 项目模式，每轮在指定项目里开对话 |
+| `review.url` | `https://www.kimi.com/?chat_enter_method=new_chat` | 正常模式下审核窗口打开的链接。缺 `chat_enter_method` 时自动补上，已有则原样使用；可填企业版域名或带自有查询参数的地址 |
+| `review.projectUrl` | 空 | 项目模式下审核窗口打开的链接，形如 `https://www.kimi.com/project/<项目ID>?chat_enter_method=new_chat`；选项目模式但这里为空会明确报 `KIMI_PROJECT_URL_MISSING`，不会静默退回普通对话 |
 | `review.glmUrl` | `https://chat.z.ai/` | GLM 审核窗口打开的链接，规则同上 |
 | `review.sendVerifyMs` | `1500` | 自动发送后确认“已发出”的等待窗口（毫秒）；窗口内没等到信号才视为没发出去 |
 | `review.sendRetries` | `2` | 发送未被确认时的重试轮数（每轮 = 回车 + 点发送按钮兜底） |
@@ -178,11 +180,22 @@ node node_modules/dsh-deepseek-web-littlecar30/tools/glm-status.mjs --turn
 
 ### 审核对话开在哪里
 
-`kimi` / `glm` 的每轮审核都会**新开一个浏览器标签页**，打开 `review.url` 指向的链接，
-填完发送后关掉上一轮的审核标签——任何时候只留一个 Kimi 审核页，不会一轮攒一个标签。
+Kimi 审核分**两种模式**，在设置页「Kimi 审核」分组里用「审核模式」选择，两者各用各的入口地址，
+互不兜底：
 
-`review.url` 就是「审核窗口要打开的链接」，设置页里直接可见可改（选中 Kimi 时显示
-「Kimi 审核窗口地址」，选中 GLM 时显示 GLM 那一条）。默认值是
+| 模式 | 用哪个地址 | 每轮打开什么 |
+| --- | --- | --- |
+| 正常模式（`normal`，默认） | `review.url` | 一个独立的新对话标签页 |
+| 项目模式（`project`） | `review.projectUrl` | 项目页，对话归到这个项目下 |
+
+选 `normal` 时设置页只显示「Kimi 审核窗口地址」，选 `project` 时只显示「项目模式链接」，
+看着不会串。项目模式没填链接会直接报 `KIMI_PROJECT_URL_MISSING` 并给出填法，
+**不会**悄悄退回普通对话——审核结果落错地方比明确失败更难发现。
+
+两种模式都是**每轮新开一个浏览器标签页**，发出后关掉上一轮的审核标签，任何时候只留一个
+Kimi 审核页，不会一轮攒一个标签。
+
+正常模式的默认地址是
 
 ```
 https://www.kimi.com/?chat_enter_method=new_chat
@@ -190,15 +203,25 @@ https://www.kimi.com/?chat_enter_method=new_chat
 
 `chat_enter_method=new_chat` 是 Kimi 自己的建新参数，带上它新标签打开就是 0 条消息的
 干净对话。通道只做一件事：**地址里没有这个参数就补上，已经有就一个字不动**（旧配置只写
-了域名照样能用），所以你完全可以接管这个地址：
-
-- 换成企业版域名，或加上自己的查询参数；
-- 填项目页 `https://www.kimi.com/project/<id>`——实测打开后输入框是「在"审核"中开始对话…」，
-  从项目页发出的对话会归到该项目下。想让审核记录集中在一个项目里就用这种方式。
+了域名照样能用），所以你完全可以接管这个地址，换成企业版域名或加上自己的查询参数。
 
 之所以不用「点侧边栏的新建会话按钮」：那个入口是只有一个图标的 `<a aria-label="新建会话">`，
 标签页在后台时 `locator.click()` 点不动；直接 `goto` 首页又会被站点恢复成上一次的对话。
 两条路都会静默失败，表现就是"配置了新开对话却还是同一个对话，越审越慢"。
+
+#### 项目模式实测到的行为
+
+在项目页（`/project/<id>`）打开时，输入框提示是「在"审核"中开始对话…」（「审核」是项目名）。
+**发出第一条消息后地址会变成 `/chat/<uuid>`，`/project/` 前缀消失**，但对话确实归到了该项目下——
+项目页里有 `div.project-chat-list` 这个对话列表容器，刚发出的一轮作为 `a.project-feed-link`
+出现在里面，链接带 `chat_enter_method=project`（实测容器链：
+`a.project-feed-link ← div.project-feed-item-container ← div.project-chat-list ← main.project-conversation`）。
+也就是说：
+
+- 项目页能稳定复用，每轮从项目页发都归到项目里；
+- 但发完消息的页面地址已经看不出"属于哪个项目"，所以**页面归属只能靠"这一页是用哪种模式开的"
+  来判断，不能看路径**。通道记着每一页的来源模式，切模式后会自动换页，
+  不会把正常模式的审核发进项目、也不会把项目的发进普通对话。
 
 ### 审核卡住时会发生什么
 

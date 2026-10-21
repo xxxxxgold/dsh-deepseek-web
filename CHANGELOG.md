@@ -1,5 +1,12 @@
 # 更新记录
 
+## 0.3.3
+
+- **Kimi 审核支持「正常模式 / 项目模式」两种入口，在设置页可选**。项目模式不是"换个入口地址"而已：实测从项目页发出的对话会作为 `a.project-feed-link` 出现在项目页的 `div.project-chat-list` 里，链接带 `chat_enter_method=project`，确实归档到该项目下。之前只有一个 `review.url`，把项目页填进去能用、但和普通对话是同一套语义，配置里也看不出区别。现在新增 `review.kimiMode`（`normal` 默认 / `project`）与 `review.projectUrl`：正常模式走 `review.url` 开独立新对话，项目模式走 `review.projectUrl` 开项目页、对话归到该项目下。两者**各用各的地址、互不兜底**——选了项目模式却没填链接会直接抛 `KIMI_PROJECT_URL_MISSING` 并写明该填什么，不会静默退回普通对话（审核记录落错地方比明确失败更难发现）。设置页按所选模式联动显示对应那条地址输入框。
+- **修复一个会让整轮审核莫名失败的隐蔽 bug**：`turn()` 的重试次数取自 volatile 数值字段 `review.fetchRetries`。该字段在 Loader 尚未提交值时读到的是 `NaN`，而 `NaN ?? 1` 仍是 `NaN`，`Math.max(0, Math.min(3, NaN))` 也还是 `NaN`；于是 `attempt <= retries` 恒为 false，重试循环一次都不进，`lastError` 保持 `undefined`，最后 `throw undefined`——宿主只看到「回合失败」，完全看不出真正原因。现在统一由 `sanitizeRetries()` 收敛：`NaN`/`Infinity`/空串/`null` 回退默认值，负数夹到 0，超过上限截断，小数取整，保证循环次数永远是合法整数。
+- **跨模式切换不再发错地方**。实测项目页发出第一条消息后地址会变成 `/chat/<uuid>`、`/project/` 前缀消失，路径上再也分不出归属。所以页面归属改为记「这一页是用哪种模式开出来的」：复用模式（`conversationMode: 'reuse'`）下若发现当前页与所选模式不符，自动按新模式重开一个标签页并打日志说明，不会把正常模式的审核发进项目、也不会把项目的发进普通对话。
+- 新增离线回归 `tools/kimi-mode-check.ts`：11 项覆盖重试次数收敛（`NaN`/`null`/空串/负数/超限/小数/字符串/`Infinity`）、两种模式入口各取各的地址且不互相兜底、项目模式缺链接抛 `KIMI_PROJECT_URL_MISSING` 且带排查指引、页面归属的四种判定（跨模式不符 / 同模式相符 / 跨站页面 / 来源未知不重开）、以及配置默认值本身，并入 `npm run test:parsers`。
+
 ## 0.3.2
 
 - **审核窗口地址变成可配置项，并且默认带建新参数**。原来 `review.url` 只有代码里的默认值 `https://www.kimi.com/`，设置页看不到也改不了，通道拿到它之后自己拼 `/?chat_enter_method=new_chat`——等于"链接"这件事对用户是隐形的，想换域名、换查询参数、换项目页都无从下手。
