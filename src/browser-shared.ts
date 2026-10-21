@@ -295,6 +295,14 @@ export async function looksLoginWall(
   return await looksSendBlocked(page)
 }
 
+/** 新建对话入口的自定义候选：不同站点文案/结构差异很大，允许调用方补充。 */
+export interface NewChatOptions {
+  /** 额外的文本候选（会排在默认候选之前，优先命中）。 */
+  labels?: readonly string[]
+  /** 额外的选择器候选（最可靠，优先尝试）。 */
+  selectors?: readonly string[]
+}
+
 /**
  * 尝试点击“开启新对话/New chat”入口。返回是否成功触发点击。
  *
@@ -302,9 +310,35 @@ export async function looksLoginWall(
  * （visible/stable/receives events），后台标签页里侧栏可能未布局，点击会静默失败，
  * 从而沿用上一次网页对话。因此除定位器点击外，追加页面内原生 DOM 点击兜底：
  * 它不要求标签页在前台，也不要求元素可命中。
+ *
+ * 注意：返回 true 只代表“点到了某个入口”，不代表新对话真的建起来了。
+ * 站点是 SPA 时点击可能不产生任何跳转，调用方必须自己验证（见 Kimi 通道的
+ * `openFreshConversation`，它在点击无效时回退到直接跳首页）。
  */
-export async function bestEffortNewChat(page: Page): Promise<boolean> {
-  const labels = ['开启新对话', '新建对话', '新对话', '新话题', 'New chat', 'New Chat', 'New topic']
+export async function bestEffortNewChat(page: Page, options: NewChatOptions = {}): Promise<boolean> {
+  // 选择器最可靠（Kimi 的新建入口是只有图标、靠 aria-label 表达语义的链接）。
+  for (const selector of options.selectors ?? []) {
+    try {
+      const element = page.locator(selector).first()
+      if (await element.isVisible().catch(() => false)) {
+        const clicked = await element.click({ timeout: 3_000 }).then(() => true).catch(() => false)
+        if (clicked) return true
+      }
+    } catch {
+      // 选择器语法不兼容当前 Playwright 时跳过，不影响后面的文本候选。
+    }
+  }
+  const labels = [
+    ...(options.labels ?? []),
+    '开启新对话',
+    '新建对话',
+    '新建会话',
+    '新对话',
+    '新话题',
+    'New chat',
+    'New Chat',
+    'New topic',
+  ]
   for (const label of labels) {
     const candidate = page.getByText(label, { exact: true }).first()
     if (await candidate.isVisible().catch(() => false)) {

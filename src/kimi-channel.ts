@@ -242,6 +242,85 @@ export class KimiBrowserChannel implements BrowserChannel {
     await page.waitForTimeout(120)
   }
 
+  /**
+   * 开一个**全新的标签页**当审核窗口，而不是在旧标签里点“新建会话”。
+   *
+   * 为什么不用点按钮：Kimi 的入口是只有一个图标的链接，标签页在后台时
+   * `locator.click()` 点不动；而直接 `goto` 首页又会被恢复成上一次的对话。
+   * 两条路都实测失败过，表现就是「每轮审核都在同一个对话里」，越审越慢。
+   *
+   * 现在直接开新标签并带上 Kimi 自己的新建参数 `?chat_enter_method=new_chat`，
+   * 实测新标签打开就是 0 条消息的干净对话（约 3 秒）。旧的审核标签在新标签就绪后关掉，
+   * 保证任何时候只有一个 Kimi 审核页，不会攒一堆标签。
+   */
+  private async openFreshConversation(): Promise<void> {
+    const context = this.page?.context()
+    if (!context) throw new LlmError('kimi: 找不到浏览器上下文，无法新建审核标签页。', 'KIMI_PAGE_CLOSED')
+    const base = this.options.config.url.replace(/\/+$/u, '')
+    const freshUrl = `${base}/?chat_enter_method=new_chat`
+    const fresh = await context.newPage()
+    try {
+      await fresh.goto(freshUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+      await this.waitEditorReady(fresh)
+      // 极少数情况下列表仍带着旧消息（参数被改版忽略）时，再补一次入口点击。
+      const carried = await fresh
+        .evaluate(`document.querySelectorAll('[class*="chat-content-item"], [class*="message-item"]').length`)
+        .catch(() => 0)
+      if (typeof carried === 'number' && carried > 0) {
+        await this.clickNewChatEntry(fresh)
+        await fresh.waitForTimeout(800)
+      }
+    } catch (error) {
+      await fresh.close().catch(() => {})
+      throw error
+    }
+    const previous = this.page
+    this.page = fresh
+    // 旧标签整页关掉了，它记过的标题状态跟着一起作废（新标签从未被改过标题，不需要清理）。
+    // 关闭失败不能影响本轮审核，但必须留痕：否则标签会一轮一个地攒下去。
+    if (previous && previous !== fresh) {
+      const closed = await Promise.race([
+        previous.close({ runBeforeUnload: false }).then(() => true).catch(error => {
+          console.warn(`[kimi] 关闭旧审核标签失败（不影响本轮）：${error instanceof Error ? error.message : String(error)}`)
+          return false
+        }),
+        new Promise<boolean>(resolve => setTimeout(() => resolve(false), 3_000)),
+      ])
+      if (closed) console.info('[kimi] 已关闭上一轮的审核标签')
+      else console.warn('[kimi] 关闭旧审核标签超时，该标签会保留在浏览器里')
+    }
+    const carriedNow = await fresh
+      .evaluate(`document.querySelectorAll('[class*="chat-content-item"], [class*="message-item"]').length`)
+      .catch(() => 0)
+    console.info(`[kimi] 已打开新的审核标签页（历史消息 ${String(carriedNow)} 条）`)
+  }
+
+  /** 兜底：在页面内原生点一次“新建会话”（不要求元素可命中）。 */
+  private async clickNewChatEntry(page: Page): Promise<boolean> {
+    const NEW_CHAT_CLICK = `(() => {
+      const vis = (el) => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && getComputedStyle(el).display !== 'none';
+      };
+      const all = Array.from(document.querySelectorAll('a, button, div, span'));
+      const hit = all.find((el) => (el.getAttribute('aria-label') || '').indexOf('新建会话') >= 0 && vis(el))
+        || all.find((el) => /new-chat-btn|sidebar-new-chat/.test(String(el.className || '')) && vis(el));
+      if (!hit) return false;
+      hit.click();
+      return true;
+    })()`
+    try {
+      const clicked = await page.evaluate(NEW_CHAT_CLICK)
+      if (clicked === true) return true
+    } catch {
+      // 页面正在跳转时 evaluate 会失败，交给下面的定位器路径。
+    }
+    return await bestEffortNewChat(page, {
+      labels: ['新建会话'],
+      selectors: ['a[aria-label*="新建会话"]', '.new-chat-btn', '.sidebar-new-chat'],
+    }).catch(() => false)
+  }
+
   /** 只清“已初始化对话”的标记：下一轮带 `initialize` 就会新开对话。发送设置不受影响。 */
   resetConversationGate(_sessionId?: string): void {
     this.conversationStarted = false
@@ -322,7 +401,6 @@ export class KimiBrowserChannel implements BrowserChannel {
       this.dropConnection()
       await this.ensureReady()
     }
-    const page = this.page!
     const config = this.options.config
 
     // 发送方式：显式请求 > 会话级设置 > 审核配置的默认值。
@@ -342,9 +420,13 @@ export class KimiBrowserChannel implements BrowserChannel {
 
     try {
       if (request.initialize && !this.conversationStarted) {
-        await bestEffortNewChat(page)
-        await this.settleAfterNewChat(page)
+        await this.openFreshConversation()
         this.conversationStarted = true
+      }
+      // 新建对话会换掉 this.page，所以 page 必须在这之后取。
+      const page = this.page!
+      if (!page || page.isClosed()) {
+        throw new LlmError('kimi: 审核标签页已关闭，重试时会自动重连。', 'KIMI_PAGE_CLOSED')
       }
 
       // 响应监听必须在“填入/发送”之前挂上，否则会漏掉第一个响应。
