@@ -62,7 +62,7 @@ export function DeepSeekWebConfigPage({ view, form }: PluginConfigViewProps): JS
   const [notice, setNotice] = useState<string | null>(null)
 
   if (view === 'summary') {
-    return <>审核通道、网页版模型入口、工具白名单、频控与窗口聚焦。</>
+    return <>审核通道、网页版模型入口、工具白名单、频控退避、过程提示、浏览器自愈与窗口聚焦。</>
   }
 
   const accepted = (form?.state.value ?? {}) as Record<string, unknown>

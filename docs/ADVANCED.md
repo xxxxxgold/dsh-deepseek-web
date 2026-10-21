@@ -87,7 +87,7 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `liveThinking` | `false` | 是否展示网页真实思考；正文不混入思考块，不改变网页思考模式 |
 | `compactionLanguage` | `task` | 官方压缩摘要跟随用户任务语言；`host` 保留宿主要求，`zh` / `en` 固定中英文 |
 | `maxToolResultChars` | `6000` | 工具结果送入网页模型的字符上限，按头尾截断；不截断最终正文或网页委托结果 |
-| `streamIdleTimeoutMs` | `600000` | 网页流空闲超时 |
+| `streamIdleTimeoutMs` | `45000` | 网页流空闲超时（默认 45 秒，须大于 0；`review.streamIdleTimeoutMs` 同默认） |
 | `maxSessionPages` | `3` | 同时保留的会话标签页上限（每个并发会话独占一页）；超出按“最久未用且当前没在跑”的页回收，`1`–`8` |
 | `maxConcurrentTurns` | `2` | 全局并发上限：同一时刻最多几条请求真在网页上跑（主会话/子代理/辅助请求一起算）；超出的按先进先出排队，`0` 表示不限制 |
 | `sendPauseMinMs` / `sendPauseMaxMs` | `2000` / `4000` | 全自动发送时，消息填入输入框之后、按回车之前的随机停留区间（毫秒）；真人不会打完字立刻回车，固定延迟方差≈0 反而是机器特征。两者为 `0` 即关闭 |
@@ -97,7 +97,21 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `lockLeaseMs` | `4500000` | 会话锁租约，持有者泄漏时到点强制回收；必须大于“最大合法整轮” |
 | `maxStreamMs` | `3600000` | 单次请求（整条流，含纠错/委托/多轮审核）上限，超时主动取消网页回合，`0` 表示不限制 |
 | `rateLimit.enabled` | `true` | 是否自动处理“发送过于频繁” |
-| `rateLimit.maxRetries` | `5` | 单轮频控重试次数 |
+| `rateLimit.retryDelayMs` | `60000` | 首次重发等待（毫秒），也是指数退避的基数 |
+| `rateLimit.maxRetries` | `4` | 单轮频控重发次数；配合默认退避合计约 12 分钟，覆盖实测 10–15 分钟冷却 |
+| `rateLimit.backoff` | `exponential` | 退避曲线：`exponential` 每次翻倍；`fixed` 每次都等 `retryDelayMs` |
+| `rateLimit.retryMaxDelayMs` | `300000` | 单次等待封顶（毫秒），防止退避越滚越长把回合拖死 |
+| `rateLimit.jitterRatio` | `0.15` | 每次等待在基准值上随机浮动 ±15%，避免多实例同一秒重撞 |
+| `notify.enabled` | `true` | 过程提示总开关（关掉后对话里和浏览器里都不再有提示） |
+| `notify.session` | `true` | 主对话提示（前缀 `[DSH]`）：发送、接收、完成、频控等待/重发、失败 |
+| `notify.review` | `true` | 审核提示（前缀 `[DSH·审核]`），与会话提示分开显示 |
+| `notify.send` | `true` | 发送侧提示：已发送 / 已填入等待你点发送 |
+| `notify.receive` | `true` | 接收侧提示：网页已响应、开始生成、本轮完成、频控倒计时 |
+| `notify.errors` | `true` | 失败提示：把错误码翻成一句人话加处理建议（表外错误回退原文） |
+| `notify.browser` | `true` | 网页右下角的浮层提示（频控倒计时、等待重发），不挡点击 |
+| `browserRecovery.enabled` | `true` | 浏览器或网页标签被关掉时是否自动恢复并重发本轮；关掉后只报 `WEB_PAGE_CLOSED` |
+| `browserRecovery.maxAttempts` | `2` | 单轮最多恢复几次；连续被关超过这个次数通常意味着有东西在反复杀进程，此时抛原始错误更有用 |
+| `browserRecovery.delayMs` | `2000` | 重新拉起浏览器前的等待（毫秒），给系统回收窗口句柄 |
 | `toolAllowlist` | 常用文件/终端工具 | 暴露给网页模型的工具白名单 |
 | `excludeToolNames` | `['web_search']` | 强制隐藏的工具名 |
 | `review.enabled` | `false` | 是否启用交付审核 |

@@ -9,6 +9,7 @@
 
 import type { LlmError } from '@deepseek-ai/dsh-llm'
 import type { Config } from './config.ts'
+import type { NoticePayload } from './notify.ts'
 
 /** 一轮网页对话的实时增量：网页端已生成（累计解析出）的思考与正文。 */
 export interface BrowserTurnProgress {
@@ -60,6 +61,18 @@ export interface BrowserTurnRequest {
   conversationSessionId?: string
   /** 临时内部请求用途，用于浏览器标题提示。 */
   purpose?: string
+  /**
+   * 提示回调（可选）：通道在「发出消息 / 收到回复 / 频控等待 / 本轮失败」时触发。
+   *
+   * 与 onProgress 分开是刻意的：onProgress 受 liveThinking 门禁，而提示是用户
+   * 要求的常驻能力，不能因为没开思考流就消失。
+   */
+  onNotice?: (notice: NoticePayload) => void
+  /**
+   * 本轮归属：session 是正常对话，review 是内部审核（自审 / 独立审核通道）。
+   * 缺省按 session 处理；它决定提示前缀与开关，不影响网页里发什么。
+   */
+  role?: 'session' | 'review'
 }
 
 export interface BrowserTurnResult {

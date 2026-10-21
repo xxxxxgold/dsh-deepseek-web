@@ -44,6 +44,7 @@ import { buildReviewEvidence } from './protocol.ts'
 import { SessionRegistry, type ChannelTokenTotals, type WebChatState } from './session-state.ts'
 import { ConcurrencyGate } from './concurrency-gate.ts'
 import type { ReviewVerdict } from './reviewer.ts'
+import { formatNotice, noticeEnabled, type NoticeEvent, type NoticePayload } from './notify.ts'
 import os from 'node:os'
 import path from 'node:path'
 import { AsyncLock } from './async-lock.ts'
@@ -176,7 +177,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
    * 超时/租约三件套的交叉校验：配错了不会崩，但防护会失效，所以在启动时明确告警。
    * 约束：turnTimeoutMs ≤ maxStreamMs，且 lockLeaseMs ≥ maxStreamMs + turnTimeoutMs。
    * 理由：一条 llm.stream 会串联多个网页回合（纠错 / 委托 / 多轮审核），人工模式
-   * 每回合都可能等满 streamIdleTimeoutMs 600s；租约必须比"最大合法整轮"更长，
+   * 每回合都可能等满 streamIdleTimeoutMs（默认 45s）；租约必须比"最大合法整轮"更长，
    * 否则会在回合仍正常进行时强行放锁，让同一会话的两条流交替写同一个网页对话。
    */
   private warnAboutTimeoutConfig(): void {
@@ -285,8 +286,29 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const reasoningIndex = blocks.next++
     let opened = false
     let reasoningText = ''
+    /*
+     * 提示通道：插件自己的状态（已发送 / 已接收 / 频控等待 / 失败）也写进这个
+     * reasoning 块，前缀 `[DSH]` / `[DSH·审核]` 由 notify.ts 统一加。
+     *
+     * 为什么不另开一个块：Harness 要求块按 index 递增开启，而「模型先思考」与
+     * 「插件先提示」两种顺序都可能出现，两个块会撞顺序约束；提示本身就是过程
+     * 信息，和思考同块、按真实时间交错最自然。
+     */
+    const appendNotice = (text: string): void => {
+      if (!opened) {
+        opened = true
+        pipe.push({ type: 'block-start', index: reasoningIndex, blockType: 'reasoning' })
+      }
+      const line = reasoningText === '' ? text : `\n${text}`
+      reasoningText += line
+      pipe.push({ type: 'reasoning-delta', index: reasoningIndex, text: line })
+    }
     const turnPromise = this.channel.turn({
       ...request,
+      // 内部辅助（上下文压缩、起标题）不给用户添噪声：只对真实对话出提示。
+      ...(request.purpose === undefined
+        ? { onNotice: (notice: NoticePayload) => { appendNotice(notice.text) } }
+        : {}),
       onProgress: (progress) => {
         if (this.config.liveThinking !== true || !progress.reasoning) return
         if (!opened) {
@@ -810,6 +832,34 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       : this.config.review.provider === 'glm' ? 'GLM'
       : 'DeepSeek'
     let reviewSummary: string | undefined
+    /*
+     * 审核提示单独成块，与会话提示分开（用户明确要求两类消息不能搅成一锅）。
+     *
+     * 位置安全：审核发生在正文产出之后，此时 blocks.next 已越过正文起始位，
+     * 新块严格递增，不会违反「块按 index 顺序开启」的约束。
+     */
+    let reviewNoticeIndex = -1
+    let reviewNoticeText = ''
+    const reviewLines = (event: NoticeEvent, detail: string): readonly StreamChunk[] => {
+      if (!noticeEnabled(this.config.notify, 'review', event)) return []
+      const text = formatNotice({ category: 'review', event, detail })
+      if (reviewNoticeIndex < 0) {
+        reviewNoticeIndex = blocks.next++
+        reviewNoticeText = text
+        return [
+          { type: 'block-start', index: reviewNoticeIndex, blockType: 'reasoning' },
+          { type: 'reasoning-delta', index: reviewNoticeIndex, text },
+        ]
+      }
+      const line = `\n${text}`
+      reviewNoticeText += line
+      return [{ type: 'reasoning-delta', index: reviewNoticeIndex, text: line }]
+    }
+    const reviewBlockEnd = (): readonly StreamChunk[] => (
+      reviewNoticeIndex < 0
+        ? []
+        : [{ type: 'block-end', index: reviewNoticeIndex, block: { type: 'reasoning', text: reviewNoticeText } }]
+    )
     if (
       !parsed.hasActions
       && this.reviewer
@@ -818,6 +868,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       && state.reviewRoundsUsed < this.config.review.maxRounds
       && state.reviewedSignature !== reviewSignature(state.goalText ?? '', parsed.text)
     ) {
+      for (const chunk of reviewLines('send', `${reviewLabel} 审核：开始检查本轮产出…`)) yield chunk
       let reviewRound = 0
       while (reviewRound < this.config.review.maxRounds) {
         reviewRound++
@@ -829,7 +880,9 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         try {
           verdict = await this.reviewer.review(evidence, { conversationSessionId: sessionId })
         } catch (error) {
-          console.warn(`[deepseek-web] ${reviewLabel} 审核失败，跳过本轮审核：`, error instanceof Error ? error.message : error)
+          const reason = error instanceof Error ? error.message : String(error)
+          console.warn(`[deepseek-web] ${reviewLabel} 审核失败，跳过本轮审核：`, reason)
+          for (const chunk of reviewLines('error', `${reviewLabel} 审核失败，已跳过本轮审核：${reason}`)) yield chunk
           break
         }
         state.reviewRoundsUsed += 1
@@ -839,14 +892,16 @@ export class DeepSeekWebAdapter extends LlmAdapter {
           reviewSummary = [
             `✅ ${reviewLabel} 审核：通过`,
             verdict.suggestions.length > 0 ? `建议：${verdict.suggestions.slice(0, 3).join('；')}` : '',
-          ].filter(Boolean).join('\n')
+          ].filter(Boolean).join('；')
+          for (const chunk of reviewLines('receive', reviewSummary)) yield chunk
           break
         }
         reviewSummary = [
           `⚠️ ${reviewLabel} 审核（首版）：未通过，已回注修正`,
           verdict.issues.length > 0 ? `问题：${verdict.issues.slice(0, 3).join('；')}` : '',
           verdict.suggestions.length > 0 ? `建议：${verdict.suggestions.slice(0, 3).join('；')}` : '',
-        ].filter(Boolean).join('\n')
+        ].filter(Boolean).join('；')
+        for (const chunk of reviewLines('receive', reviewSummary)) yield chunk
         const feedback = [
           '[审核反馈] 独立审核员认为当前产出未通过审核，请修正后重新输出。',
           verdict.issues.length > 0 ? `问题：\n${verdict.issues.map(item => `- ${item}`).join('\n')}` : '',
@@ -874,10 +929,9 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       }
     }
 
-    // 把审核结论附在最终正文末尾，让 Harness 对话里可见
-    if (reviewSummary && !parsed.hasActions) {
-      parsed = { ...parsed, text: `${parsed.text}\n\n---\n${reviewSummary}` }
-    }
+    // 审核块收尾：必须在正文块开启（下方 replyChunks）之前关闭，
+    // 否则会变成「块 1 还没结束就开块 2」，前端按块渲染时会出现串台。
+    for (const chunk of reviewBlockEnd()) yield chunk
 
     if (!parsed.hasActions && looksLikeUnfinishedHandoff(parsed.text, state.goalText ?? '')) {
       throw new LlmError('网页仍返回未完成的任务交接摘要，未作为最终交付提交；请重试当前任务。', 'WEB_UNFINISHED_HANDOFF')

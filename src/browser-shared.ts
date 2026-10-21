@@ -129,6 +129,21 @@ export function withTimeout<T>(
 }
 
 /**
+ * 「浏览器/标签页已经被关掉」的报错特征。
+ *
+ * Playwright 在连接断掉时抛的是纯文本（`Target page, context or browser has been closed`
+ * / `Browser has been closed`），不给我们错误码；而插件自己的 `WEB_PAGE_CLOSED` 是另一条路。
+ * 自愈只该被这两类触发，频控、超时、用户取消都不能被当成"重启浏览器"。
+ */
+const BROWSER_CLOSED_PATTERN =
+  /Target (?:page|context|browser)[^\n]{0,40}closed|Browser has been closed|browser has been closed|has been disconnected|Connection closed|connection closed|连接已关闭|连接已断开/u
+
+/** 这条报错是不是「浏览器被关了」造成的。 */
+export function isBrowserClosedMessage(text: string): boolean {
+  return BROWSER_CLOSED_PATTERN.test(text)
+}
+
+/**
  * 把「审核窗口入口地址」补成「一定会新开对话」的地址。
  *
  * 用户在设置里填的就是新标签页要打开的链接，所以这里只做一件事：确保带上站点

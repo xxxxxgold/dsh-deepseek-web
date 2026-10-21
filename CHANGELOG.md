@@ -1,5 +1,26 @@
 # 更新记录
 
+## 0.5.0
+
+- **网页流空闲超时默认值从 10 分钟改成 45 秒**。`streamIdleTimeoutMs` 与 `review.streamIdleTimeoutMs` 的默认值都改为 `45_000`：网页版正常 1–3 秒就回响应头，旧默认 600 秒意味一条卡死的流能把队头堵满 10 分钟，用户只看到「一直不动」。现在空闲超过 45 秒即判超时并给出准确定位，仍可在设置里按需调大（下限 1ms 不变）。`docs/ADVANCED.md` 的配置表同步更新。
+- **浏览器或网页标签被关掉时，先提示、再自动恢复、然后把这一轮重发出去**。以前这类事故在 `turn()` 入口就被判死：`state.page.isClosed()` 直接抛 `WEB_PAGE_CLOSED`，你在 DSH 里只看到一句「本轮运行失败」，得自己去翻日志才知道是浏览器没了；回合跑到一半被关更糟——报错来自 Playwright 底层（`Target page, context or browser has been closed`），连错误码都没有。现在 `turn()` 外面套了一层自愈循环：捕获到关闭类错误 → 发一条 `[DSH] 恢复 · …` 提示 → 清掉失效的页与连接 → `ensureReady()` 重新拉起 → 重新取会话页 → **重发本轮消息**（最多 2 次，默认间隔 2 秒）。
+- **区分「只关了标签页」和「整个浏览器没了」，不搞一刀切重启**。`recoverBrowser()` 先看 `browser.isConnected()`：还连着就只补标签页、保留浏览器对象（不能因为一个标签页关掉就把你其它窗口一起关掉）；整个浏览器退出了才释放 `browser` / `context` / `managedConnection`，`browser.close()` 与 `process.kill()` 都做了容错，然后重新走 launch/connect。两条路径的提示文案也不同（「正在重新打开标签页」vs「正在重新启动浏览器」），因为它决定了这次恢复要等多久。
+- **自愈只认「被关掉」，不吞别的错误**。判定由 `browserClosed()` 三路合成：`WEB_PAGE_CLOSED` 错误码、`isBrowserClosedMessage()` 对报错原文的模式匹配（`Target page/context/browser … closed`、`Browser has been closed`、`has been disconnected`、`Connection closed`、`连接已关闭/断开`）、以及 `browser.isConnected() === false`（连接已死时任何错误都按可自愈处理，在死连接上重试没有意义）。频控、回合超时、手动取消、HTTP 错误一律照原样抛出——否则「一直重启浏览器」会把真正的频控冷却掩盖掉。
+- **恢复提示走独立的 `recover` 事件，且不节流**。等待期提示本来有 500ms/1000ms 节流，但恢复只有三条状态（开始、重启前等待、已就绪），每一条都必须能被看到，所以 `recover` 的节流阈值设成 0。提示文案带「第 n/m 次」，连续被关也能看出这是第几次恢复；提示在设置页可关（跟接收侧提示同一组开关），但**关掉提示不影响自愈本身**。
+- **回合开始前就被关掉也补提示**。`turn()` 入口先记下 `healthyBefore`（浏览器当时是否连接）和 `closedPageBefore`（锚点页当时是否已关），`ensureReady()` 之后若发现是被自动修好的，补一条「网页标签已被关闭，已自动重新打开」/「浏览器已被关闭，已自动重新启动并打开网页」——否则用户只会看到回合莫名其妙成功了，不知道中间出过事。
+- **设置页新增「浏览器自愈」分组**：`browserRecovery.enabled`（默认开）、`maxAttempts`（默认 2，0–5）、`delayMs`（默认 2000ms，0–60000）。`maxAttempts` 的说明写清为什么默认只有 2 次：连续被关超过两次通常不是手滑，而是有东西在反复杀进程，这时候把原始错误抛出来比无限重启有用。
+- 新增离线回归 `tools/browser-recovery-check.ts`（并入 `npm run test:parsers`）：6 条关闭类样本必须命中、4 条非关闭样本（频控中文、回合超时、取消、HTTP 500）必须不命中；再用原型实例直接验通道——`WEB_RATE_LIMITED`/`WEB_TURN_TIMEOUT` 不触发自愈、浏览器断连时任意错误都触发；`connected=true` 时 `ensureReady` 恰好调一次、`browser` 必须保留、会话页登记清空、首条提示是「网页标签被关掉了…（第 1/2 次）」、末条是「浏览器已就绪，正在重新打开网页并重发本轮消息」；`connected=false` 时 `browser`/`context`/`managedConnection` 全被放掉、首条提示是「浏览器被关掉了…（第 2/2 次）」；把提示总开关关掉后提示 0 条但 `ensureReady` 照常调用。
+
+## 0.4.0
+
+- **频控重发从「30 秒硬撞 5 次」改成指数退避，默认覆盖真实冷却期**。旧默认 `retryDelayMs=30_000`、`maxRetries=5` 一共只等 150 秒，而实测「发送过于频繁」多数要 10–15 分钟才恢复——等于在冷却期里又连撞 5 次，撞完报错，下次请求继续撞。新默认 `retryDelayMs=60_000`、`maxRetries=4`、`backoff=exponential`、`retryMaxDelayMs=300_000`、`jitterRatio=0.15`：等待序列 60s → 120s → 240s → 300s，合计 720 秒，正好落在常见冷却期中段，且总时长仍小于 `turnTimeoutMs` 的 900 秒，不会被回合上限提前截断成「超时」这种误导性错误。不同实例的等待还带 ±15% 抖动，避免同一账号多标签在同一秒一起重撞。
+- **等待期间终于有提示了，而且提示走的是能真正送到 DSH 的通道**。以前 `liveThinking: false`（默认）下 `onProgress` 根本不触发，等待期间界面一片静默，提示只有浏览器标签标题。现在新增独立的 `onNotice` 通道：频控等待、重发、发送、接收、完成、失败都会变成一条 reasoning 提示块，前缀 `[DSH]`（审核流程是 `[DSH·审核]`），可折叠、不进正文、不进模型上下文。频控等待期间，进入等待报一次「X 后自动重发」，之后每逢整分钟和最后 30 秒各报一次「还需要 X」（逐秒刷会把 12 分钟变成几百行噪音）；浏览器右下角则逐秒更新一个 `pointer-events: none` 的倒计时浮层（`#dsh-web-notice`，不挡点击），标签标题继续写 `[dsh 频控：1m 后自动重发]`。
+- **全部错误都翻成人话加处理建议**。`src/notify.ts` 的 `describeFailure()` 覆盖 50 个错误码（`WEB_*`、`BROWSER_*`、`KIMI_*`、`GLM_*`、`UNKNOWN_MODEL` 等），每条都写「接下来怎么办」而不是把 code 再念一遍；表外错误回退到原文（截 120 字），宿主气泡里的完整原文不受影响。
+- **会话提示与审核提示分开**。审核（自审 / Kimi / GLM）在正文之后单独成块，前缀 `[DSH·审核]`，不再和主对话的发送/接收提示混在一条里；审核通道自身失败也会留下一条说明（「审核失败，已跳过本轮审核」），而不是静默跳过。
+- **提示可在设置页逐层关闭**。新增 `notify` 配置段：总开关 `enabled`、分类开关 `session` / `review`、事件开关 `send` / `receive` / `errors`、浏览器浮层 `browser`；`rateLimit` 段从 3 个字段扩到 6 个（新增 `backoff`、`retryMaxDelayMs`、`jitterRatio`）。两个分组在设置页都有中英说明。
+- `tools/rate-limit-check.ts` 从「只验证频控文案识别」扩到「识别 + 退避序列 + 提示文案」：断言默认序列恰好是 `60000/120000/240000/300000/300000`、`fixed` 曲线恒为基数、抖动边界 8000/12000、下限 1000ms、会话与审核前缀必须不同且不相等、7 个开关逐层生效、`formatDuration(60000)='1m'`，并扫描 `src/*.ts` 抓出全部错误码逐个要求 `describeFailure` 给出人话——新增错误码却忘了写提示会直接失败。当前覆盖 50 个码。
+- 新增 `tools/notice-check.ts` 守提示链路本身：用脚本化假通道跑完整 `adapter.stream()`，断言 `liveThinking=false`（默认）时提示照样成为一个 reasoning 块、按到达顺序换行拼接、正文块里不含 `[DSH]`、提示块排在正文之前；再借原型直接验通道层——同一事件连发被节流、`session=false` 时会话静默而审核照发、`send=false` 只留接收、总开关关闭一条都不发。
+
 ## 0.3.4
 
 - **项目模式改成「只填项目 ID」**。上一版要求填一整条项目页地址（`https://www.kimi.com/project/<ID>?chat_enter_method=new_chat`），抄起来容易错、还容易把项目名当成地址、换个域名要改两处。现在设置页那一栏就叫「项目 ID」，只填 `/project/` 后面那一段（形如 `1a15bef4-b7a2-894f-8000-0e7143648841`），插件用「正常模式链接」的域名拼成完整项目页地址再打开——企业版域名跟着正常模式走，不用两边都改。

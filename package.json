@@ -1,7 +1,7 @@
 {
   "name": "dsh-deepseek-web-littlecar30",
   "description": "DeepSeek Harness 桌面版网页通道插件：通过真实 Edge/Chrome 使用 DeepSeek 免费网页版，支持可选 Kimi/GLM 审核和中文配置页。",
-  "version": "0.3.4",
+  "version": "0.5.0",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -55,7 +55,7 @@
     "build": "npm run build:host && npm run build:client",
     "build:host": "tsdown --config tsdown.host.config.ts --config-loader tsx",
     "build:client": "tsdown --config tsdown.config.ts --config-loader tsx",
-    "test:parsers": "tsx tools/synthetic-parse-check.ts && tsx tools/kimi-parse-check.ts && tsx tools/kimi-gzip-check.ts && tsx tools/glm-parse-check.ts && tsx tools/action-repair-check.ts && tsx tools/image-upload-check.ts && tsx tools/image-attach-check.ts && tsx tools/review-evidence-check.ts && tsx tools/rate-limit-check.ts && tsx tools/live-delta-check.ts && tsx tools/watchdog-check.ts && tsx tools/review-config-check.ts && tsx tools/usage-check.ts && tsx tools/handoff-check.ts && tsx tools/adapter-output-check.ts && tsx tools/compaction-check.ts && tsx tools/dsml-check.ts && tsx tools/concurrency-check.ts && tsx tools/risk-config-check.ts && node tools/compaction-config-check.mjs && tsx tools/send-confirm-check.ts && tsx tools/review-url-check.ts && tsx tools/kimi-mode-check.ts",
+    "test:parsers": "tsx tools/synthetic-parse-check.ts && tsx tools/kimi-parse-check.ts && tsx tools/kimi-gzip-check.ts && tsx tools/glm-parse-check.ts && tsx tools/action-repair-check.ts && tsx tools/image-upload-check.ts && tsx tools/image-attach-check.ts && tsx tools/review-evidence-check.ts && tsx tools/rate-limit-check.ts && tsx tools/notice-check.ts && tsx tools/browser-recovery-check.ts && tsx tools/live-delta-check.ts && tsx tools/watchdog-check.ts && tsx tools/review-config-check.ts && tsx tools/usage-check.ts && tsx tools/handoff-check.ts && tsx tools/adapter-output-check.ts && tsx tools/compaction-check.ts && tsx tools/dsml-check.ts && tsx tools/concurrency-check.ts && tsx tools/risk-config-check.ts && node tools/compaction-config-check.mjs && tsx tools/send-confirm-check.ts && tsx tools/review-url-check.ts && tsx tools/kimi-mode-check.ts",
     "pack": "npm pack"
   },
   "devDependencies": {

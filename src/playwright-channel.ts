@@ -21,6 +21,17 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { BrowserChannel, BrowserImageAttachment, BrowserTurnRequest, BrowserTurnResult } from './browser-channel.ts'
 import type { Config, WebModelId } from './config.ts'
 import { WEB_MODEL_CAPABILITIES } from './config.ts'
+import {
+  browserNoticeEnabled,
+  describeFailure,
+  describeRateLimitPolicy,
+  formatDuration,
+  formatNotice,
+  noticeEnabled,
+  rateLimitDelayMs,
+  type NoticeCategory,
+  type NoticeEvent,
+} from './notify.ts'
 import { AsyncLock } from './async-lock.ts'
 import {
   bestEffortNewChat,
@@ -32,6 +43,7 @@ import {
   looksLoggedOut,
   locateEditor,
   ensureChatPage,
+  isBrowserClosedMessage,
   setBrowserWindowTopmost,
   launchManagedBrowser,
   type ManagedBrowserConnection,
@@ -57,7 +69,7 @@ const RATE_LIMIT_POLL_MS = 800
  *
  * 网页版正常 1~3 秒就会回响应头；等满 3 分钟还没有，说明消息根本没发出去
  *（人工发送模式下忘了点、页面弹了遮挡层）或站点异常。
- * 原来这里直接吃 `streamIdleTimeoutMs`（默认 600 秒）——用户看到的就是
+ * 原来这里直接吃 `streamIdleTimeoutMs`（当时默认 600 秒）——用户看到的就是
  * “卡住十分钟、不会重来”。这里压到 3 分钟并给出准确定位，生成阶段不受影响。
  */
 const SEND_ACK_TIMEOUT_MS = 180_000
@@ -444,6 +456,8 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   /** 连续请求计数与最后一次请求时间（防风控长休用，见 maybeTakeLongRunPause）。 */
   private consecutiveSends = 0
   private lastSendAt = 0
+  /** 提示节流：key 为「会话::分类::事件」，value 为上次发送时刻（毫秒）。 */
+  private readonly lastNoticeAt = new Map<string, number>()
 
   constructor(options: PlaywrightChannelOptions) {
     this.options = options
@@ -599,8 +613,224 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     }, { title: clean, prefix: marker })
   }
 
-  async turn(request: BrowserTurnRequest): Promise<BrowserTurnResult> {
+  /** 提示归属：审核请求（reviewer 传 role:'review'）与会话请求分开，绝不混成一锅。 */
+  private noticeCategory(request: BrowserTurnRequest): NoticeCategory {
+    return request.role === 'review' ? 'review' : 'session'
+  }
+
+  /**
+   * 发一条提示。
+   *
+   * 节流按「会话 + 分类 + 事件」去重：重发循环里连续调用不会把同一句话刷屏，
+   * 但等待 → 重发 → 完成这种真实状态变化一定各有一次。
+   */
+  private emitNotice(request: BrowserTurnRequest, event: NoticeEvent, detail: string): void {
+    const onNotice = request.onNotice
+    if (onNotice === undefined) return
+    const category = this.noticeCategory(request)
+    if (!noticeEnabled(this.options.config.notify, category, event)) return
+    const key = `${request.sessionId}::${category}::${event}`
+    const now = Date.now()
+    const throttleMs = event === 'recover'
+      ? 0 // 自愈全程只有三条，且每条都是不同的状态，压掉任何一条都会让人以为卡住了
+      : event === 'send' || event === 'receive' ? 500 : 1_000
+    if (now - (this.lastNoticeAt.get(key) ?? 0) < throttleMs) return
+    if (this.lastNoticeAt.size > 200) this.lastNoticeAt.clear()
+    this.lastNoticeAt.set(key, now)
+    const text = formatNotice({ category, event, detail })
+    try {
+      onNotice({ category, event, text })
+    } catch (error) {
+      // 提示是旁路：回调自己炸了也不能影响回合本体。
+      console.warn(
+        '[deepseek-web] 提示回调异常（已忽略）：',
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+  }
+
+  /**
+   * 在网页右下角画一块浮层。
+   *
+   * 只服务「用户正盯着浏览器」的等待场景（频控倒计时、等人工点发送）：
+   * pointer-events:none 保证它永远不挡住网页按钮和输入框。
+   */
+  private async paintPageNotice(page: Page, text: string): Promise<void> {
+    if (!browserNoticeEnabled(this.options.config.notify)) return
+    await page.evaluate((payload) => {
+      const id = 'dsh-web-notice'
+      let box = document.getElementById(id)
+      if (box === null) {
+        box = document.createElement('div')
+        box.id = id
+        box.setAttribute('role', 'status')
+        box.style.cssText = [
+          'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483647',
+          'max-width:320px', 'padding:10px 14px', 'border-radius:10px',
+          'background:rgba(28,28,32,.92)', 'color:#fff', 'font-size:13px',
+          'line-height:1.5', 'white-space:pre-line', 'pointer-events:none',
+          'box-shadow:0 6px 24px rgba(0,0,0,.28)', 'font-family:system-ui,sans-serif',
+        ].join(';')
+        document.body.appendChild(box)
+      }
+      box.textContent = payload
+    }, text)
+  }
+
+  /** 抹掉浮层；网页已关闭时静默跳过。 */
+  private async clearPageNotice(page: Page): Promise<void> {
+    if (!browserNoticeEnabled(this.options.config.notify)) return
+    if (page.isClosed()) return
+    await page.evaluate(() => document.getElementById('dsh-web-notice')?.remove())
+  }
+
+  /**
+   * 频控等待：按秒刷新浮层倒计时，同时让 sleep 保持可中断。
+   *
+   * 倒计时只在秒数变化时重画（一次 evaluate），不会因为 200ms 步进而打满页面。
+   */
+  private async waitWithCountdown(
+    page: Page,
+    request: BrowserTurnRequest,
+    waitMs: number,
+    attemptIndex: number,
+    maxRetries: number,
+  ): Promise<void> {
+    const canPaint = browserNoticeEnabled(this.options.config.notify) && !page.isClosed()
+    let lastSecond = -1
+    let lastNoticeSecond = -1
+    try {
+      await this.sleep(waitMs, request.signal, (remainingMs) => {
+        const second = Math.ceil(remainingMs / 1000)
+        if (second === lastSecond) return
+        lastSecond = second
+        if (canPaint) {
+          void this.paintPageNotice(
+            page,
+            `DSH：网页提示发送过于频繁\n${formatDuration(remainingMs)} 后自动重发`
+            + `（第 ${attemptIndex}/${maxRetries} 次）`,
+          ).catch(() => {})
+        }
+        // 对话里的提示块不逐秒刷（12 分钟会刷出几百行），
+        // 只在整分钟和最后 30 秒各报一次进度。
+        const shouldNotify = second === 30 || (second > 30 && second % 60 === 0)
+        if (!shouldNotify || second === lastNoticeSecond) return
+        lastNoticeSecond = second
+        this.emitNotice(
+          request,
+          'wait',
+          `还需要 ${formatDuration(remainingMs)}（第 ${attemptIndex}/${maxRetries} 次重发）`,
+        )
+      })
+    } finally {
+      if (canPaint) await this.clearPageNotice(page).catch(() => {})
+    }
+  }
+
+  /**
+   * 本轮失败提示。
+   *
+   * 放在 turn / turnIsolated 的 catch 里，而不是散落在每个 throw 点：
+   * 只要这一轮以错误收场，就一定有一条提示，不会漏。
+   */
+  private emitFailure(request: BrowserTurnRequest, error: unknown): void {
+    const failure = error instanceof LlmError
+      ? error.failure
+      : { code: 'UNKNOWN', message: error instanceof Error ? error.message : String(error) }
+    this.emitNotice(request, 'error', describeFailure(failure))
+  }
+
+  /**
+   * 这条错误是不是「浏览器/标签页被关掉」造成的。
+   *
+   * 两条证据：插件自己抛的 `WEB_PAGE_CLOSED`，以及 Playwright 断连的纯文本报错；
+   * 另外浏览器对象已经明确断开时，任何错误都按可自愈处理——连接都没了，
+   * 继续在死对象上重试没有意义。
+   */
+  private browserClosed(error: unknown): boolean {
+    if (error instanceof LlmError && error.failure.code === 'WEB_PAGE_CLOSED') return true
+    const text = error instanceof Error ? error.message : String(error)
+    if (isBrowserClosedMessage(text)) return true
+    return this.browser !== undefined && !this.browser.isConnected()
+  }
+
+  /**
+   * 浏览器自愈：清掉断掉的连接/页面登记，再重启（或重连）浏览器。
+   *
+   * 只做「把环境恢复成可用」，新的标签页由调用方的 stateFor 重新创建；
+   * 这样自愈和正常的会话页创建走同一条路，不会出现两套补页逻辑。
+   */
+  private async recoverBrowser(
+    request: BrowserTurnRequest,
+    attempt: number,
+    maxAttempts: number,
+    error: unknown,
+    sessionId: string,
+  ): Promise<void> {
+    const connected = this.browser?.isConnected() === true
+    const reason = error instanceof LlmError
+      ? error.failure.message
+      : error instanceof Error ? error.message : String(error)
+    console.info(
+      `[deepseek-web] 浏览器已断开，开始自愈（第 ${attempt}/${maxAttempts} 次）：`
+      + `${connected ? '仅标签页被关，保留浏览器' : '重启浏览器'}；原因：${reason.slice(0, 200)}`,
+    )
+    this.emitNotice(
+      request,
+      'recover',
+      connected
+        ? `网页标签被关掉了，正在重新打开标签页（第 ${attempt}/${maxAttempts} 次）`
+        : `浏览器被关掉了，正在重新启动浏览器（第 ${attempt}/${maxAttempts} 次）`,
+    )
+
+    // 至少要把这个会话的旧登记清掉：它指向的 Page 已经关闭，留着只会让下一轮继续踩空。
+    const stale = this.sessionPages.get(sessionId)
+    this.sessionPages.delete(sessionId)
+    this.creatingPages.delete(sessionId)
+    void stale?.page.close().catch(() => {})
+    if (this.page === stale?.page) this.page = undefined
+    if (!connected) {
+      // 浏览器对象本身已死：别的会话页也一起失效，缓冲全清，连接句柄放掉，交给 ensureReady 重启。
+      this.sessionPages.clear()
+      this.pendingPages.clear()
+      this.page = undefined
+      const managed = this.managedConnection
+      this.managedConnection = undefined
+      this.browser = undefined
+      this.context = undefined
+      await managed?.browser.close().catch(() => {})
+      if (managed?.process && !managed.process.killed) managed.process.kill()
+    }
+
+    const delayMs = this.options.config.browserRecovery.delayMs
+    if (delayMs > 0) {
+      this.emitNotice(
+        request,
+        'recover',
+        `${formatDuration(delayMs)} 后重新${connected ? '打开标签页' : '启动浏览器'}，本轮消息会自动重发`,
+      )
+      await this.sleep(delayMs, request.signal)
+    }
+
     await this.ensureReady()
+    this.emitNotice(request, 'recover', '浏览器已就绪，正在重新打开网页并重发本轮消息')
+  }
+
+  async turn(request: BrowserTurnRequest): Promise<BrowserTurnResult> {
+    // 回合还没开始，浏览器/标签页就已经被关掉：ensureReady 会自己重启/补页，
+    // 但那一步是静默的——用户只会看到"发出去没反应"。所以先记下现场，恢复后补一条提示。
+    const healthyBefore = this.browser?.isConnected() === true
+    const closedPageBefore = this.page !== undefined && this.page.isClosed()
+    await this.ensureReady()
+    if (this.browser !== undefined && (!healthyBefore || closedPageBefore)) {
+      this.emitNotice(
+        request,
+        'recover',
+        healthyBefore
+          ? '网页标签已被关闭，已自动重新打开'
+          : '浏览器已被关闭，已自动重新启动并打开网页',
+      )
+    }
     // 同对话自审（preserveConversation）必须落回"发起审阅的那个会话"的网页页：
     // 优先用请求里显式指定的 conversationSessionId（不受并发子会话影响），
     // 其次才回落 adapter 打点的 focusSessionId，最后才是"最近用过的页"。
@@ -620,17 +850,17 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     } else {
       state = await this.stateFor(request.sessionId)
     }
-    if (state.page.isClosed()) {
-      throw new LlmError('deepseek-web: 会话工作页已被关闭，请重试本轮任务（会重新回放宿主上下文）。', 'WEB_PAGE_CLOSED')
-    }
+    // 页面若已被关闭，不在这里直接抛：交给下面的自愈循环（turnOnPage 会抛 WEB_PAGE_CLOSED），
+    // 这样"用户顺手关了标签页"和"浏览器整个退出"走同一条恢复路径。
 
-    const release = await state.lock.acquire(request.signal, {
+    const acquire = (target: SessionPageState): Promise<() => void> => target.lock.acquire(request.signal, {
       maxHoldMs: this.options.config.lockLeaseMs,
       onLeak: info => console.warn(
-        `[deepseek-web] 会话回合锁被强制回收：session=${state.sessionId} 已持有 ${Math.round(info.heldMs / 1000)}s。`
+        `[deepseek-web] 会话回合锁被强制回收：session=${target.sessionId} 已持有 ${Math.round(info.heldMs / 1000)}s。`
         + '该回合仍在后台收尾，但不会再永久阻塞这个会话的后续请求。',
       ),
     })
+    let release = await acquire(state)
 
     // 内部中止源：cancelTurn（宿主放弃生成）与单回合超时都走这里，和宿主 signal 并联，
     // 谁先触发都能让网页回合立刻结束，不再出现"没人等它但页面还在生成"的幽灵回合。
@@ -653,28 +883,51 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     if (timer) (timer as unknown as { unref?: () => void }).unref?.()
     const inner: BrowserTurnRequest = { ...request, signal: abort.signal }
 
+    const recovery = this.options.config.browserRecovery
+    const maxRecoveries = recovery.enabled === false ? 0 : Math.max(0, Math.trunc(recovery.maxAttempts))
+
     try {
-      console.info(
-        `[deepseek-web] turn 入口 session=${request.sessionId} initialize=${String(request.initialize)} `
-        + `页面会话=${state.sessionId} started=${String(state.started)} 会话页=${this.sessionPages.size}`,
-      )
-      request.signal?.throwIfAborted()
-      if (request.initialize && !state.started) {
-        await this.startFreshConversation(state.page)
-        state.started = true
+      for (let recovered = 0; ; recovered += 1) {
+        try {
+          console.info(
+            `[deepseek-web] turn 入口 session=${request.sessionId} initialize=${String(request.initialize)} `
+            + `页面会话=${state.sessionId} started=${String(state.started)} 会话页=${this.sessionPages.size}`
+            + `${recovered > 0 ? ` 自愈第 ${recovered} 次` : ''}`,
+          )
+          request.signal?.throwIfAborted()
+          if (request.initialize && !state.started) {
+            await this.startFreshConversation(state.page)
+            state.started = true
+          }
+          return await this.turnOnPage(state.page, inner)
+        } catch (error) {
+          // 超时/取消是"主动结束"，不能拿重启浏览器来掩盖；自愈只处理意外关闭。
+          if (timedOut || abort.signal.aborted) throw error
+          if (recovered >= maxRecoveries || !this.browserClosed(error)) throw error
+          // 换新页之前先放锁：自愈可能要重启浏览器，别让其它请求堵在这把锁上干等。
+          release()
+          await this.recoverBrowser(request, recovered + 1, maxRecoveries, error, request.sessionId)
+          state = await this.stateFor(request.sessionId)
+          state.abort = abort
+          release = await acquire(state)
+        }
       }
-      return await this.turnOnPage(state.page, inner)
     } catch (error) {
       if (timedOut) {
-        throw new LlmError(
+        const timeout = new LlmError(
           `deepseek-web: 本次网页回合超过单回合上限（${Math.round(timeoutMs / 1000)}s），已主动中止，避免长期占用网页与会话锁。`
           + '请检查网页是否卡在生成中，或调大 turnTimeoutMs 后重试。',
           'WEB_TURN_TIMEOUT',
         )
+        this.emitFailure(request, timeout)
+        throw timeout
       }
       if (abort.signal.aborted && !request.signal?.aborted) {
-        throw new LlmError('网页回合已被主动取消（宿主已放弃本次生成）。', 'WEB_TURN_ABORTED')
+        const aborted = new LlmError('网页回合已被主动取消（宿主已放弃本次生成）。', 'WEB_TURN_ABORTED')
+        this.emitFailure(request, aborted)
+        throw aborted
       }
+      this.emitFailure(request, error)
       throw error
     } finally {
       if (timer) clearTimeout(timer)
@@ -713,6 +966,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       await page.goto(entryUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 })
       await this.startFreshConversation(page, entryUrl)
       return await this.turnOnPage(page, request)
+    } catch (error) {
+      this.emitFailure(request, error)
+      throw error
     } finally {
       await page?.close().catch(() => {})
       await this.setWebWindowTopmost(request.sessionId, false).catch(() => {})
@@ -720,11 +976,13 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   }
 
   private async turnOnPage(page: Page, request: BrowserTurnRequest): Promise<BrowserTurnResult> {
-
+    const startedAt = Date.now()
+    let waitedMs = 0
     // 频控自动重发：网页提示“发送过于频繁”时等待后重发同一条消息，
     // 而不是中断回合报错；重试用尽才抛 WEB_RATE_LIMITED。
+    // 默认走指数退避（60s→120s→240s→300s 封顶），覆盖实测 10~15 分钟冷却窗口。
     const rateLimit = this.options.config.rateLimit
-    const maxRetries = rateLimit?.enabled === false ? 0 : rateLimit?.maxRetries ?? 5
+    const maxRetries = rateLimit?.enabled === false ? 0 : rateLimit?.maxRetries ?? 4
     for (let attempt = 0; ; attempt++) {
       request.signal?.throwIfAborted()
       const outcome = await this.sendAndWait(page, request)
@@ -743,7 +1001,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
           && !outcome.completion.interrupted) {
           throw new LlmError('网页响应格式无法识别，原始网络内容未作为正文提交。', 'WEB_UNPARSEABLE_RESPONSE')
         }
-        return {
+        const result: BrowserTurnResult = {
           text: parsed.text,
           ...parsed.reasoning !== undefined ? { reasoning: parsed.reasoning } : {},
           ...parsed.accumulatedUsage !== undefined ? { accumulatedUsage: parsed.accumulatedUsage } : {},
@@ -751,21 +1009,39 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
           ...outcome.completion.interrupted ? { finishReason: 'interrupted' as const }
             : parsed.finishReason ? { finishReason: parsed.finishReason } : {},
         }
+        this.emitNotice(
+          request,
+          'done',
+          `用时 ${formatDuration(Date.now() - startedAt)}，收到 ${parsed.text.length} 字`
+          + `${waitedMs > 0 ? `（含频控等待 ${formatDuration(waitedMs)}）` : ''}`,
+        )
+        return result
       }
       if (attempt >= maxRetries) {
         throw new LlmError(
-          `deepseek-web: 网页提示发送过于频繁，已自动重发 ${maxRetries} 次仍未成功。`
+          `deepseek-web: 网页提示发送过于频繁，已自动重发 ${maxRetries} 次仍未成功`
+          + `${waitedMs > 0 ? `（累计等待 ${formatDuration(waitedMs)}）` : ''}。`
           + '请稍后在网页端手动发送，或稍后重试本任务。',
           'WEB_RATE_LIMITED',
         )
       }
-      const delayMs = rateLimit?.retryDelayMs ?? 30_000
+      const waitMs = rateLimitDelayMs(rateLimit, attempt)
+      waitedMs += waitMs
+      const delayText = formatDuration(waitMs)
+      const jitterPercent = Math.round((rateLimit?.jitterRatio ?? 0.15) * 100)
       console.info(
-        `[deepseek-web] 网页提示发送频繁，${Math.round(delayMs / 1000)}s 后自动重发同一条消息（第 ${attempt + 1}/${maxRetries} 次）…`,
+        `[deepseek-web] 网页提示发送频繁，${delayText} 后自动重发同一条消息`
+        + `（第 ${attempt + 1}/${maxRetries} 次，${describeRateLimitPolicy(rateLimit)}，抖动 ±${jitterPercent}%）…`,
       )
-      await this.markPageStatus(page, `[dsh 频控：${Math.round(delayMs / 1000)}s 后自动重发]`)
-      await this.sleep(delayMs, request.signal)
+      this.emitNotice(
+        request,
+        'wait',
+        `网页提示发送过于频繁，${delayText} 后自动重发（第 ${attempt + 1}/${maxRetries} 次）`,
+      )
+      await this.markPageStatus(page, `[dsh 频控：${delayText} 后自动重发]`).catch(() => {})
+      await this.waitWithCountdown(page, request, waitMs, attempt + 1, maxRetries)
       await this.markPageStatus(page, undefined).catch(() => {})
+      this.emitNotice(request, 'retry', `正在第 ${attempt + 1}/${maxRetries} 次重发同一条消息`)
     }
   }
 
@@ -1060,6 +1336,11 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       return true
     }, { timeout: Math.min(this.options.config.streamIdleTimeoutMs, SEND_ACK_TIMEOUT_MS) }).then(async response => {
       await this.markPageStatus(page, request.purpose ? `[dsh 内部辅助：${request.purpose} 生成中]` : '[dsh 网页生成中]').catch(() => {})
+      this.emitNotice(
+        request,
+        'receive',
+        request.purpose ? `网页已响应（内部辅助：${request.purpose}），正在生成…` : '网页已响应，正在生成…',
+      )
       // finished() 与 body() 并行：body() 内部本来就要等流结束，
       // 串行 await 等于把“等流结束”做两遍，白多一次往返。
       const [interrupted, body] = await Promise.all([
@@ -1167,6 +1448,17 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         console.info('[deepseek-web] 消息已填入 Edge 并置顶聚焦，请回车或点击“发送”…')
       }
 
+      const attachText = request.attachments !== undefined && request.attachments.length > 0
+        ? `，附图 ${request.attachments.length} 张`
+        : ''
+      this.emitNotice(
+        request,
+        'send',
+        autoSend
+          ? `已发送 ${request.text.length} 字${attachText}`
+          : `已填入输入框 ${request.text.length} 字${attachText}，等待你在网页点击发送`,
+      )
+
       const winner = await Promise.race([waiter, rateLimited, aborted])
       // 作废 waiter 的 undefined 不会先于 race 落定；防御性兜底按频控处理
       if (winner === undefined) return { kind: 'rate-limited' }
@@ -1200,13 +1492,19 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     }
   }
 
-  /** 可中断的等待（AbortSignal 触发时抛 WEB_TURN_ABORTED）。 */
-  private async sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  /**
+   * 可中断的等待（AbortSignal 触发时抛 WEB_TURN_ABORTED）。
+   *
+   * `onTick` 每满 1 秒回调一次剩余毫秒，用于刷新倒计时；回调是同步的，
+   * 内部也别 await——等待期间页面可能已经没了，刷新失败不该影响等待本身。
+   */
+  private async sleep(ms: number, signal?: AbortSignal, onTick?: (remainingMs: number) => void): Promise<void> {
     const step = 200
     for (let waited = 0; waited < ms; waited += step) {
       if (signal?.aborted) {
         throw new LlmError('deepseek-web: 等待频控重发期间回合被取消。', 'WEB_TURN_ABORTED')
       }
+      if (onTick !== undefined && waited % 1_000 === 0) onTick(Math.max(0, ms - waited))
       await new Promise(resolve => setTimeout(resolve, Math.min(step, ms - waited)))
     }
   }

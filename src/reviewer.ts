@@ -139,6 +139,8 @@ export class KimiReviewer {
       text: buildReviewPrompt(evidence, this.config.maxEvidenceChars),
       initialize: fresh,
       autoSend: this.config.autoSend !== false,
+      // 提示归属：审核通道发的提示必须标成 review，不能混进会话提示。
+      role: 'review',
     })
     return parseReviewVerdict(result.text)
   }
@@ -167,6 +169,8 @@ export class GlmReviewer {
       text: buildReviewPrompt(evidence, this.config.maxEvidenceChars),
       initialize: fresh,
       autoSend: this.config.autoSend !== false,
+      // 提示归属：审核通道发的提示必须标成 review。
+      role: 'review',
     })
     return parseReviewVerdict(result.text)
   }
@@ -200,6 +204,8 @@ export class DeepSeekSelfReviewer {
       model: 'deepseek-web',
       text,
       initialize: false,
+      // 提示归属：自审也是审核，前缀与开关都走 review 那一套。
+      role: 'review',
     })
     return parseReviewVerdict(result.text)
   }

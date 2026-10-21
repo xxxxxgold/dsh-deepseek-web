@@ -5,6 +5,7 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import type { NotifyConfig } from './notify.ts'
 import { WEB_MODEL_CAPABILITIES, WEB_MODEL_IDS, type WebModelId } from './web-models.ts'
 
 export const PROVIDER = 'deepseek-web'
@@ -105,7 +106,7 @@ export interface ReviewConfig {
    * 所以企业版域名也能跟着走。
    *
    * 填完整项目页链接同样认（老配置里存的就是整条地址），此时原样使用、不再拼接。
-   * 缺建新参数时会被自动补上；留空时选项目模式会直接报错，避免悄悄退回普通对话。
+   * 留空时选项目模式会直接报错，避免悄悄退回普通对话。
    */
   projectUrl: string
   /** 常驻 Kimi 审核浏览器的 CDP 端口。 */
@@ -176,10 +177,37 @@ export interface Config {
   rateLimit: {
     /** 总开关。 */
     enabled: boolean
-    /** 检测到频控后等待多久重发（毫秒）。 */
+    /** 检测到频控后第一次等待多久（毫秒）；指数退避时作为基数。 */
     retryDelayMs: number
-    /** 单轮最多自动重发次数；用尽后才报错（默认 5 次 ≈ 2.5 分钟窗口）。 */
+    /** 单轮最多自动重发次数；用尽后才抛 WEB_RATE_LIMITED。 */
     maxRetries: number
+    /** 退避曲线：fixed 每次等 retryDelayMs；exponential 按次数翻倍（默认）。 */
+    backoff: 'fixed' | 'exponential'
+    /** 指数退避的单次等待上限（毫秒），防止越退越长把回合拖死。 */
+    retryMaxDelayMs: number
+    /** 抖动比例 0~0.5：每次等待在基准值上随机浮动，避免多实例同一秒重撞。 */
+    jitterRatio: number
+  }
+  /**
+   * 提示：把「发出消息 / 收到回复 / 频控等待 / 本轮失败」做成对话里可见的一行提示。
+   *
+   * 主通道是 reasoning 块（可折叠、不污染正文），浏览器页面浮层只辅助等待场景。
+   * 会话消息与审核消息分开开关：内部自审不该把主对话刷满。
+   */
+  notify: NotifyConfig
+  /**
+   * 浏览器自愈：网页标签或整个浏览器被关掉后，自动重启/重连并重发本轮。
+   *
+   * 处理的是「用户手滑关掉浏览器」「系统清理了窗口」这类可恢复事故，
+   * 而不是代码 bug：只对关闭类报错生效，频控、超时、取消都不在这里兜。
+   */
+  browserRecovery: {
+    /** 总开关。关掉后浏览器被关只报错，不自动重启。 */
+    enabled: boolean
+    /** 单轮最多尝试恢复几次；用尽后才把原始错误抛给宿主。 */
+    maxAttempts: number
+    /** 重启前的等待（毫秒），给系统一点时间回收句柄。 */
+    delayMs: number
   }
   /**
    * 实时思考流：默认关闭；开启时仅把网页真实思考增量作为 reasoning 块
@@ -338,11 +366,34 @@ const schema = z.object({
   sendMode: markVolatile(z.union(['manual', 'approved']).default('manual')),
   model: markVolatile(z.union([...WEB_MODEL_IDS]).default('deepseek-web')),
   selectors: z.dict(z.string()),
-  streamIdleTimeoutMs: z.number().step(1).min(1).default(600_000),
+  // 默认 45 秒：网页回合空闲超过此值即判超时，避免队头被一条死流堵住 10 分钟。
+  streamIdleTimeoutMs: z.number().step(1).min(1).default(45_000),
   rateLimit: z.object({
     enabled: markVolatile(z.boolean().default(true)),
-    retryDelayMs: markVolatile(z.number().step(1).min(1_000).default(30_000)),
-    maxRetries: markVolatile(z.number().step(1).min(0).default(5)),
+    // 默认指数退避：60s → 120s → 240s → 300s（封顶），合计约 12 分钟，
+    // 覆盖实测最常见的 10~15 分钟冷却窗口。固定 30s×5 只够 2.5 分钟，
+    // 等于在冷却期里再硬撞 5 次（docs/RISK-CONTROL.md）。
+    retryDelayMs: markVolatile(z.number().step(1).min(1_000).default(60_000)),
+    maxRetries: markVolatile(z.number().step(1).min(0).default(4)),
+    backoff: markVolatile(z.union(['fixed', 'exponential']).default('exponential')),
+    retryMaxDelayMs: markVolatile(z.number().step(1).min(1_000).default(300_000)),
+    jitterRatio: markVolatile(z.number().step(0.01).min(0).max(0.5).default(0.15)),
+  }).default({}),
+  notify: z.object({
+    enabled: markVolatile(z.boolean().default(true)),
+    session: markVolatile(z.boolean().default(true)),
+    review: markVolatile(z.boolean().default(true)),
+    send: markVolatile(z.boolean().default(true)),
+    receive: markVolatile(z.boolean().default(true)),
+    errors: markVolatile(z.boolean().default(true)),
+    browser: markVolatile(z.boolean().default(true)),
+  }).default({}),
+  browserRecovery: z.object({
+    enabled: markVolatile(z.boolean().default(true)),
+    // 默认 2 次：手滑关窗一次就该恢复；连续两次还关，说明不是事故而是脚本在反复杀进程，
+    // 继续兜只会把真正的报错藏掉。
+    maxAttempts: markVolatile(z.number().step(1).min(0).max(5).default(2)),
+    delayMs: markVolatile(z.number().step(1).min(0).max(60_000).default(2_000)),
   }).default({}),
   liveThinking: markVolatile(z.boolean().default(false)),
   maxReplyBytes: z.number().step(1).min(1024).default(4 * 1024 * 1024),
@@ -399,11 +450,13 @@ const schema = z.object({
     kimiMode: markVolatile(z.union(['normal', 'project']).default('normal')),
     // 默认就是「新会话入口」：通道会直接打开这个链接当审核窗口。
     url: markVolatile(z.string().default('https://www.kimi.com/?chat_enter_method=new_chat')),
-    // 项目模式默认留空：各人的项目 ID 不同，不能替用户猜一个。只填 ID，插件负责拼成完整项目页地址。
+    // 项目模式默认留空：各人的项目 ID 不同，不能替用户猜一个。
+    // 只填 ID 即可，完整项目页链接也认；拼接逻辑在 KimiBrowserChannel.toProjectUrl()。
     projectUrl: markVolatile(z.string().default('')),
     debugPort: z.number().step(1).min(1024).max(65535).default(9334),
     profileDir: z.string(),
-    streamIdleTimeoutMs: z.number().step(1).min(1).default(600_000),
+    // 默认 45 秒：审核通道（Kimi/GLM）空闲超时，与主通道保持一致。
+    streamIdleTimeoutMs: z.number().step(1).min(1).default(45_000),
     maxEvidenceChars: z.number().step(1).min(1_000).default(60_000),
     maxRounds: markVolatile(z.number().step(1).min(0).default(1)),
     glmUrl: z.string().default('https://chat.z.ai/'),
