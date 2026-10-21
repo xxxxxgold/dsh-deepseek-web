@@ -31,35 +31,185 @@ export function locateEditor(page: Page): Locator {
 /** 网页端“发送过于频繁/稍后重试”一类频控提示的匹配模式。 */
 export const RATE_LIMIT_PATTERN = /过于频繁|太频繁|发送太快|发送太快了|请.{0,4}稍后.{0,4}(重试|再试)|稍后再试|操作频繁|请求过于|too\s+(many|frequent)|rate[._\s-]?limit(?:ed)?|try\s+again\s+(later|soon)/i
 
-/** 判断一段文本（toast 文案或响应体）是否是频控提示。 */
+/** 判断一段文本（toast 文案）是否是频控提示。 */
 export function looksLikeRateLimitText(text: string): boolean {
   return RATE_LIMIT_PATTERN.test(text)
 }
 
 /**
+ * 频控响应体判定：**只认明确的错误体**。
+ *
+ * 正常回复是 SSE 流（`data: {...}`），正文里出现“稍后重试”是模型在正常说话。
+ * 早期版本直接对前 2000 字跑正则，于是每一条带“稍后再试”的正常回答都会被判成
+ * 频控：重发同一条消息、再被判、再重发，最后抛 WEB_RATE_LIMITED。
+ */
+export function isRateLimitResponse(status: number, body: string): boolean {
+  if (status === 429) return true
+  const head = body.slice(0, 4_000)
+  const isEventStream = /^\s*(data:|event:)/.test(head) || head.includes('\ndata:')
+  if (isEventStream) {
+    // 流里的独立 error 帧才算数，正文段落一概不扫
+    const errorFrame = /"error"\s*:\s*\{[^}]*\}/.exec(head)
+    if (errorFrame === null) return false
+    return looksLikeRateLimitText(errorFrame[0]) || errorFrame[0].includes('429')
+  }
+  const trimmed = body.trim()
+  if (trimmed.length === 0 || trimmed.length > 500) return false
+  return looksLikeRateLimitText(trimmed)
+}
+
+/** 插件自己画在网页右下角的那块浮层的 id（它本身带着频控字眼，必须排除）。 */
+export const PAGE_NOTICE_ID = 'dsh-web-notice'
+
+/**
+ * 频控 toast 的“已认领”标记属性。
+ *
+ * 检测器每 800ms 扫一次全页，而 toast 往往**视觉上消失、节点仍留在 DOM 里**
+ * （父容器 display:none、淡出后 opacity:0、被移出视口……）。没有这层标记，
+ * 一条旧提示会让之后每一轮发送都在第一拍被判成频控：重发 5 次、共等 12 分钟、
+ * 最后报 WEB_RATE_LIMITED——用户看到的是“网页上什么都没有，却一直失败”。
+ */
+export const RATE_LIMIT_SEEN_ATTR = 'data-dsh-rate-limit-seen'
+
+/** 一个候选节点的事实集合（纯数据，便于离线检查覆盖判定规则）。 */
+export interface RateLimitNodeFacts {
+  /** 节点的可见文本（已 trim） */
+  text: string
+  /** 视觉上是否能被用户看到（含祖先链、尺寸、视口） */
+  visible: boolean
+  /** 直接子元素个数 */
+  childElementCount: number
+  /** 是否落在输入区内部 */
+  insideEditor: boolean
+  /** 是否是本插件自己画的浮层 */
+  selfPaint: boolean
+  /** 是否已被之前某一轮认领（旧节点） */
+  seen: boolean
+}
+
+/**
+ * 判定单个候选节点该不该算作“本轮正在显示的频控提示”。
+ *
+ * 纯函数：`hasRateLimitToast` 的页面内联逻辑必须与这里逐条对应，
+ * 离线检查 `tools/rate-limit-check.ts` 依赖它覆盖“什么该算、什么不该算”。
+ */
+export function shouldCountRateLimitNode(facts: RateLimitNodeFacts): boolean {
+  if (!facts.visible) return false
+  if (facts.insideEditor) return false
+  if (facts.selfPaint) return false
+  if (facts.seen) return false
+  if (facts.childElementCount > 2) return false
+  const text = facts.text.trim()
+  if (text.length === 0 || text.length > 120) return false
+  return looksLikeRateLimitText(text)
+}
+
+/**
  * 页面里是否正显示频控 toast。
  *
- * 只看“短小可见”的叶子元素（toast 的典型形态），并排除输入区本身——
- * 避免把用户/协议文本里恰好包含“请稍后重试”的正文误判成频控。
+ * 与早期版本的区别（都是真实踩过的坑）：
+ * 1. 可见性沿祖先链判断（`checkVisibility`），父容器 `display:none` / `opacity:0`
+ *    的残留节点不再算“正在显示”；
+ * 2. 完全移出视口、零尺寸的节点算已消失；
+ * 3. 排除插件自己画的浮层（它的文案本身就能命中原正则，会形成自锁）；
+ * 4. 已被之前某一轮认领过的旧节点不再重复计数——只有**这一轮之后新出现的**才算数。
  */
 export async function hasRateLimitToast(page: Page): Promise<boolean> {
-  // evaluate 回调无法闭包模块常量，把模式源作为参数传入，保证单一事实来源
-  return await page.evaluate(patternSource => {
-    const pattern = new RegExp(patternSource, 'i')
+  // evaluate 回调无法闭包模块常量，把所需常量作为参数传入，保证单一事实来源。
+  // 注意：回调体内**不要**写具名函数表达式——esbuild 的 keepNames 会把它包成
+  // `__name(...)`，而页面里没有这个 helper，整个回调会抛错并被 .catch 吞成 false。
+  return await page.evaluate(params => {
+    const pattern = new RegExp(params.patternSource, 'i')
     const editors = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [contenteditable="plaintext-only"], [role="textbox"]'))
+    const selfPaint = document.getElementById(params.noticeId)
     const elements = Array.from(document.querySelectorAll('div, span, p, section, aside')) as HTMLElement[]
+
     for (const element of elements) {
       if (!element.isConnected) continue
       if (editors.some(editor => editor.contains(element))) continue
-      const style = window.getComputedStyle(element)
-      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue
+      if (selfPaint !== null && (element === selfPaint || selfPaint.contains(element))) continue
       const text = (element.textContent ?? '').trim()
       if (text.length === 0 || text.length > 120) continue
       if (element.childElementCount > 2) continue
-      if (pattern.test(text)) return true
+      // 旧节点：同一段文字已经被之前某一轮认领过，不再重复计数；
+      // 文案变了说明是新的提示，照常识别（真实 toast 库会复用同一个节点改字）。
+      if (element.getAttribute(params.seenAttr) === text) continue
+      if (!pattern.test(text)) continue
+
+      // 可见性沿祖先链判断：父容器 display:none / 淡出 opacity:0 / 被甩出视口的
+      // 残留节点，用户看不见，就不该算“正在显示频控提示”。
+      const maybeCheck = (element as HTMLElement & {
+        checkVisibility?: (options?: { checkOpacity?: boolean, checkVisibilityCSS?: boolean }) => boolean
+      }).checkVisibility
+      let shown = true
+      if (typeof maybeCheck === 'function') {
+        shown = maybeCheck.call(element, { checkOpacity: true, checkVisibilityCSS: true })
+      } else {
+        for (let node: HTMLElement | null = element; node !== null; node = node.parentElement) {
+          const style = window.getComputedStyle(node)
+          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0
+            || node.hasAttribute('hidden')) {
+            shown = false
+            break
+          }
+        }
+      }
+      if (!shown) continue
+
+      const rect = element.getBoundingClientRect()
+      if (rect.width === 0 || rect.height === 0) continue
+      if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) continue
+      // 被祖先 overflow:hidden/clip 裁掉也算看不见（典型：0×0 容器里没清干净的残留 toast）。
+      // 这段只对「文案已命中正则」的少数元素执行，不会拖慢每 800ms 的整页扫描。
+      let clipTop = 0
+      let clipLeft = 0
+      let clipRight = window.innerWidth
+      let clipBottom = window.innerHeight
+      let hasClip = false
+      for (let node: HTMLElement | null = element.parentElement; node !== null; node = node.parentElement) {
+        const style = window.getComputedStyle(node)
+        if (!/hidden|clip/.test(`${style.overflowX} ${style.overflowY}`)) continue
+        const box = node.getBoundingClientRect()
+        clipTop = Math.max(clipTop, box.top)
+        clipLeft = Math.max(clipLeft, box.left)
+        clipRight = Math.min(clipRight, box.right)
+        clipBottom = Math.min(clipBottom, box.bottom)
+        hasClip = true
+      }
+      if (hasClip && (rect.bottom <= clipTop || rect.top >= clipBottom
+        || rect.right <= clipLeft || rect.left >= clipRight)) continue
+      return true
     }
     return false
-  }, RATE_LIMIT_PATTERN.source).catch(() => false)
+  }, { patternSource: RATE_LIMIT_PATTERN.source, seenAttr: RATE_LIMIT_SEEN_ATTR, noticeId: PAGE_NOTICE_ID }).catch(() => false)
+}
+
+/**
+ * 发送前给“此刻页面上已经存在的频控文案节点”打上认领标记。
+ *
+ * 语义：从这一轮发送开始，只有**新冒出来**的提示才算新频控。上一轮留下的、
+ * 或网页历史上早就挂着的，都不会再把本轮拦下来。返回打标记的节点数，仅用于日志。
+ */
+export async function markRateLimitToastsSeen(page: Page): Promise<number> {
+  return await page.evaluate(params => {
+    const pattern = new RegExp(params.patternSource, 'i')
+    const selfPaint = document.getElementById(params.noticeId)
+    const elements = Array.from(document.querySelectorAll('div, span, p, section, aside')) as HTMLElement[]
+    let marked = 0
+    for (const element of elements) {
+      if (!element.isConnected) continue
+      if (selfPaint !== null && (element === selfPaint || selfPaint.contains(element))) continue
+      const text = (element.textContent ?? '').trim()
+      if (text.length === 0 || text.length > 120) continue
+      if (element.childElementCount > 2) continue
+      if (!pattern.test(text)) continue
+      // 不筛可见性：隐藏的旧节点更该认领——它可能下一秒被重新显示。
+      element.setAttribute(params.seenAttr, text)
+      marked += 1
+      if (marked >= 50) break
+    }
+    return marked
+  }, { patternSource: RATE_LIMIT_PATTERN.source, seenAttr: RATE_LIMIT_SEEN_ATTR, noticeId: PAGE_NOTICE_ID }).catch(() => 0)
 }
 
 export async function ensureChatPage(page: Page, url: string): Promise<void> {

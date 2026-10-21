@@ -39,7 +39,9 @@ import {
   defaultProfileDir,
   focusDshWindow,
   hasRateLimitToast,
-  looksLikeRateLimitText,
+  isRateLimitResponse,
+  markRateLimitToastsSeen,
+  PAGE_NOTICE_ID,
   looksLoggedOut,
   locateEditor,
   ensureChatPage,
@@ -660,11 +662,10 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   private async paintPageNotice(page: Page, text: string): Promise<void> {
     if (!browserNoticeEnabled(this.options.config.notify)) return
     await page.evaluate((payload) => {
-      const id = 'dsh-web-notice'
-      let box = document.getElementById(id)
+      let box = document.getElementById(payload.id)
       if (box === null) {
         box = document.createElement('div')
-        box.id = id
+        box.id = payload.id
         box.setAttribute('role', 'status')
         box.style.cssText = [
           'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483647',
@@ -675,15 +676,20 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         ].join(';')
         document.body.appendChild(box)
       }
-      box.textContent = payload
-    }, text)
+      box.textContent = payload.text
+    }, { id: PAGE_NOTICE_ID, text })
   }
 
-  /** 抹掉浮层；网页已关闭时静默跳过。 */
+  /**
+   * 抹掉浮层；网页已关闭时静默跳过。
+   *
+   * 这里**不**再看 `browserNoticeEnabled`：开关只在“画”的时候判断，清理必须无条件执行。
+   * 否则等待中途把「网页内提示」关掉，浮层就永远留在网页右下角；而它的文案
+   * （“网页提示发送过于频繁…”）本身能命中频控正则，会把之后每一轮都锁死。
+   */
   private async clearPageNotice(page: Page): Promise<void> {
-    if (!browserNoticeEnabled(this.options.config.notify)) return
     if (page.isClosed()) return
-    await page.evaluate(() => document.getElementById('dsh-web-notice')?.remove())
+    await page.evaluate(id => document.getElementById(id)?.remove(), PAGE_NOTICE_ID)
   }
 
   /**
@@ -725,7 +731,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         )
       })
     } finally {
-      if (canPaint) await this.clearPageNotice(page).catch(() => {})
+      // 不论这轮有没有画成功都清一次：paintPageNotice 是 fire-and-forget（`void`），
+      // 最后一次绘制可能晚于 canPaint 的判定落地，漏清就会在网页上留下一块自锁浮层。
+      await this.clearPageNotice(page).catch(() => {})
     }
   }
 
@@ -1415,6 +1423,13 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       progressTimer = request.onProgress
         ? await this.startProgressPolling(page, request)
         : undefined
+      // 先把「此刻页面上已经存在的」频控文案节点认领掉：只有这一轮发送之后
+      // 新冒出来的提示才算新频控。少了这一步，上一轮残留的 toast（视觉上消失、
+      // 节点仍在 DOM 里）会让每一轮都在第一拍被判死——网页上明明没有提示，却一直失败。
+      const claimedBeforeSend = await markRateLimitToastsSeen(page)
+      if (claimedBeforeSend > 0) {
+        console.info(`[deepseek-web] 发送前认领 ${claimedBeforeSend} 个已存在的频控文案节点（不计入本轮判定）。`)
+      }
       toastTimer = setInterval(() => {
         void hasRateLimitToast(page).then(hit => {
           if (hit) rateLimitedNow?.()
@@ -1470,7 +1485,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       // 作废 waiter 的 undefined 不会先于 race 落定；防御性兜底按频控处理
       if (winner === undefined) return { kind: 'rate-limited' }
       if ('kind' in winner) return winner
-      if (winner.status === 429 || looksLikeRateLimitText(winner.body.slice(0, 2_000))) {
+      // 只认明确的错误体（429 / 非流式短错误文本 / 流里的独立 error 帧）。
+      // 早期版本扫正文前 2000 字，一句“失败的话可以稍后再试”就会把整轮判成频控。
+      if (isRateLimitResponse(winner.status, winner.body)) {
         console.warn(`[deepseek-web] 响应判定为频控（HTTP ${winner.status}）。`)
         return { kind: 'rate-limited' }
       }
