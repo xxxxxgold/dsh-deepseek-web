@@ -67,7 +67,8 @@ check(
 const baseReview = liveConfig(Config({})).review as ReviewConfig
 const focus = liveConfig(Config({})).focus as FocusConfig
 const NORMAL_URL = 'https://www.kimi.com/?chat_enter_method=new_chat'
-const PROJECT_URL = 'https://www.kimi.com/project/1a15bef4-b7a2-894f-8000-0e7143648841?chat_enter_method=new_chat'
+const PROJECT_ID = '1a15bef4-b7a2-894f-8000-0e7143648841'
+const PROJECT_URL = `https://www.kimi.com/project/${PROJECT_ID}?chat_enter_method=new_chat`
 
 function makeChannel(overrides: Partial<ReviewConfig>): KimiBrowserChannel {
   return new KimiBrowserChannel({
@@ -94,15 +95,60 @@ check(
   internals(makeChannel({ kimiMode: 'normal', url: NORMAL_URL })).resolveEntryUrl(),
 )
 check(
-  '入口：项目模式用 projectUrl（且保留项目路径）',
+  '入口：项目模式填完整链接时原样使用',
   internals(makeChannel({ kimiMode: 'project', projectUrl: PROJECT_URL })).resolveEntryUrl() === PROJECT_URL,
   internals(makeChannel({ kimiMode: 'project', projectUrl: PROJECT_URL })).resolveEntryUrl(),
 )
 check(
   '入口：正常模式不会误用 projectUrl',
-  internals(makeChannel({ kimiMode: 'normal', url: NORMAL_URL, projectUrl: PROJECT_URL })).resolveEntryUrl()
+  internals(makeChannel({ kimiMode: 'normal', url: NORMAL_URL, projectUrl: PROJECT_ID })).resolveEntryUrl()
     === NORMAL_URL,
   '正常模式取到了项目地址',
+)
+
+// 只填项目 ID：插件自己拼，不用用户抄整条链接（这是设置页默认用法）
+check(
+  '入口：项目模式只填 ID 时自动拼成项目页地址',
+  internals(makeChannel({ kimiMode: 'project', projectUrl: PROJECT_ID })).resolveEntryUrl()
+    === `https://www.kimi.com/project/${PROJECT_ID}?chat_enter_method=new_chat`,
+  internals(makeChannel({ kimiMode: 'project', projectUrl: PROJECT_ID })).resolveEntryUrl(),
+)
+check(
+  '入口：只填 ID 时域名跟「正常模式链接」走（企业版域名）',
+  internals(makeChannel({
+    kimiMode: 'project',
+    projectUrl: PROJECT_ID,
+    url: 'https://kimi.corp.example.com/?chat_enter_method=new_chat',
+  })).resolveEntryUrl() === `https://kimi.corp.example.com/project/${PROJECT_ID}?chat_enter_method=new_chat`,
+  internals(makeChannel({
+    kimiMode: 'project',
+    projectUrl: PROJECT_ID,
+    url: 'https://kimi.corp.example.com/?chat_enter_method=new_chat',
+  })).resolveEntryUrl(),
+)
+check(
+  '入口：ID 带前导斜杠或首尾空白时也能拼对',
+  internals(makeChannel({ kimiMode: 'project', projectUrl: `  /${PROJECT_ID}/  ` })).resolveEntryUrl()
+    === `https://www.kimi.com/project/${PROJECT_ID}?chat_enter_method=new_chat`,
+  internals(makeChannel({ kimiMode: 'project', projectUrl: `  /${PROJECT_ID}/  ` })).resolveEntryUrl(),
+)
+
+// 明显不是 ID 的输入：必须报错，而不是拼进路径里打开一个 404
+let badIdError: unknown
+try {
+  internals(makeChannel({ kimiMode: 'project', projectUrl: '我的项目 审核' })).resolveEntryUrl()
+} catch (error) {
+  badIdError = error
+}
+check(
+  '入口：项目 ID 不合法时抛 KIMI_PROJECT_ID_INVALID',
+  badIdError instanceof LlmError && badIdError.code === 'KIMI_PROJECT_ID_INVALID',
+  `实得 ${String(badIdError)}`,
+)
+check(
+  '入口：项目 ID 不合法的报错带填法示例',
+  badIdError instanceof Error && badIdError.message.includes('/project/'),
+  '报错里没说该填哪一段',
 )
 
 // 项目模式没填链接：必须明确报错，不能静默退回普通对话
@@ -119,7 +165,7 @@ check(
 )
 check(
   '入口：项目模式缺链接的报错带排查指引',
-  projectUrlError instanceof Error && projectUrlError.message.includes('项目模式链接'),
+  projectUrlError instanceof Error && projectUrlError.message.includes('项目 ID'),
   '报错里没提该填哪个字段',
 )
 check(
