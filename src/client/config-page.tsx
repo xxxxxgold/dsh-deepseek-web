@@ -36,6 +36,21 @@ const rowStyle = { marginBottom: 14, maxWidth: 560 } as const
 const inputStyle = { font: 'inherit', padding: '6px 8px', width: '100%', boxSizing: 'border-box' } as const
 
 /**
+ * 判断一个字段是否应当显示。
+ *
+ * `visibleWhen` 支持单条件或条件数组：数组要求**全部满足**，
+ * 这样「provider 是 kimi 且 kimiMode 是 project」才能精确只显示项目链接框。
+ */
+function isFieldVisible(
+  rule: { readonly path: FieldPath; readonly equals: string } | readonly { readonly path: FieldPath; readonly equals: string }[] | undefined,
+  current: unknown,
+): boolean {
+  if (rule === undefined) return true
+  if (Array.isArray(rule)) return rule.every(item => readPath(current, item.path) === item.equals)
+  return readPath(current, rule.path) === rule.equals
+}
+
+/**
  * 渲染本插件的配置页。
  *
  * @param props - 槽位宿主传入的 `view` 与页面表单句柄。
@@ -155,8 +170,7 @@ export function DeepSeekWebConfigPage({ view, form }: PluginConfigViewProps): JS
         </p>
       </div>
 
-      {FIELDS.filter((field) => field.visibleWhen === undefined
-        || readPath(current, field.visibleWhen.path) === field.visibleWhen.equals).map((field) => {
+      {FIELDS.filter((field) => isFieldVisible(field.visibleWhen, current)).map((field) => {
         const value = readPath(current, field.path)
         const id = `dsweb-row-${fieldKey(field)}`
         const error = errors.get(fieldKey(field))

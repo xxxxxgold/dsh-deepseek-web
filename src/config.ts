@@ -36,6 +36,16 @@ export type SendMode = 'manual' | 'approved'
 /** 可选的审核通道配置；默认关闭，关闭时行为与只用 DeepSeek 完全一致。 */
 export type ReviewProvider = 'kimi' | 'deepseek-web' | 'glm'
 
+/**
+ * Kimi 审核窗口的两种模式（互斥，不是一个开关的两种写法）：
+ * - `normal`：普通对话页。每次审核开一个普通对话，落在「最近对话」里。
+ * - `project`：项目页内的对话。每次审核在该项目里新开一个对话，对话归档到项目下。
+ *
+ * 实机核对（2026-10）：项目页发消息后地址会变成 `/chat/<uuid>`（Kimi 的对话页统一形态），
+ * 但对话确实归属该项目——项目页侧边栏和历史里都能看到，带 `project` 查询参数。
+ */
+export type KimiReviewMode = 'normal' | 'project'
+
 export interface ReviewConfig {
   /** 是否启用审核（审核器由 provider 决定）。 */
   enabled: boolean
@@ -75,11 +85,26 @@ export interface ReviewConfig {
    */
   fetchRetries: number
   /**
-   * 审核窗口打开的链接（默认已带 `?chat_enter_method=new_chat`，打开即是新对话）。
-   * 可改成任意同源地址：企业版域名、带自己查询参数的地址、甚至项目页。
+   * Kimi 审核窗口打开方式（二选一）：
+   * - `normal`（默认）：普通对话页。
+   * - `project`：项目页里的对话，审核结果归档到该项目下。
+   *
+   * 选 `project` 时使用下面的 `projectUrl`，选 `normal` 时使用 `url`；
+   * 两者不会互相兜底——选项目模式却没填项目链接会直接报错，避免悄悄退回普通对话。
+   */
+  kimiMode: KimiReviewMode
+  /**
+   * 正常模式的入口链接（默认已带 `?chat_enter_method=new_chat`，打开即是新对话）。
+   * 可改成任意同源地址：企业版域名、带自己查询参数的地址。
    * 通道只保证“打开这个链接”，不会篡改路径；缺建新参数时会被自动补上。
    */
   url: string
+  /**
+   * 项目模式的入口链接，形如
+   * `https://www.kimi.com/project/<项目ID>?chat_enter_method=new_chat`。
+   * 必须是项目页地址；缺建新参数时同样会被自动补上。
+   */
+  projectUrl: string
   /** 常驻 Kimi 审核浏览器的 CDP 端口。 */
   debugPort: number
   /** Kimi 审核独立 profile 目录；留空使用 %LOCALAPPDATA%\DshDeepSeekWeb\kimi-profile。 */
@@ -367,8 +392,12 @@ const schema = z.object({
     sendVerifyMs: markVolatile(z.number().step(1).min(100).default(1_500)),
     sendRetries: markVolatile(z.number().step(1).min(1).max(5).default(2)),
     fetchRetries: markVolatile(z.number().step(1).min(0).max(3).default(1)),
+    // 两种模式各用各的地址，互不兜底：选错模式会立刻报错，而不是静默走错页面。
+    kimiMode: markVolatile(z.union(['normal', 'project']).default('normal')),
     // 默认就是「新会话入口」：通道会直接打开这个链接当审核窗口。
-    url: z.string().default('https://www.kimi.com/?chat_enter_method=new_chat'),
+    url: markVolatile(z.string().default('https://www.kimi.com/?chat_enter_method=new_chat')),
+    // 项目模式默认留空：各人的项目 ID 不同，不能替用户猜一个。
+    projectUrl: markVolatile(z.string().default('')),
     debugPort: z.number().step(1).min(1024).max(65535).default(9334),
     profileDir: z.string(),
     streamIdleTimeoutMs: z.number().step(1).min(1).default(600_000),

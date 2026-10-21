@@ -140,7 +140,9 @@ export function withTimeout<T>(
  * 不保证「对话归属到那个项目」。
  */
 export function ensureFreshChatUrl(raw: string, param = 'chat_enter_method=new_chat'): string {
-  const trimmed = raw.trim()
+  // 配置里的 volatile 字段在未解引用时读到的是引用对象，直接 `.trim()` 会把
+  // “配置没读对”变成一句莫名其妙的 TypeError；这里按空串处理，交给调用方报人话错误。
+  const trimmed = (typeof raw === 'string' ? raw : '').trim()
   if (!trimmed) return trimmed
   const [key, value = ''] = param.split('=')
   try {
@@ -230,10 +232,17 @@ export async function sendEditorMessage(
   editor: Locator,
   options: SendEditorMessageOptions = {},
 ): Promise<SendOutcome> {
-  const verifyTimeoutMs = options.verifyTimeoutMs ?? 1_500
-  const maxAttempts = Math.max(1, options.maxAttempts ?? 2)
-  const pauseMinMs = Math.max(0, options.pauseMinMs ?? 0)
-  const pauseMaxMs = Math.max(pauseMinMs, options.pauseMaxMs ?? 0)
+  // 配置值可能来自 volatile 字段，未提交时读到的是 `NaN`；`Math.max(1, NaN)` 仍是 `NaN`，
+  // 会让 `attempt <= maxAttempts` 恒为 false，整个发送循环被静默跳过（表现为“填进去却没发”）。
+  const finiteInt = (input: unknown, fallback: number, min: number, max: number): number => {
+    const value = Number(input)
+    if (!Number.isFinite(value)) return fallback
+    return Math.max(min, Math.min(max, Math.trunc(value)))
+  }
+  const verifyTimeoutMs = finiteInt(options.verifyTimeoutMs, 1_500, 200, 60_000)
+  const maxAttempts = finiteInt(options.maxAttempts, 2, 1, 5)
+  const pauseMinMs = finiteInt(options.pauseMinMs, 0, 0, 5_000)
+  const pauseMaxMs = finiteInt(options.pauseMaxMs, pauseMinMs, pauseMinMs, 5_000)
   const isCancelled = options.isCancelled ?? (() => false)
   const hasResponse = options.hasResponse ?? (() => false)
   const attempts: string[] = []

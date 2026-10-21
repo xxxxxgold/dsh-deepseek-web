@@ -168,6 +168,13 @@ export class KimiBrowserChannel implements BrowserChannel {
   private readonly cancels = new Map<string, AbortController>()
   /** 会话级的自动发送设置（来自主配置 sendMode 或 setSessionAutoSend）。 */
   private readonly autoSendSessions = new Map<string, boolean>()
+  /**
+   * 当前审核页是用哪种模式的入口打开的（undefined = 本实例还没开过，页面来源未知）。
+   *
+   * 必须记下来而不是看 URL：项目页发出第一条消息后地址会变成 `/chat/<uuid>`，
+   * 与普通对话完全同形，靠路径无法分辨“这一页属于项目模式还是正常模式”。
+   */
+  private pageMode: 'normal' | 'project' | undefined
 
   constructor(options: KimiChannelOptions) {
     this.options = options
@@ -185,6 +192,7 @@ export class KimiBrowserChannel implements BrowserChannel {
     this.browser = undefined
     this.context = undefined
     this.page = undefined
+    this.pageMode = undefined
     this.conversationStarted = false
   }
 
@@ -196,20 +204,22 @@ export class KimiBrowserChannel implements BrowserChannel {
       console.info('[kimi] 浏览器或页面已失效，重新建立连接…')
       this.dropConnection()
     }
+    const entryUrl = this.resolveEntryUrl()
     const { browser, context } = await connectBrowser({
       port: this.options.config.debugPort,
       profileDir: this.profileDir,
-      url: this.options.config.url,
+      url: entryUrl,
       autoStartKeeper: true,
       label: this.label,
     })
     this.browser = browser
     this.context = context
     const pages = context.pages()
-    this.page = pages.find(item => item.url().startsWith(new URL(this.options.config.url).origin))
+    const origin = KimiBrowserChannel.safeOrigin(entryUrl)
+    this.page = (origin ? pages.find(item => item.url().startsWith(origin)) : undefined)
       ?? pages[0]
       ?? await context.newPage()
-    await ensureChatPage(this.page, this.options.config.url)
+    await ensureChatPage(this.page, entryUrl)
     // 原来这里无条件等 1.5 秒（每轮都付一次）；改成等输入框真正可用，
     // 页面本来就绪时 100~300ms 就能返回。
     await this.waitEditorReady(this.page)
@@ -244,6 +254,57 @@ export class KimiBrowserChannel implements BrowserChannel {
   }
 
   /**
+   * 解析本轮审核要打开的入口地址：正常模式与项目模式各用各的，互不兜底。
+   *
+   * 选了项目模式却没填项目链接时直接报错——静默退回普通对话会让审核结果落错地方，
+   * 比明确失败更难发现。
+   */
+  private resolveEntryUrl(): string {
+    const config = this.options.config
+    if (config.kimiMode === 'project') {
+      const raw = (config.projectUrl ?? '').trim()
+      if (raw.length === 0) {
+        throw new LlmError(
+          'kimi: 审核模式是「项目模式」，但项目链接为空。请到设置里把「项目模式链接」填成'
+          + ' https://www.kimi.com/project/<项目ID>?chat_enter_method=new_chat 这样的项目页地址；'
+          + '若只想用普通对话，把「审核模式」切回「正常模式」。',
+          'KIMI_PROJECT_URL_MISSING',
+        )
+      }
+      return raw
+    }
+    const raw = (config.url ?? '').trim()
+    return raw.length > 0 ? raw : 'https://www.kimi.com/?chat_enter_method=new_chat'
+  }
+
+  /**
+   * 当前页面是否属于所选审核模式的入口。
+   *
+   * 正常模式不该停在项目页里（那会把对话归档到项目下）；项目模式两种页面都算——
+   * 项目页发出第一条消息后地址会变成 `/chat/<uuid>`，无法再用路径判断归属。
+   */
+  private pageMatchesMode(page: Page): boolean {
+    // 本实例开过的页面知道自己是用哪种模式打开的，这比看路径可靠：
+    // 项目页发出第一条消息后同样会变成 `/chat/<uuid>`，路径上分辨不出来。
+    if (this.pageMode !== undefined && this.pageMode !== this.options.config.kimiMode) return false
+    try {
+      const entry = new URL(this.resolveEntryUrl())
+      return new URL(page.url()).origin === entry.origin
+    } catch {
+      return true
+    }
+  }
+
+  /** 取地址的 origin；地址不合法时返回 undefined，避免 `new URL` 直接抛错盖掉真正原因。 */
+  private static safeOrigin(raw: string): string | undefined {
+    try {
+      return new URL(raw).origin
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
    * 开一个**全新的标签页**当审核窗口，而不是在旧标签里点“新建会话”。
    *
    * 为什么不用点按钮：Kimi 的入口是只有一个图标的链接，标签页在后台时
@@ -259,7 +320,7 @@ export class KimiBrowserChannel implements BrowserChannel {
     if (!context) throw new LlmError('kimi: 找不到浏览器上下文，无法新建审核标签页。', 'KIMI_PAGE_CLOSED')
     // 用户填的地址就是新标签要打开的地址：已经带了建新参数就照用，
     // 这样企业版域名 / 项目页 / 自定义查询参数都能原样生效。
-    const freshUrl = ensureFreshChatUrl(this.options.config.url)
+    const freshUrl = ensureFreshChatUrl(this.resolveEntryUrl())
     const fresh = await context.newPage()
     try {
       await fresh.goto(freshUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
@@ -278,6 +339,7 @@ export class KimiBrowserChannel implements BrowserChannel {
     }
     const previous = this.page
     this.page = fresh
+    this.pageMode = this.options.config.kimiMode
     // 旧标签整页关掉了，它记过的标题状态跟着一起作废（新标签从未被改过标题，不需要清理）。
     // 关闭失败不能影响本轮审核，但必须留痕：否则标签会一轮一个地攒下去。
     if (previous && previous !== fresh) {
@@ -366,7 +428,9 @@ export class KimiBrowserChannel implements BrowserChannel {
    * 不会重新获取”的形态。重试前一律丢弃旧连接，避免在已经死掉的页面上重试。
    */
   async turn(request: BrowserTurnRequest): Promise<BrowserTurnResult> {
-    const retries = Math.max(0, Math.min(3, this.options.config.fetchRetries ?? 1))
+    // 重试次数先收敛成合法整数：volatile 数值字段可能读到 NaN，
+    // 而 `attempt <= NaN` 恒为 false，会让整个重试循环被跳过并抛出 undefined。
+    const retries = KimiBrowserChannel.sanitizeRetries(this.options.config.fetchRetries, 1, 3)
     let lastError: unknown
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       if (request.signal?.aborted) {
@@ -395,7 +459,24 @@ export class KimiBrowserChannel implements BrowserChannel {
         await new Promise(resolve => setTimeout(resolve, 800))
       }
     }
-    throw lastError
+    // 防御：循环一次都没跑时 lastError 仍是 undefined，直接抛出会得到「抛 undefined」的哑谜错误。
+    throw lastError ?? new LlmError('kimi: 审核回合没有执行（内部重试计数异常）', 'KIMI_TURN_NOT_RUN')
+  }
+
+  /**
+   * 把配置里的重试次数收敛成安全整数。
+   *
+   * volatile 数值字段在 Loader 尚未提交值时可能读到 `NaN`，而 `NaN ?? 1` 仍是 `NaN`；
+   * `Math.max(0, Math.min(3, NaN))` 依旧是 `NaN`，会让 `attempt <= retries` 恒为 false，
+   * 循环整体被跳过、上层收到 `undefined` 异常。这里统一按有限值校验并夹到合法区间。
+   */
+  private static sanitizeRetries(raw: unknown, fallback: number, max: number): number {
+    // 注意 `Number(null)` 与 `Number('')` 都等于 0，会被当成「用户显式关掉重试」，
+    // 所以空值必须先判掉，不能交给 Number 转换。
+    if (raw === null || raw === undefined || raw === '') return fallback
+    const value = Number(raw)
+    if (!Number.isFinite(value)) return fallback
+    return Math.max(0, Math.min(max, Math.trunc(value)))
   }
 
   private async turnOnce(request: BrowserTurnRequest): Promise<BrowserTurnResult> {
@@ -422,6 +503,12 @@ export class KimiBrowserChannel implements BrowserChannel {
 
     try {
       if (request.initialize && !this.conversationStarted) {
+        await this.openFreshConversation()
+        this.conversationStarted = true
+      } else if (this.page !== undefined && !this.page.isClosed() && !this.pageMatchesMode(this.page)) {
+        // 复用模式（initialize=false）下上一轮可能停在另一种模式的页面里：
+        // 比如刚从项目模式切回正常模式，旧页还在项目内，继续发会把对话落到项目里。
+        console.info('[kimi] 当前审核页与所选模式不符，按新模式重开一个标签页')
         await this.openFreshConversation()
         this.conversationStarted = true
       }

@@ -64,10 +64,14 @@ export interface FieldSpec {
   readonly min?: number
   readonly max?: number
   /**
-   * 只在另一项配置等于某个值时才显示。
-   * 用来做「选了 Kimi 才出现 Kimi 的地址框」这类联动，避免把无关字段摆一屏。
+   * 条件显示规则：满足条件才显示，避免把无关字段摆一屏。
+   *
+   * 单个对象 = 一条条件；数组 = 必须同时满足（用于「provider 是 kimi、且模式是项目模式」
+   * 这类组合，否则同一个地址框会在两种模式下同时出现，用户根本分不清该填哪个）。
    */
-  readonly visibleWhen?: { readonly path: FieldPath; readonly equals: string }
+  readonly visibleWhen?:
+    | { readonly path: FieldPath; readonly equals: string }
+    | readonly { readonly path: FieldPath; readonly equals: string }[]
 }
 
 /** 设置页分组，顺序即渲染顺序。 */
@@ -389,14 +393,43 @@ export const FIELDS: readonly FieldSpec[] = [
     },
   },
   {
+    path: ['review', 'kimiMode'],
+    group: 'review',
+    kind: 'select',
+    options: ['normal', 'project'],
+    label: { zh: 'Kimi 审核模式', en: 'Kimi review mode' },
+    visibleWhen: { path: ['review', 'provider'], equals: 'kimi' },
+    hint: {
+      zh: 'normal = 正常模式：开普通对话页审核，对话落在「最近对话」里。project = 项目模式：在指定项目页里新开对话审核，对话归档到该项目下（项目名称由你在 Kimi 里定，比如「审核」）。两种模式各用各的地址，不会互相兜底。',
+      en: 'normal = plain conversation page; the chat lands in your recent chats. project = open a new chat inside a Kimi project page; the chat is filed under that project (project name is whatever you called it in Kimi). Each mode uses its own URL and they never fall back to each other.',
+    },
+  },
+  {
     path: ['review', 'url'],
     group: 'review',
     kind: 'text',
-    label: { zh: 'Kimi 审核窗口地址', en: 'Kimi review window URL' },
-    visibleWhen: { path: ['review', 'provider'], equals: 'kimi' },
+    label: { zh: '正常模式链接', en: 'Normal mode URL' },
+    visibleWhen: [
+      { path: ['review', 'provider'], equals: 'kimi' },
+      { path: ['review', 'kimiMode'], equals: 'normal' },
+    ],
     hint: {
-      zh: '新标签页要打开的链接。默认带 ?chat_enter_method=new_chat，打开就是空对话；缺这个参数时会自动补上。也可以直接填 Kimi 项目页（/project/<id>）：那样每轮审核都在项目页里开新对话，实测对话会归到这个项目下。企业版域名、带自有查询参数的地址同样可用。',
-      en: 'The link opened in a new tab. The default carries ?chat_enter_method=new_chat so it lands on an empty conversation, and the parameter is added automatically when missing. You can also point it at a Kimi project page (/project/<id>): each review round then starts a new chat inside that project and the chat is filed under it (verified). Enterprise domains and your own query parameters work too.',
+      zh: '正常模式下新标签页要打开的链接。默认带 ?chat_enter_method=new_chat，打开就是空对话；缺这个参数时会自动补上。企业版域名、带自有查询参数的地址同样可用。',
+      en: 'The link opened in normal mode. The default carries ?chat_enter_method=new_chat so it lands on an empty conversation, and the parameter is added automatically when missing. Enterprise domains and your own query parameters work too.',
+    },
+  },
+  {
+    path: ['review', 'projectUrl'],
+    group: 'review',
+    kind: 'text',
+    label: { zh: '项目模式链接', en: 'Project mode URL' },
+    visibleWhen: [
+      { path: ['review', 'provider'], equals: 'kimi' },
+      { path: ['review', 'kimiMode'], equals: 'project' },
+    ],
+    hint: {
+      zh: '项目页地址，形如 https://www.kimi.com/project/<项目ID>?chat_enter_method=new_chat。每轮审核都在这个项目里新开一个对话，对话归档到项目下。留空时选项目模式会直接报错，不会悄悄退回普通对话。',
+      en: 'A Kimi project page such as https://www.kimi.com/project/<project-id>?chat_enter_method=new_chat. Each round opens a new chat inside that project and the chat is filed under it. Leaving it empty makes project mode fail loudly instead of silently falling back to a normal chat.',
     },
   },
   {
