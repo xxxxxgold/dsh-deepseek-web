@@ -7,6 +7,7 @@
  * 2. 用户填的地址不能被篡改——路径、已有参数、企业版域名、项目页都要原样保留。
  */
 import { ensureFreshChatUrl } from '../src/browser-shared.ts'
+import { liveConfig } from '../src/live-config.ts'
 import { Config } from '../src/config.ts'
 
 let failures = 0
@@ -62,11 +63,31 @@ function main(): void {
     ensureFreshChatUrl('  https://www.kimi.com/  ') === 'https://www.kimi.com/?chat_enter_method=new_chat')
 
   // ---- 8. 配置默认值确实就是「新会话入口」----
-  const parsed = Config({})
-  const reviewUrl = (parsed as { review: { url: string } }).review.url
+  // volatile 字段必须经 liveConfig 解引用后才能拿到真值（Loader 与内部读取都走这条路径）。
+  const parsed = liveConfig(Config({})) as {
+    review: { url: string; projectUrl: string; kimiMode: string }
+  }
+  const reviewUrl = parsed.review.url
   check('配置默认值已带建新参数',
     ensureFreshChatUrl(reviewUrl) === reviewUrl && reviewUrl.includes('chat_enter_method=new_chat'),
     `默认值：${reviewUrl}`)
+
+  // ---- 9. 双模式：正常模式 / 项目模式各用各的地址 ----
+  check('审核模式默认是正常模式', parsed.review.kimiMode === 'normal', `实际：${parsed.review.kimiMode}`)
+  check('项目模式链接默认留空（不替用户猜项目 ID）', parsed.review.projectUrl === '',
+    `实际：${JSON.stringify(parsed.review.projectUrl)}`)
+
+  const projectUrl = 'https://www.kimi.com/project/1a15bef4-b7a2-894f-8000-0e7143648841?chat_enter_method=new_chat'
+  check('项目模式地址保留 /project/<id> 路径',
+    ensureFreshChatUrl(projectUrl) === projectUrl,
+    `实际：${ensureFreshChatUrl(projectUrl)}`)
+  check('项目模式缺参数时补上且保留路径',
+    ensureFreshChatUrl('https://www.kimi.com/project/1a15bef4-b7a2-894f-8000-0e7143648841')
+      === projectUrl,
+    `实际：${ensureFreshChatUrl('https://www.kimi.com/project/1a15bef4-b7a2-894f-8000-0e7143648841')}`)
+  check('两种模式的默认地址不是同一个页面',
+    ensureFreshChatUrl(parsed.review.url) !== ensureFreshChatUrl('https://www.kimi.com/project/x?chat_enter_method=new_chat'),
+    '正常模式与项目模式必须指向不同入口')
 
   if (failures > 0) {
     console.error(`\n${failures} 项失败`)
