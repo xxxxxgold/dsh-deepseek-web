@@ -177,7 +177,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
    * 超时/租约三件套的交叉校验：配错了不会崩，但防护会失效，所以在启动时明确告警。
    * 约束：turnTimeoutMs ≤ maxStreamMs，且 lockLeaseMs ≥ maxStreamMs + turnTimeoutMs。
    * 理由：一条 llm.stream 会串联多个网页回合（纠错 / 委托 / 多轮审核），人工模式
-   * 每回合都可能等满 streamIdleTimeoutMs（默认 45s）；租约必须比"最大合法整轮"更长，
+   * 每回合都可能等满 streamIdleTimeoutMs（默认 600s，即 10 分钟）；租约必须比"最大合法整轮"更长，
    * 否则会在回合仍正常进行时强行放锁，让同一会话的两条流交替写同一个网页对话。
    */
   private warnAboutTimeoutConfig(): void {
