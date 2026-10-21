@@ -18,6 +18,7 @@ import {
   connectBrowser,
   defaultProfileDir,
   ensureChatPage,
+  ensureFreshChatUrl,
   locateEditor,
   focusDshWindow,
   looksLoginWall,
@@ -256,8 +257,9 @@ export class KimiBrowserChannel implements BrowserChannel {
   private async openFreshConversation(): Promise<void> {
     const context = this.page?.context()
     if (!context) throw new LlmError('kimi: 找不到浏览器上下文，无法新建审核标签页。', 'KIMI_PAGE_CLOSED')
-    const base = this.options.config.url.replace(/\/+$/u, '')
-    const freshUrl = `${base}/?chat_enter_method=new_chat`
+    // 用户填的地址就是新标签要打开的地址：已经带了建新参数就照用，
+    // 这样企业版域名 / 项目页 / 自定义查询参数都能原样生效。
+    const freshUrl = ensureFreshChatUrl(this.options.config.url)
     const fresh = await context.newPage()
     try {
       await fresh.goto(freshUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })

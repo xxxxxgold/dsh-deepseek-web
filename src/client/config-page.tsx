@@ -155,7 +155,8 @@ export function DeepSeekWebConfigPage({ view, form }: PluginConfigViewProps): JS
         </p>
       </div>
 
-      {FIELDS.map((field) => {
+      {FIELDS.filter((field) => field.visibleWhen === undefined
+        || readPath(current, field.visibleWhen.path) === field.visibleWhen.equals).map((field) => {
         const value = readPath(current, field.path)
         const id = `dsweb-row-${fieldKey(field)}`
         const error = errors.get(fieldKey(field))

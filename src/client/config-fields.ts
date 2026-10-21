@@ -63,6 +63,11 @@ export interface FieldSpec {
   /** `number` 的上下界。 */
   readonly min?: number
   readonly max?: number
+  /**
+   * 只在另一项配置等于某个值时才显示。
+   * 用来做「选了 Kimi 才出现 Kimi 的地址框」这类联动，避免把无关字段摆一屏。
+   */
+  readonly visibleWhen?: { readonly path: FieldPath; readonly equals: string }
 }
 
 /** 设置页分组，顺序即渲染顺序。 */
@@ -381,6 +386,28 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: {
       zh: 'kimi / glm 需要对应网页已登录；deepseek-web 在同一对话里自审，更快但独立性弱。',
       en: 'kimi / glm need a signed-in page; deepseek-web self-reviews in the same conversation, faster but less independent.',
+    },
+  },
+  {
+    path: ['review', 'url'],
+    group: 'review',
+    kind: 'text',
+    label: { zh: 'Kimi 审核窗口地址', en: 'Kimi review window URL' },
+    visibleWhen: { path: ['review', 'provider'], equals: 'kimi' },
+    hint: {
+      zh: '新标签页要打开的链接。默认带 ?chat_enter_method=new_chat，打开就是空对话；缺这个参数时会自动补上。也可以直接填 Kimi 项目页（/project/<id>）：那样每轮审核都在项目页里开新对话，实测对话会归到这个项目下。企业版域名、带自有查询参数的地址同样可用。',
+      en: 'The link opened in a new tab. The default carries ?chat_enter_method=new_chat so it lands on an empty conversation, and the parameter is added automatically when missing. You can also point it at a Kimi project page (/project/<id>): each review round then starts a new chat inside that project and the chat is filed under it (verified). Enterprise domains and your own query parameters work too.',
+    },
+  },
+  {
+    path: ['review', 'glmUrl'],
+    group: 'review',
+    kind: 'text',
+    label: { zh: 'GLM 审核窗口地址', en: 'GLM review window URL' },
+    visibleWhen: { path: ['review', 'provider'], equals: 'glm' },
+    hint: {
+      zh: 'GLM 审核新标签页要打开的链接，默认 https://chat.z.ai/。',
+      en: 'The link opened for GLM review, default https://chat.z.ai/.',
     },
   },
   {

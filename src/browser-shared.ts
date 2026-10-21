@@ -128,6 +128,32 @@ export function withTimeout<T>(
   })
 }
 
+/**
+ * 把「审核窗口入口地址」补成「一定会新开对话」的地址。
+ *
+ * 用户在设置里填的就是新标签页要打开的链接，所以这里只做一件事：确保带上站点
+ * 自己的建新参数（Kimi 是 `chat_enter_method=new_chat`）。已经带了就原样返回，
+ * 让用户能完全接管地址（比如换成企业版域名、加自己的查询参数）。
+ *
+ * 注意这是**尽力而为**：Kimi 的项目页（`/project/<id>`）即使带上这个参数，
+ * 发消息时也会跳到 `/chat/<uuid>` 普通对话（实测），参数只保证「打开时是空的对 话」，
+ * 不保证「对话归属到那个项目」。
+ */
+export function ensureFreshChatUrl(raw: string, param = 'chat_enter_method=new_chat'): string {
+  const trimmed = raw.trim()
+  if (!trimmed) return trimmed
+  const [key, value = ''] = param.split('=')
+  try {
+    const url = new URL(trimmed)
+    if (url.searchParams.has(key)) return url.toString()
+    url.searchParams.set(key, value)
+    return url.toString()
+  } catch {
+    // 不是合法 URL（用户可能还在输入中）：原样交给浏览器，由 goto 自己报错。
+    return trimmed
+  }
+}
+
 /** 发送按钮候选选择器（点击发送的兜底路径，与 looksSendBlocked 共用语义）。 */
 export const SEND_BUTTON_CANDIDATES = [
   'button[class*="sendMessage" i]',

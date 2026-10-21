@@ -74,7 +74,11 @@ export interface ReviewConfig {
    * 每次重试前都会丢弃旧连接并重新连浏览器，不会复用已经死掉的页面。
    */
   fetchRetries: number
-  /** Kimi 审核网页版地址。 */
+  /**
+   * 审核窗口打开的链接（默认已带 `?chat_enter_method=new_chat`，打开即是新对话）。
+   * 可改成任意同源地址：企业版域名、带自己查询参数的地址、甚至项目页。
+   * 通道只保证“打开这个链接”，不会篡改路径；缺建新参数时会被自动补上。
+   */
   url: string
   /** 常驻 Kimi 审核浏览器的 CDP 端口。 */
   debugPort: number
@@ -363,7 +367,8 @@ const schema = z.object({
     sendVerifyMs: markVolatile(z.number().step(1).min(100).default(1_500)),
     sendRetries: markVolatile(z.number().step(1).min(1).max(5).default(2)),
     fetchRetries: markVolatile(z.number().step(1).min(0).max(3).default(1)),
-    url: z.string().default('https://www.kimi.com/'),
+    // 默认就是「新会话入口」：通道会直接打开这个链接当审核窗口。
+    url: z.string().default('https://www.kimi.com/?chat_enter_method=new_chat'),
     debugPort: z.number().step(1).min(1024).max(65535).default(9334),
     profileDir: z.string(),
     streamIdleTimeoutMs: z.number().step(1).min(1).default(600_000),
