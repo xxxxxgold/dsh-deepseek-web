@@ -100,9 +100,12 @@ export interface ReviewConfig {
    */
   url: string
   /**
-   * 项目模式的入口链接，形如
-   * `https://www.kimi.com/project/<项目ID>?chat_enter_method=new_chat`。
-   * 必须是项目页地址；缺建新参数时同样会被自动补上。
+   * 项目模式的目标项目：**只填项目 ID 就行**（形如 `1a15bef4-b7a2-894f-8000-0e7143648841`），
+   * 通道会拼成 `<域名>/project/<ID>?chat_enter_method=new_chat` 再打开，域名取自上面的 `url`，
+   * 所以企业版域名也能跟着走。
+   *
+   * 填完整项目页链接同样认（老配置里存的就是整条地址），此时原样使用、不再拼接。
+   * 缺建新参数时会被自动补上；留空时选项目模式会直接报错，避免悄悄退回普通对话。
    */
   projectUrl: string
   /** 常驻 Kimi 审核浏览器的 CDP 端口。 */
@@ -396,7 +399,7 @@ const schema = z.object({
     kimiMode: markVolatile(z.union(['normal', 'project']).default('normal')),
     // 默认就是「新会话入口」：通道会直接打开这个链接当审核窗口。
     url: markVolatile(z.string().default('https://www.kimi.com/?chat_enter_method=new_chat')),
-    // 项目模式默认留空：各人的项目 ID 不同，不能替用户猜一个。
+    // 项目模式默认留空：各人的项目 ID 不同，不能替用户猜一个。只填 ID，插件负责拼成完整项目页地址。
     projectUrl: markVolatile(z.string().default('')),
     debugPort: z.number().step(1).min(1024).max(65535).default(9334),
     profileDir: z.string(),

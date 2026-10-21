@@ -256,7 +256,7 @@ export class KimiBrowserChannel implements BrowserChannel {
   /**
    * 解析本轮审核要打开的入口地址：正常模式与项目模式各用各的，互不兜底。
    *
-   * 选了项目模式却没填项目链接时直接报错——静默退回普通对话会让审核结果落错地方，
+   * 选了项目模式却没填项目时直接报错——静默退回普通对话会让审核结果落错地方，
    * 比明确失败更难发现。
    */
   private resolveEntryUrl(): string {
@@ -265,16 +265,42 @@ export class KimiBrowserChannel implements BrowserChannel {
       const raw = (config.projectUrl ?? '').trim()
       if (raw.length === 0) {
         throw new LlmError(
-          'kimi: 审核模式是「项目模式」，但项目链接为空。请到设置里把「项目模式链接」填成'
-          + ' https://www.kimi.com/project/<项目ID>?chat_enter_method=new_chat 这样的项目页地址；'
+          'kimi: 审核模式是「项目模式」，但还没填项目。请到设置里把「项目 ID」填上'
+          + '（从项目页地址 https://www.kimi.com/project/<项目ID> 里取最后那段，形如'
+          + ' 1a15bef4-b7a2-894f-8000-0e7143648841，只填 ID 就行）；'
           + '若只想用普通对话，把「审核模式」切回「正常模式」。',
           'KIMI_PROJECT_URL_MISSING',
         )
       }
-      return raw
+      return KimiBrowserChannel.toProjectUrl(raw, config.url)
     }
     const raw = (config.url ?? '').trim()
     return raw.length > 0 ? raw : 'https://www.kimi.com/?chat_enter_method=new_chat'
+  }
+
+  /**
+   * 把用户填的「项目」变成可打开的项目页地址。
+   *
+   * 只填项目 ID 是常态：手动抄一整条带查询参数的链接太容易出错，而域名在
+   * 「正常模式链接」里已经有了（企业版域名也能跟着走）。所以：
+   * - 已经是完整 URL（有 scheme）→ 原样返回，兼容老配置里存整条链接的情况；
+   * - 只给了 ID → 用正常模式的 origin 拼 `<origin>/project/<ID>?chat_enter_method=new_chat`；
+   * - 看起来不是 ID → 明确报错，别把一句说明文字拼进路径里再打开一个 404。
+   */
+  private static toProjectUrl(raw: string, normalUrl: string): string {
+    const text = raw.trim()
+    if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(text)) return text
+    const id = text.replace(/^\/+/u, '').replace(/\/+$/u, '').trim()
+    if (!/^[0-9A-Za-z][0-9A-Za-z_-]*$/u.test(id)) {
+      throw new LlmError(
+        `kimi: 项目 ID「${text}」看起来不合法。只填项目页地址里 /project/ 后面那一段，`
+        + '形如 1a15bef4-b7a2-894f-8000-0e7143648841（字母、数字和连字符）；'
+        + '要填完整项目页链接也可以，但必须以 http(s):// 开头。',
+        'KIMI_PROJECT_ID_INVALID',
+      )
+    }
+    const origin = KimiBrowserChannel.safeOrigin(normalUrl) ?? 'https://www.kimi.com'
+    return `${origin}/project/${id}?chat_enter_method=new_chat`
   }
 
   /**
