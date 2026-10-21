@@ -168,7 +168,13 @@ export interface Config {
   model: WebModelId
   /** 页面元素/开关的 CSS 选择器覆盖；为空时使用内置默认并允许运行期“校准”。 */
   selectors?: Record<string, string>
-  /** 生成空闲超时。网页回复（含人工操作）较慢，默认 10 分钟。 */
+  /**
+   * 自动发送时“按下回车 → 看到 HTTP 响应头”的等待上限（毫秒）。
+   *
+   * 只管首响应，不管生成过程；人工发送（`sendMode: manual`）不吃这个值，
+   * 固定给足 3 分钟等你去点发送按钮。默认 45 秒：网页正常 1~3 秒就回响应头，
+   * 卡住说明消息根本没发出去，不该让一条死流把队头堵满 10 分钟。
+   */
   streamIdleTimeoutMs: number
   /**
    * 频控自动重试：网页提示“消息发送过于频繁，请稍后重试”时，
@@ -455,8 +461,10 @@ const schema = z.object({
     projectUrl: markVolatile(z.string().default('')),
     debugPort: z.number().step(1).min(1024).max(65535).default(9334),
     profileDir: z.string(),
-    // 默认 45 秒：审核通道（Kimi/GLM）空闲超时，与主通道保持一致。
-    streamIdleTimeoutMs: z.number().step(1).min(1).default(45_000),
+    // 审核通道（Kimi/GLM）读流的等待上限，与主通道同口径收进 30–60 秒区间，
+    // 取上限 60 秒：审核要吐整段评语，比主通道多留一点余量，但不再默认干等 10 分钟。
+    // 首响应另封顶 2 分钟（见 glm-channel/kimi-channel），卡住不动不会白等满 60 秒。
+    streamIdleTimeoutMs: z.number().step(1).min(1).default(60_000),
     maxEvidenceChars: z.number().step(1).min(1_000).default(60_000),
     maxRounds: markVolatile(z.number().step(1).min(0).default(1)),
     glmUrl: z.string().default('https://chat.z.ai/'),

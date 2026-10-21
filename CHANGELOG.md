@@ -2,7 +2,7 @@
 
 ## 0.5.0
 
-- **网页流空闲超时默认值从 10 分钟改成 45 秒**。`streamIdleTimeoutMs` 与 `review.streamIdleTimeoutMs` 的默认值都改为 `45_000`：网页版正常 1–3 秒就回响应头，旧默认 600 秒意味一条卡死的流能把队头堵满 10 分钟，用户只看到「一直不动」。现在空闲超过 45 秒即判超时并给出准确定位，仍可在设置里按需调大（下限 1ms 不变）。`docs/ADVANCED.md` 的配置表同步更新。
+- **主通道「按下回车 → 看到响应头」的等待上限从 10 分钟压到 45 秒，但人工发送不吃这个限制**。`streamIdleTimeoutMs` 默认改为 `45_000`：网页版正常 1–3 秒就回响应头，旧默认 600 秒意味一条卡死的流能把队头堵满 10 分钟，用户只看到「一直不动」。不过这一段在人工发送（`sendMode: manual`）时等的是「人去点发送按钮」——45 秒意味着去倒杯水回来就报「未点击发送」，频控重发期间每轮都要点一次更容易踩到；所以人工发送固定给足 `SEND_ACK_TIMEOUT_MS`（3 分钟），自动发送才吃 `streamIdleTimeoutMs`。审核通道的 `review.streamIdleTimeoutMs` **保持 600 秒**：它管的是读完整段评语，压到 45 秒会把正常审核打成 `KIMI_STREAM_STALLED`；只把审核「首响应」额外封顶 2 分钟（`glm-channel.ts` 原本没有上限，这次补上），这样卡住也不会白等满 10 分钟。`docs/ADVANCED.md` 的配置表同步更新。
 - **浏览器或网页标签被关掉时，先提示、再自动恢复、然后把这一轮重发出去**。以前这类事故在 `turn()` 入口就被判死：`state.page.isClosed()` 直接抛 `WEB_PAGE_CLOSED`，你在 DSH 里只看到一句「本轮运行失败」，得自己去翻日志才知道是浏览器没了；回合跑到一半被关更糟——报错来自 Playwright 底层（`Target page, context or browser has been closed`），连错误码都没有。现在 `turn()` 外面套了一层自愈循环：捕获到关闭类错误 → 发一条 `[DSH] 恢复 · …` 提示 → 清掉失效的页与连接 → `ensureReady()` 重新拉起 → 重新取会话页 → **重发本轮消息**（最多 2 次，默认间隔 2 秒）。
 - **区分「只关了标签页」和「整个浏览器没了」，不搞一刀切重启**。`recoverBrowser()` 先看 `browser.isConnected()`：还连着就只补标签页、保留浏览器对象（不能因为一个标签页关掉就把你其它窗口一起关掉）；整个浏览器退出了才释放 `browser` / `context` / `managedConnection`，`browser.close()` 与 `process.kill()` 都做了容错，然后重新走 launch/connect。两条路径的提示文案也不同（「正在重新打开标签页」vs「正在重新启动浏览器」），因为它决定了这次恢复要等多久。
 - **自愈只认「被关掉」，不吞别的错误**。判定由 `browserClosed()` 三路合成：`WEB_PAGE_CLOSED` 错误码、`isBrowserClosedMessage()` 对报错原文的模式匹配（`Target page/context/browser … closed`、`Browser has been closed`、`has been disconnected`、`Connection closed`、`连接已关闭/断开`）、以及 `browser.isConnected() === false`（连接已死时任何错误都按可自愈处理，在死连接上重试没有意义）。频控、回合超时、手动取消、HTTP 错误一律照原样抛出——否则「一直重启浏览器」会把真正的频控冷却掩盖掉。
@@ -10,6 +10,7 @@
 - **回合开始前就被关掉也补提示**。`turn()` 入口先记下 `healthyBefore`（浏览器当时是否连接）和 `closedPageBefore`（锚点页当时是否已关），`ensureReady()` 之后若发现是被自动修好的，补一条「网页标签已被关闭，已自动重新打开」/「浏览器已被关闭，已自动重新启动并打开网页」——否则用户只会看到回合莫名其妙成功了，不知道中间出过事。
 - **设置页新增「浏览器自愈」分组**：`browserRecovery.enabled`（默认开）、`maxAttempts`（默认 2，0–5）、`delayMs`（默认 2000ms，0–60000）。`maxAttempts` 的说明写清为什么默认只有 2 次：连续被关超过两次通常不是手滑，而是有东西在反复杀进程，这时候把原始错误抛出来比无限重启有用。
 - 新增离线回归 `tools/browser-recovery-check.ts`（并入 `npm run test:parsers`）：6 条关闭类样本必须命中、4 条非关闭样本（频控中文、回合超时、取消、HTTP 500）必须不命中；再用原型实例直接验通道——`WEB_RATE_LIMITED`/`WEB_TURN_TIMEOUT` 不触发自愈、浏览器断连时任意错误都触发；`connected=true` 时 `ensureReady` 恰好调一次、`browser` 必须保留、会话页登记清空、首条提示是「网页标签被关掉了…（第 1/2 次）」、末条是「浏览器已就绪，正在重新打开网页并重发本轮消息」；`connected=false` 时 `browser`/`context`/`managedConnection` 全被放掉、首条提示是「浏览器被关掉了…（第 2/2 次）」；把提示总开关关掉后提示 0 条但 `ensureReady` 照常调用。
+- 另加真机脚本 `tools/manual/browser-realcheck.ts`（手动跑，不进 CI，因为它会真的起一个 Edge 再杀掉）：实测 Playwright 的真实关闭报错文本 `page.evaluate: Target page, context or browser has been closed` 能被 `isBrowserClosedMessage()` 识别；被杀的进程能在同一 profile 上重新拉起（约 1.0–1.2 秒，新 pid）；真通道 `recoverBrowser()` 的两条分支都跑通——重启分支换新 pid 并发 3 条恢复提示（「正在重新启动浏览器（第 1/2 次）」→「0.5s 后重新启动浏览器，本轮消息会自动重发」→「浏览器已就绪，正在重新打开网页并重发本轮消息」），补页分支保持同一 pid 只补标签页。顺带确认一个坑：**Chromium 关掉最后一个标签页会连浏览器一起退出**，所以「关了一个标签页」到底走补页还是重启，取决于当时还有没有别的页。
 
 ## 0.4.0
 

@@ -68,9 +68,11 @@ const RATE_LIMIT_POLL_MS = 800
  * 从“按下发送”到“看到 HTTP 响应头”的等待上限。
  *
  * 网页版正常 1~3 秒就会回响应头；等满 3 分钟还没有，说明消息根本没发出去
- *（人工发送模式下忘了点、页面弹了遮挡层）或站点异常。
- * 原来这里直接吃 `streamIdleTimeoutMs`（当时默认 600 秒）——用户看到的就是
- * “卡住十分钟、不会重来”。这里压到 3 分钟并给出准确定位，生成阶段不受影响。
+ *（页面弹了遮挡层）或站点异常。原来这里直接吃 `streamIdleTimeoutMs`
+ *（当时默认 600 秒）——用户看到的就是“卡住十分钟、不会重来”。自动发送时
+ * 压到 `streamIdleTimeoutMs`（默认 45 秒）并给出准确定位；人工发送时不压，
+ * 因为这一段等的是“人去点发送按钮”，45 秒太苛刻（去倒杯水就报超时，
+ * 频控重发期间每一轮都要点一次，更容易踩到）。
  */
 const SEND_ACK_TIMEOUT_MS = 180_000
 /** 页面网络镜像保留的最近请求数。 */
@@ -1329,12 +1331,17 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
 
     // 提前挂监听，防止用户在我们填完后立刻点击发送导致漏掉响应。
     // 频控重发时旧 waiter 用 waiterActive 作废，避免迟到响应串扰下一轮。
+    // 自动发送等的是站点响应头，吃 streamIdleTimeoutMs；人工发送等的是人点按钮，
+    // 必须给足 SEND_ACK_TIMEOUT_MS，否则用户稍一分神就报“未点击发送”。
+    const ackTimeoutMs = autoSend
+      ? Math.min(this.options.config.streamIdleTimeoutMs, SEND_ACK_TIMEOUT_MS)
+      : SEND_ACK_TIMEOUT_MS
     let waiterActive = true
     const waiter = page.waitForResponse(async response => {
       if (response.request().method() !== 'POST') return false
       if (!matchesCompletionUrl(response.url())) return false
       return true
-    }, { timeout: Math.min(this.options.config.streamIdleTimeoutMs, SEND_ACK_TIMEOUT_MS) }).then(async response => {
+    }, { timeout: ackTimeoutMs }).then(async response => {
       await this.markPageStatus(page, request.purpose ? `[dsh 内部辅助：${request.purpose} 生成中]` : '[dsh 网页生成中]').catch(() => {})
       this.emitNotice(
         request,

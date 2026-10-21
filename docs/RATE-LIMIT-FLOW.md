@@ -317,6 +317,17 @@ C:/Users/29060/.dsh/sessions/<workspace-key>/<sessionId>/session.v4.jsonl.zstd
 - `recoverBrowser()` 先看浏览器是否还连着：**只关标签页** → 保留 `browser`/`context`，删掉该会话的页登记、关掉旧页、`ensureReady()` 补一个；**整个浏览器退出** → 清空全部页登记与 `managedConnection`，`browser.close()` 与 `process.kill()` 都做了容错，再重新 launch/connect。
 - 自愈循环在 `turn()` 内，`release()` 之后再 `recoverBrowser()`，恢复后重新 `stateFor()` 取页、重新 `acquire()` 拿锁再进 `turnOnPage()`。回合超时和手动取消优先于自愈：`if (timedOut || abort.signal.aborted) throw error` 在最前面，不会被自愈循环吞掉。
 
+**真机验证过了**（`npx tsx tools/manual/browser-realcheck.ts`，临时 profile + 独立端口，不碰本机在用的 Edge）：
+
+| 验的什么 | 实测结果 |
+| --- | --- |
+| Playwright 真的报什么 | `page.evaluate: Target page, context or browser has been closed`，`isBrowserClosedMessage()` 命中 |
+| 杀进程后能否用同一 profile 重开 | 能，新 pid，耗时约 1.0–1.2 秒（`browserRecovery.delayMs=2000` 有余量） |
+| 真通道 `recoverBrowser()` 重启分支 | `browser.isConnected()` 先变 false，自愈后连上新 pid，提示 3 条：`[DSH] 恢复 · 浏览器被关掉了，正在重新启动浏览器（第 1/2 次）` → `[DSH] 恢复 · 0.5s 后重新启动浏览器，本轮消息会自动重发` → `[DSH] 恢复 · 浏览器已就绪，正在重新打开网页并重发本轮消息` |
+| 只关标签页分支 | 浏览器对象与 pid 都不变，补出一个新页，提示首条是「网页标签被关掉了，正在重新打开标签页（第 1/2 次）」 |
+
+顺带实测到一个容易被忽略的坑：**Chromium 关掉最后一个标签页时会直接退出整个浏览器进程**。所以「只关了一个标签页」到底走补页还是走重启，取决于当时还有没有别的页——DSH 平时有锚点页 + 会话页，关会话页不会退浏览器；用户把窗口里所有标签都关掉，浏览器就没了，走的是重启分支（更慢，但结论一样：能恢复）。测试脚本必须先留一个页再关目标页，否则验的其实是重启分支。
+
 **要留意的副作用**：如果消息已经填入并回车成功、网页正在生成时才被关掉，自愈后会**重发同一条消息**，网页端可能留下两条内容相同的提问（旧那条已发出）。这是「恢复」换来的代价——不重发就只能让用户手动重说一遍。真在意重复的话：等浏览器恢复后先去网页端把那条重复的删掉，或把 `browserRecovery.enabled` 关掉改成手动处理。
 
 **没覆盖的地方**：`turnIsolated()`（辅助请求，无 `onNotice`）只靠 `ensureReady()` 自己拉起浏览器，不会提示也不会重发；审核通道 Kimi/GLM 的浏览器被关仍按原错误抛出，由适配层转成 `[DSH·审核] …审核失败，已跳过本轮审核`。
@@ -384,4 +395,4 @@ C:/Users/29060/.dsh/sessions/<workspace-key>/<sessionId>/session.v4.jsonl.zstd
 - **WebSocket 错误帧的原始 JSON 没抓到**：launch token 进程内随机且不落盘，外部连不上 Web GUI 的本地端口（端口每次启动可能变化）。
 - **半截正文在失败后过程面板的最终留存**：代码上 `live` 节点未 settle、错误强制展开，理论上能看到流出的部分；未在真机复现确认。
 - **提示块的观感只做过离线校验**：`tools/rate-limit-check.ts` 断言了退避序列、前缀区分、开关逐层生效与 50 个错误码都有提示文案，但没有在真实频控下截图确认 `[DSH] 频控等待` 在 Web GUI 里换行与折叠后的样子。
-- **浏览器自愈没有做过「真的把浏览器杀掉」的端到端验证**：`tools/browser-recovery-check.ts` 用原型实例直接验了判定、补页、重启、提示与开关五条路径，`ensureReady()` 本身是 stub 的；真实 Windows 环境下 Edge 进程被 kill 后重新 launch/connect 的耗时、以及「网页已发出消息后自愈导致重复提问」的实际表现，需要在真机手动关一次浏览器确认。
+- **浏览器自愈的真机验证只做到「通道层」**：`tools/manual/browser-realcheck.ts` 已经真的杀了 Edge 进程，验证了真实报错文本命中、同 profile 重新拉起、真通道 `recoverBrowser()` 重启与补页两条分支、以及三条提示文案；没验的是「完整 `turn()` 在网页生成中途被关浏览器 → 重发同一条消息 → 网页端出现两条提问」的实际表现，需要真账号手动关一次窗口确认。离线回归 `tools/browser-recovery-check.ts` 仍然保留（`ensureReady()` 在那里是 stub，跑得快、可在 CI 里跑）。

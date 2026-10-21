@@ -166,7 +166,9 @@ export class GLMChannel implements BrowserChannel {
 
     const completionPromise = page.waitForResponse(
       response => response.request().method() === 'POST' && matchesGlmCompletion(response.url()),
-      { timeout: this.options.config.streamIdleTimeoutMs },
+      // 等的是“有没有真的发出去”：审核页正常 1~3 秒回响应头，卡住时不该让回合
+      // 白等 10 分钟，所以首响应封顶 2 分钟；读流仍用 review.streamIdleTimeoutMs。
+      { timeout: Math.min(this.options.config.streamIdleTimeoutMs, 120_000) },
     ).then(async response => {
       await markPageTitle(page, '[dsh GLM 审核生成中]', this.titleState).catch(() => {})
       // body() / finished() 自带“等到流结束”的语义但没有超时参数：

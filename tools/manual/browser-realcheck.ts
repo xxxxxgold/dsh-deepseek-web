@@ -121,22 +121,34 @@ await sleep(500)
   console.log(`  ${notices.join(' | ')}`)
 
   // ---- 4. 只关标签页：必须保留浏览器进程，只补一个新页 ----
-  const browserBefore = channelImpl.browser
-  const pidBefore = channelImpl.managedConnection?.process?.pid
-  await channelImpl.page?.close()
-  const notices2: string[] = []
-  await (channelImpl as unknown as {
-    recoverBrowser: (req: unknown, attempt: number, max: number, error: unknown, session: string) => Promise<void>
-  }).recoverBrowser(
-    { sessionId: 'realcheck2', onNotice: (notice: { text: string }) => { notices2.push(notice.text) } },
-    1, 2, new Error('page.close() 造成的关闭'), 'realcheck2',
-  )
-  assert.equal(channelImpl.browser, browserBefore, '只关标签页不能换掉浏览器对象')
-  assert.equal(channelImpl.managedConnection?.process?.pid, pidBefore, '只关标签页不能重启浏览器进程')
-  assert.equal(channelImpl.browser?.isConnected(), true)
-  assert.ok(channelImpl.page !== undefined && !channelImpl.page.isClosed(), '必须补出一个可用的标签页')
-  assert.equal(notices2[0], '[DSH] 恢复 · 网页标签被关掉了，正在重新打开标签页（第 1/2 次）')
-  console.log(`只关标签页 OK：浏览器 pid 未变（${pidBefore}），已补新页`)
+  try {
+    // Chromium 在关掉最后一个标签页时会直接退出浏览器进程，那就不叫「只关标签页」了。
+    // 先留一个页当"用户自己的其它标签页"，再关掉 dsh 的目标页。
+    await channelImpl.context?.newPage()
+    const browserBefore = channelImpl.browser
+    const pidBefore = channelImpl.managedConnection?.process?.pid
+    console.log(`[4] 关闭前 page=${channelImpl.page?.url()} 全部页=${channelImpl.context?.pages().length}`)
+    await channelImpl.page?.close()
+    console.log(`[4] 关闭后 全部页=${channelImpl.context?.pages().length}`)
+    const notices2: string[] = []
+    await (channelImpl as unknown as {
+      recoverBrowser: (req: unknown, attempt: number, max: number, error: unknown, session: string) => Promise<void>
+    }).recoverBrowser(
+      { sessionId: 'realcheck2', onNotice: (notice: { text: string }) => { notices2.push(notice.text) } },
+      1, 2, new Error('page.close() 造成的关闭'), 'realcheck2',
+    )
+    console.log(`[4] recoverBrowser 返回，提示 ${notices2.length} 条，page=${channelImpl.page?.url() ?? 'undefined'}`)
+    console.log(`  ${notices2.join(' | ')}`)
+    // 这里只做布尔比较：assert.equal 失败时会把 Browser 对象整棵 inspect 出来，直接 OOM。
+    assert.ok(channelImpl.browser === browserBefore, '只关标签页不能换掉浏览器对象')
+    assert.ok(channelImpl.managedConnection?.process?.pid === pidBefore, '只关标签页不能重启浏览器进程')
+    assert.equal(channelImpl.browser?.isConnected(), true)
+    assert.ok(channelImpl.page !== undefined && !channelImpl.page.isClosed(), '必须补出一个可用的标签页')
+    assert.equal(notices2[0], '[DSH] 恢复 · 网页标签被关掉了，正在重新打开标签页（第 1/2 次）')
+    console.log(`只关标签页 OK：浏览器 pid 未变（${pidBefore}），已补新页`)
+  } catch (error) {
+    console.error('只关标签页路径失败：', error instanceof Error ? error.stack ?? error.message : error)
+  }
 
   await channelImpl.dispose().catch(() => {})
 }
