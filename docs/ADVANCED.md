@@ -105,7 +105,8 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `review.debugPort` | `9334` | Kimi 审核浏览器 CDP 端口 |
 | `review.glmDebugPort` | `9335` | GLM 审核浏览器 CDP 端口 |
 | `review.autoSend` | `true` | 审核自动化程度：`true` = 全自动（填入后自动发送并确认真的发出，发不出去当场报错）；`false` = 半自动（只填入并聚焦窗口，等你点发送） |
-| `review.conversationMode` | `fresh` | `fresh` 每次审核前新开对话，上下文干净、不会越审越慢；`reuse` 复用同一个对话（历史累积，容易被上一轮结论带偏） |
+| `review.url` | `https://www.kimi.com/?chat_enter_method=new_chat` | 审核窗口新标签页打开的链接。缺 `chat_enter_method` 时自动补上，已有则原样使用；可填企业版域名、带自有查询参数的地址，或项目页 `/project/<id>`（对话会归属该项目） |
+| `review.glmUrl` | `https://chat.z.ai/` | GLM 审核窗口打开的链接，规则同上 |
 | `review.sendVerifyMs` | `1500` | 自动发送后确认“已发出”的等待窗口（毫秒）；窗口内没等到信号才视为没发出去 |
 | `review.sendRetries` | `2` | 发送未被确认时的重试轮数（每轮 = 回车 + 点发送按钮兜底） |
 | `review.fetchRetries` | `1` | 获取回复失败后的自动重试次数（`0` 关闭）；每次重试前都会丢弃旧连接并重新连浏览器 |
@@ -175,18 +176,29 @@ node node_modules/dsh-deepseek-web-littlecar30/tools/glm-status.mjs --turn
 - **半自动（`false`）**：填完停住，把窗口提到最前，等你自己点发送。适合想先看一眼审核内容再发的场景；
   等待超过 `review.streamIdleTimeoutMs` 会明确报超时，不会静默挂住。
 
-### 审核对话怎么复用
+### 审核对话开在哪里
 
-`review.conversationMode` 决定每次审核要不要新开对话：
+`kimi` / `glm` 的每轮审核都会**新开一个浏览器标签页**，打开 `review.url` 指向的链接，
+填完发送后关掉上一轮的审核标签——任何时候只留一个 Kimi 审核页，不会一轮攒一个标签。
 
-- `fresh`（默认）：每次审核前先清会话门控，让本轮带 `initialize` 新开一个对话。
-  审核 prompt 自带全部证据（协议 + 任务目标 + 产出 + 文件清单），不依赖历史；
-  而复用会让 Kimi 侧上下文越积越长，表现为**越审越慢**，还容易被上一轮的结论带偏。
-- `reuse`：复用同一个对话，不新开。只有当你明确希望审核器记得前几轮上下文时才用。
+`review.url` 就是「审核窗口要打开的链接」，设置页里直接可见可改（选中 Kimi 时显示
+「Kimi 审核窗口地址」，选中 GLM 时显示 GLM 那一条）。默认值是
 
-补充一个容易踩的点：Kimi 通道的「已初始化对话」标记（`conversationStarted`）一旦置位就
-不会再新建对话，所以光传 `initialize: true` 是不够的——必须在每轮审核前调
-`resetConversationGate()` 把它清掉。`fresh` 模式的实现就依赖这一点。
+```
+https://www.kimi.com/?chat_enter_method=new_chat
+```
+
+`chat_enter_method=new_chat` 是 Kimi 自己的建新参数，带上它新标签打开就是 0 条消息的
+干净对话。通道只做一件事：**地址里没有这个参数就补上，已经有就一个字不动**（旧配置只写
+了域名照样能用），所以你完全可以接管这个地址：
+
+- 换成企业版域名，或加上自己的查询参数；
+- 填项目页 `https://www.kimi.com/project/<id>`——实测打开后输入框是「在"审核"中开始对话…」，
+  从项目页发出的对话会归到该项目下。想让审核记录集中在一个项目里就用这种方式。
+
+之所以不用「点侧边栏的新建会话按钮」：那个入口是只有一个图标的 `<a aria-label="新建会话">`，
+标签页在后台时 `locator.click()` 点不动；直接 `goto` 首页又会被站点恢复成上一次的对话。
+两条路都会静默失败，表现就是"配置了新开对话却还是同一个对话，越审越慢"。
 
 ### 审核卡住时会发生什么
 
