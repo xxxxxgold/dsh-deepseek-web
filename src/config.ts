@@ -372,8 +372,7 @@ const schema = z.object({
   sendMode: markVolatile(z.union(['manual', 'approved']).default('manual')),
   model: markVolatile(z.union([...WEB_MODEL_IDS]).default('deepseek-web')),
   selectors: z.dict(z.string()),
-  // 默认 45 秒：网页回合空闲超过此值即判超时，避免队头被一条死流堵住 10 分钟。
-  streamIdleTimeoutMs: z.number().step(1).min(1).default(45_000),
+  streamIdleTimeoutMs: z.number().step(1).min(1).default(600_000),
   rateLimit: z.object({
     enabled: markVolatile(z.boolean().default(true)),
     // 默认指数退避：60s → 120s → 240s → 300s（封顶），合计约 12 分钟，
@@ -416,8 +415,10 @@ const schema = z.object({
   sendPauseMinMs: markVolatile(z.number().step(1).min(0).max(60_000).default(2_000)),
   sendPauseMaxMs: markVolatile(z.number().step(1).min(0).max(60_000).default(4_000)),
   longRunAfterSends: markVolatile(z.number().step(1).min(0).max(10_000).default(15)),
-  longRunPauseMinMs: markVolatile(z.number().step(1).min(0).max(3_600_000).default(60_000)),
-  longRunPauseMaxMs: markVolatile(z.number().step(1).min(0).max(3_600_000).default(180_000)),
+  // 长休区间默认 30–60 秒（下限 30 秒、上限 60 秒）：连发 N 轮后静默一小段就足以打断节拍，
+  // 旧默认 60–180 秒会让长链路任务白等最多 3 分钟。
+  longRunPauseMinMs: markVolatile(z.number().step(1).min(0).max(3_600_000).default(30_000)),
+  longRunPauseMaxMs: markVolatile(z.number().step(1).min(0).max(3_600_000).default(60_000)),
   protocolRefreshEvery: markVolatile(z.number().step(1).min(1).default(8)),
   protocolEveryRequest: markVolatile(z.boolean().default(false)),
   toolAllowlist: markVolatile(z.array(z.string()).default([
@@ -461,10 +462,10 @@ const schema = z.object({
     projectUrl: markVolatile(z.string().default('')),
     debugPort: z.number().step(1).min(1024).max(65535).default(9334),
     profileDir: z.string(),
-    // 审核通道（Kimi/GLM）读流的等待上限，与主通道同口径收进 30–60 秒区间，
-    // 取上限 60 秒：审核要吐整段评语，比主通道多留一点余量，但不再默认干等 10 分钟。
-    // 首响应另封顶 2 分钟（见 glm-channel/kimi-channel），卡住不动不会白等满 60 秒。
-    streamIdleTimeoutMs: z.number().step(1).min(1).default(60_000),
+    // 审核通道（Kimi/GLM）读流的等待上限，保持 10 分钟：审核要输出整段评语，
+    // 压到几十秒会把正常审核打成超时。首响应另封顶 2 分钟（见 glm-channel/kimi-channel），
+    // 所以“卡住不动”不会白等满 10 分钟。
+    streamIdleTimeoutMs: z.number().step(1).min(1).default(600_000),
     maxEvidenceChars: z.number().step(1).min(1_000).default(60_000),
     maxRounds: markVolatile(z.number().step(1).min(0).default(1)),
     glmUrl: z.string().default('https://chat.z.ai/'),

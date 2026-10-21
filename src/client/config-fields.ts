@@ -349,7 +349,7 @@ export const FIELDS: readonly FieldSpec[] = [
     label: { zh: '长休下限（毫秒）', en: 'Long pause min (ms)' },
     min: 0,
     max: 3_600_000,
-    hint: { zh: '触发长休后的最短休息时长，默认 60000（60 秒）。', en: 'Minimum long-pause duration; default 60000 (60s).' },
+    hint: { zh: '触发长休后的最短休息时长，默认 30000（30 秒）。', en: 'Minimum long-pause duration; default 30000 (30s).' },
   },
   {
     path: ['longRunPauseMaxMs'],
@@ -358,7 +358,7 @@ export const FIELDS: readonly FieldSpec[] = [
     label: { zh: '长休上限（毫秒）', en: 'Long pause max (ms)' },
     min: 0,
     max: 3_600_000,
-    hint: { zh: '长休上限，与下限之间随机，默认 180000（3 分钟）。', en: 'Maximum long-pause duration; randomized with the minimum. Default 180000 (3 min).' },
+    hint: { zh: '长休上限，与下限之间随机，默认 60000（60 秒）。', en: 'Maximum long-pause duration; randomized with the minimum. Default 60000 (60s).' },
   },
 
   {
@@ -923,15 +923,15 @@ export const RISK_PRESETS: readonly RiskPreset[] = [
     id: 'balanced',
     label: { zh: '均衡（推荐）', en: 'Balanced (recommended)' },
     hint: {
-      zh: '每轮随机停 2~4 秒，连发 15 轮休 1~3 分钟。同源社区项目长期使用、未触发封禁的一组值，也是默认值。',
+      zh: '每轮随机停 2~4 秒，连发 15 轮休 30~60 秒。同源社区项目长期使用、未触发封禁的一组值，也是默认值。',
       en: 'Random 2–4s before each send, long pause of 1–3 min after 15 sends. Sourced from a long-lived peer project; also the defaults.',
     },
     values: [
       { path: ['sendPauseMinMs'], value: 2_000 },
       { path: ['sendPauseMaxMs'], value: 4_000 },
       { path: ['longRunAfterSends'], value: 15 },
-      { path: ['longRunPauseMinMs'], value: 60_000 },
-      { path: ['longRunPauseMaxMs'], value: 180_000 },
+      { path: ['longRunPauseMinMs'], value: 30_000 },
+      { path: ['longRunPauseMaxMs'], value: 60_000 },
     ],
   },
   {

@@ -87,12 +87,12 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `liveThinking` | `false` | 是否展示网页真实思考；正文不混入思考块，不改变网页思考模式 |
 | `compactionLanguage` | `task` | 官方压缩摘要跟随用户任务语言；`host` 保留宿主要求，`zh` / `en` 固定中英文 |
 | `maxToolResultChars` | `6000` | 工具结果送入网页模型的字符上限，按头尾截断；不截断最终正文或网页委托结果 |
-| `streamIdleTimeoutMs` | `45000` | 自动发送时「回车 → 看到响应头」的等待上限（毫秒）。只管首响应，不管生成过程；人工发送（`sendMode: manual`）不吃这个值，固定给 3 分钟等你点发送。`review.streamIdleTimeoutMs` 是审核通道读流上限，默认 `60000`（60 秒，同样收进 30–60 秒区间），首响应另封顶 2 分钟 |
+| `streamIdleTimeoutMs` | `45000` | 自动发送时「回车 → 看到响应头」的等待上限（毫秒）。只管首响应，不管生成过程；人工发送（`sendMode: manual`）不吃这个值，固定给 3 分钟等你点发送。`review.streamIdleTimeoutMs` 是审核通道读流上限，默认 `600000`（10 分钟），首响应另封顶 2 分钟 |
 | `maxSessionPages` | `3` | 同时保留的会话标签页上限（每个并发会话独占一页）；超出按“最久未用且当前没在跑”的页回收，`1`–`8` |
 | `maxConcurrentTurns` | `2` | 全局并发上限：同一时刻最多几条请求真在网页上跑（主会话/子代理/辅助请求一起算）；超出的按先进先出排队，`0` 表示不限制 |
 | `sendPauseMinMs` / `sendPauseMaxMs` | `2000` / `4000` | 全自动发送时，消息填入输入框之后、按回车之前的随机停留区间（毫秒）；真人不会打完字立刻回车，固定延迟方差≈0 反而是机器特征。两者为 `0` 即关闭 |
 | `longRunAfterSends` | `15` | 连续发满多少轮后强制静默一段（防风控），`0` 关闭；10 分钟内无请求即视为断开、重新计数 |
-| `longRunPauseMinMs` / `longRunPauseMaxMs` | `60000` / `180000` | 上面那次强制静默的随机区间（毫秒） |
+| `longRunPauseMinMs` / `longRunPauseMaxMs` | `30000` / `60000` | 上面那次强制静默的随机区间（毫秒），默认 30–60 秒 |
 | `turnTimeoutMs` | `900000` | 单个网页回合上限，超时中止并报错，`0` 表示不限制 |
 | `lockLeaseMs` | `4500000` | 会话锁租约，持有者泄漏时到点强制回收；必须大于“最大合法整轮” |
 | `maxStreamMs` | `3600000` | 单次请求（整条流，含纠错/委托/多轮审核）上限，超时主动取消网页回合，`0` 表示不限制 |
@@ -251,7 +251,7 @@ https://www.kimi.com/?chat_enter_method=new_chat
 
 获取回复阶段的每一段等待都有明确上限，不会无限挂住：
 
-- `response.finished()` / `response.body()` 的超时是 `review.streamIdleTimeoutMs`（默认 60 秒），
+- `response.finished()` / `response.body()` 的超时是 `review.streamIdleTimeoutMs`（默认 10 分钟），
   超时抛 `KIMI_STREAM_STALLED` / `GLM_STREAM_STALLED`，而不是一直等。
 - 页面或浏览器已经失效（窗口被关掉、连接断掉）时立刻丢弃旧连接，下次请求重新连，
   不在死页面上反复操作。
