@@ -1,5 +1,12 @@
 # 更新记录
 
+## 0.3.4
+
+- **项目模式改成「只填项目 ID」**。上一版要求填一整条项目页地址（`https://www.kimi.com/project/<ID>?chat_enter_method=new_chat`），抄起来容易错、还容易把项目名当成地址、换个域名要改两处。现在设置页那一栏就叫「项目 ID」，只填 `/project/` 后面那一段（形如 `1a15bef4-b7a2-894f-8000-0e7143648841`），插件用「正常模式链接」的域名拼成完整项目页地址再打开——企业版域名跟着正常模式走，不用两边都改。
+  三种输入都有明确归宿：只填 ID → 自动拼接；填完整链接（以 `http(s)://` 开头）→ 原样使用，老配置不用改；明显不是 ID 的内容（带空格、中文说明、多段路径）→ 抛 `KIMI_PROJECT_ID_INVALID` 并写明该填哪一段，而不是拼进路径里打开一个 404。留空仍是 `KIMI_PROJECT_URL_MISSING`。
+- 真机验证「只填 ID」的完整链路：解析出的入口是 `https://www.kimi.com/project/1a15bef4-…?chat_enter_method=new_chat`；回合结束后拿 chat id 回项目页查，这条对话以 `a.project-feed-link` 出现在 `div.project-chat-list` 里，href 带 `chat_enter_method=project`——确实归档到该项目下。
+- `tools/kimi-mode-check.ts` 从 11 项扩到 16 项：新增只填 ID 自动拼接、域名跟随正常模式链接（企业版域名）、ID 带前导斜杠/首尾空白也能拼对、非 ID 输入抛 `KIMI_PROJECT_ID_INVALID` 且带填法、正常模式不会误用项目字段。
+
 ## 0.3.3
 
 - **Kimi 审核支持「正常模式 / 项目模式」两种入口，在设置页可选**。项目模式不是"换个入口地址"而已：实测从项目页发出的对话会作为 `a.project-feed-link` 出现在项目页的 `div.project-chat-list` 里，链接带 `chat_enter_method=project`，确实归档到该项目下。之前只有一个 `review.url`，把项目页填进去能用、但和普通对话是同一套语义，配置里也看不出区别。现在新增 `review.kimiMode`（`normal` 默认 / `project`）与 `review.projectUrl`：正常模式走 `review.url` 开独立新对话，项目模式走 `review.projectUrl` 开项目页、对话归到该项目下。两者**各用各的地址、互不兜底**——选了项目模式却没填链接会直接抛 `KIMI_PROJECT_URL_MISSING` 并写明该填什么，不会静默退回普通对话（审核记录落错地方比明确失败更难发现）。设置页按所选模式联动显示对应那条地址输入框。

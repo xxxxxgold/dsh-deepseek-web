@@ -107,7 +107,7 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `review.autoSend` | `true` | 审核自动化程度：`true` = 全自动（填入后自动发送并确认真的发出，发不出去当场报错）；`false` = 半自动（只填入并聚焦窗口，等你点发送） |
 | `review.kimiMode` | `normal` | Kimi 审核模式：`normal` = 正常模式，每轮开一个普通对话；`project` = 项目模式，每轮在指定项目里开对话 |
 | `review.url` | `https://www.kimi.com/?chat_enter_method=new_chat` | 正常模式下审核窗口打开的链接。缺 `chat_enter_method` 时自动补上，已有则原样使用；可填企业版域名或带自有查询参数的地址 |
-| `review.projectUrl` | 空 | 项目模式下审核窗口打开的链接，形如 `https://www.kimi.com/project/<项目ID>?chat_enter_method=new_chat`；选项目模式但这里为空会明确报 `KIMI_PROJECT_URL_MISSING`，不会静默退回普通对话 |
+| `review.projectUrl` | 空 | 项目模式要用的 Kimi 项目，**只填项目 ID**（形如 `1a15bef4-b7a2-894f-8000-0e7143648841`）；插件拼成 `<正常模式链接的域名>/project/<ID>?chat_enter_method=new_chat`，填完整项目页链接也认。留空或填了非 ID 内容会明确报错，不会静默退回普通对话 |
 | `review.glmUrl` | `https://chat.z.ai/` | GLM 审核窗口打开的链接，规则同上 |
 | `review.sendVerifyMs` | `1500` | 自动发送后确认“已发出”的等待窗口（毫秒）；窗口内没等到信号才视为没发出去 |
 | `review.sendRetries` | `2` | 发送未被确认时的重试轮数（每轮 = 回车 + 点发送按钮兜底） |
@@ -183,13 +183,23 @@ node node_modules/dsh-deepseek-web-littlecar30/tools/glm-status.mjs --turn
 Kimi 审核分**两种模式**，在设置页「Kimi 审核」分组里用「审核模式」选择，两者各用各的入口地址，
 互不兜底：
 
-| 模式 | 用哪个地址 | 每轮打开什么 |
+| 模式 | 用哪个配置 | 每轮打开什么 |
 | --- | --- | --- |
 | 正常模式（`normal`，默认） | `review.url` | 一个独立的新对话标签页 |
-| 项目模式（`project`） | `review.projectUrl` | 项目页，对话归到这个项目下 |
+| 项目模式（`project`） | `review.projectUrl`（**只填项目 ID**） | 项目页，对话归到这个项目下 |
 
-选 `normal` 时设置页只显示「Kimi 审核窗口地址」，选 `project` 时只显示「项目模式链接」，
-看着不会串。项目模式没填链接会直接报 `KIMI_PROJECT_URL_MISSING` 并给出填法，
+选 `normal` 时设置页只显示「正常模式链接」，选 `project` 时只显示「项目 ID」，
+看着不会串。项目模式的「项目 ID」**只填 ID 就行**，形如
+`1a15bef4-b7a2-894f-8000-0e7143648841`（项目页地址 `/project/` 后面那一段），
+插件会拼成
+
+```
+<正常模式链接的域名>/project/<项目ID>?chat_enter_method=new_chat
+```
+
+再打开，所以你换企业版域名时域名会跟着走，不用两边都改。填完整项目页链接也认
+（老配置里存的就是整条地址），此时原样使用、不再拼接；填了明显不是 ID 的内容会报
+`KIMI_PROJECT_ID_INVALID` 并给出填法。没填项目会直接报 `KIMI_PROJECT_URL_MISSING`，
 **不会**悄悄退回普通对话——审核结果落错地方比明确失败更难发现。
 
 两种模式都是**每轮新开一个浏览器标签页**，发出后关掉上一轮的审核标签，任何时候只留一个
