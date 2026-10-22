@@ -664,7 +664,60 @@ export function renderNewWebMessages(
     buildToolCatalog(visibleToolsOf(options, config), config.compactToolCatalog),
     delegatedCatalog,
   ].filter(Boolean).join('\n')
-  const text = parts.join('\n\n')
+  // 回放预算（见 Config.maxReplayChars）只裁历史/上下文正文：系统指令、任务锚点
+  // （[当前用户任务]，由 unshift 插在 parts 最前面）、协议清单都不计入预算、永不裁剪。
+  const headerCount = parts.findIndex(piece =>
+    piece.startsWith('[历史助手回复]')
+    || piece.startsWith('[用户消息]')
+    || piece.startsWith('[宿主上下文'))
+  const budgetHeader = headerCount < 0 ? parts.length : headerCount
+  let text = parts.join('\n\n')
+  // 为什么要裁：网页输入框填字接近二次方级耗时，单条消息一旦上百万字符，会先把浏览器
+  // 主线程拖死好几分钟——响应等待窗口（3 分钟）在填字阶段就过期，表现成「消息其实发
+  // 出去了、网页也回答了，dsh 却报没收到响应」。这里按消息粒度丢掉最早的历史、保留最新
+  // 的一段，并在原位置留一行可见的省略说明。
+  const replayBudget = config.maxReplayChars
+  if (replayBudget > 0 && text.length > replayBudget && parts.length > budgetHeader) {
+    const header = parts.slice(0, budgetHeader)
+    const body = parts.slice(budgetHeader)
+    let room = Math.max(0, replayBudget - header.join('\n\n').length)
+    let cut = body.length
+    for (let i = body.length - 1; i >= 0; i--) {
+      const piece = body[i]!
+      // 至少保住最新一段；其余从最老的往前丢，直到装进预算。
+      if (cut < body.length && piece.length + 2 > room) break
+      room -= piece.length + 2
+      cut = i
+    }
+    const dropped = body.slice(0, cut)
+    const kept = body.slice(cut)
+    // 最新一段自己就超预算：没有更早的消息可丢，只能截断它、保留尾部
+    // （工具输出与最新进展通常在尾部，开头多是重复的样板）。
+    if (dropped.length === 0 && kept.length > 0) {
+      const last = kept.length - 1
+      const piece = kept[last]!
+      if (piece.length > room) {
+        const limit = Math.max(1_000, room)
+        kept[last] = `[历史过长已截断：仅保留最近 ${limit} 字]\n${piece.slice(-limit)}`
+        parts.splice(budgetHeader, body.length, ...kept)
+        text = parts.join('\n\n')
+        console.info(
+          `[deepseek-web] 回放预算 ${replayBudget} 字：最新一段 ${piece.length} 字超出预算，`
+          + `已截断为最近 ${limit} 字。`,
+        )
+      }
+    } else if (dropped.length > 0) {
+      const droppedChars = dropped.reduce((sum, piece) => sum + piece.length, 0)
+      const notice = `[历史过长已省略：为控制单条消息长度，省略了 ${dropped.length} 段更早的记录（约 ${droppedChars} 字）。`
+        + '请以当前任务与最近上下文为准继续推进。]'
+      parts.splice(budgetHeader, body.length, notice, ...kept)
+      text = parts.join('\n\n')
+      console.info(
+        `[deepseek-web] 回放预算 ${replayBudget} 字：省略最早 ${dropped.length} 段、约 ${droppedChars} 字历史，`
+        + `保留最近 ${kept.length} 段。`,
+      )
+    }
+  }
   state.contextVersion = CONTEXT_VERSION
   state.checkpointSignature = checkpointSignature
   state.systemSignature = systemSignature

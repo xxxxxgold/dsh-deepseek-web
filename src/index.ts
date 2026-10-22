@@ -13,6 +13,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Config } from './config.ts'
 import { Config as ConfigSchema, PROVIDER } from './config.ts'
+import { BUILD, writeLoadStamp } from './build-info.ts'
 import { liveConfig } from './live-config.ts'
 import { DeepSeekWebAdapter, type ReadImageAttachment } from './adapter.ts'
 import { PlaywrightBrowserChannel } from './playwright-channel.ts'
@@ -123,5 +124,11 @@ export function apply(ctx: Context, config: Config): void {
     + ` (browser=${live.browser}, sendMode=${live.sendMode},`
     + ` review=${live.review.enabled ? live.review.provider : 'off'},`
     + ` imageUpload=${live.enableImageUpload ? 'on' : 'off'})`,
+  )
+
+  // 构建身份：重启后据此确认宿主加载的是哪一份产物，而不是靠「我重启过了」猜。
+  const stamp = writeLoadStamp()
+  ctx.logger.info(
+    `[llm-deepseek-web] 构建标识 ${BUILD}（加载文件：${stamp ?? '加载戳写入失败'}）`,
   )
 }

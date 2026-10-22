@@ -21,6 +21,7 @@ import {
   looksLoginWall,
   looksSendBlocked,
   markPageTitle,
+  sendEditorMessage,
   type TitleMarkerState,
   withTimeout,
 } from './browser-shared.ts'
@@ -45,6 +46,15 @@ export interface GlmChannelOptions {
 export function matchesGlmCompletion(url: string): boolean {
   return /chat\/completions/i.test(url)
 }
+
+/**
+ * 发送之后等“网页响应流”的上限。
+ *
+ * 这个值只管**发送确认完成之后**那一段：审核页正常 1~3 秒就回响应头，卡住时不该让回合白等
+ * 10 分钟（`review.streamIdleTimeoutMs` 默认 600 秒）。填字与发送确认的耗时不计入这里——
+ * 早期实现把 2 分钟窗口挂在填字之前，长提示词必然超时，网页答了插件却报没收到。
+ */
+export const ACK_TIMEOUT_MS = 120_000
 
 /**
  * 解析 GLM SSE 流。
@@ -164,12 +174,17 @@ export class GLMChannel implements BrowserChannel {
       this.conversationStarted = true
     }
 
+    // 监听必须在填字之前挂上（否则脚本提前发送会漏掉响应），但监听本身**不能带超时**：
+    // 审核提示词可能很长，填字本身就要花掉几十秒到几分钟，原来从填字之前开始计 2 分钟，
+    // 会在消息还没发出去时就把这一轮判死，而后续代码仍会按下回车——网页确实收到并回答了，
+    // 插件却报“全自动发送后未收到网页响应”。真正的等待上限改由 startAckClock()
+    // 从“发送确认完成”那一刻开始计。
+    let sawResponse = false
     const completionPromise = page.waitForResponse(
       response => response.request().method() === 'POST' && matchesGlmCompletion(response.url()),
-      // 等的是“有没有真的发出去”：审核页正常 1~3 秒回响应头，卡住时不该让回合
-      // 白等 10 分钟，所以首响应封顶 2 分钟；读流仍用 review.streamIdleTimeoutMs。
-      { timeout: Math.min(this.options.config.streamIdleTimeoutMs, 120_000) },
+      { timeout: 0 },
     ).then(async response => {
+      sawResponse = true
       await markPageTitle(page, '[dsh GLM 审核生成中]', this.titleState).catch(() => {})
       // body() / finished() 自带“等到流结束”的语义但没有超时参数：
       // 流一旦卡住线程就永远等下去（表现为“卡住、不会重新获取”）。
@@ -184,6 +199,29 @@ export class GLMChannel implements BrowserChannel {
     })
     // 取消/超时后可能没人再 await 它，先挂空 catch 避免 unhandled rejection。
     completionPromise.catch(() => {})
+
+    // 发送完成后的等待计时器：到点报“已发出但网页没有响应流”。
+    // 只在发送动作确认之后启动，填字耗时（长提示词可达数分钟）不参与这段窗口。
+    const ackTimeoutMs = Math.min(this.options.config.streamIdleTimeoutMs, ACK_TIMEOUT_MS)
+    let ackTimer: ReturnType<typeof setTimeout> | undefined
+    let ackDeadline: Promise<never> | undefined
+    const startAckClock = (): void => {
+      clearTimeout(ackTimer)
+      ackDeadline = new Promise<never>((_, reject) => {
+        ackTimer = setTimeout(() => {
+          reject(new LlmError(
+            request.autoSend
+              ? `glm: 消息已发送，但 ${Math.round(ackTimeoutMs / 1000)} 秒内没有等到网页的响应流（HTTP 层未捕获到本轮请求）。`
+                + '请人工检查网页：对话里若已出现这条消息并开始回答，说明响应被页面拦截或网络中断；'
+                + '若输入框里还留着内容，说明回车没触发发送。确认后重试本轮任务。'
+              : `glm: 消息已填入输入框，等待你点击“发送”超时（${Math.round(ackTimeoutMs / 1000)} 秒）。`
+                + '请确认输入框内容后点击页面上的发送按钮重试。',
+            request.autoSend ? 'GLM_AUTO_SEND_TIMEOUT' : 'GLM_MANUAL_SEND_TIMEOUT',
+          ))
+        }, ackTimeoutMs)
+      })
+      void ackDeadline.catch(() => {})
+    }
 
     const editor = locateEditor(page)
     if (!(await editor.isVisible().catch(() => false))) {
@@ -211,8 +249,24 @@ export class GLMChannel implements BrowserChannel {
 
     if (request.autoSend) {
       await markPageTitle(page, '[dsh 自动发送中]', this.titleState)
-      await page.keyboard.press('Enter')
-      console.info('[glm] 全自动：已输入并回车发送…')
+      // 只按一次回车不确认，是“发没发出去”分不清的根源：焦点丢失、输入法吞键、页面改版
+      // 都会把消息留在输入框，然后空等两分钟报“未收到网页响应”。这里走带确认的发送。
+      const outcome = await sendEditorMessage(page, editor, {
+        verifyTimeoutMs: 3_000,
+        maxAttempts: 2,
+        pauseMinMs: 0,
+        pauseMaxMs: 0,
+        hasResponse: () => sawResponse,
+        isCancelled: () => request.signal?.aborted ?? false,
+      })
+      if (!outcome.sent) {
+        throw new LlmError(
+          `glm: 消息已填入输入框，但没能确认发送出去。尝试记录：${outcome.attempts.join('；')}。`
+          + '页面可能改版导致回车与发送按钮都失效——请人工检查网页后重试。',
+          'GLM_SEND_NOT_TRIGGERED',
+        )
+      }
+      console.info(`[glm] 全自动：已确认发送（方式：${outcome.via}）。`)
     } else {
       await page.bringToFront()
       this.conversationStarted = true
@@ -220,9 +274,12 @@ export class GLMChannel implements BrowserChannel {
       console.info('[glm] 消息已填入 Edge，请在 GLM 页面点击“发送”…')
     }
 
+    // 发送动作到这里才算完成：从现在开始计“等网页响应”的时间。
+    startAckClock()
+
     let completion: { url: string; status: number; body: Buffer }
     try {
-      completion = await completionPromise
+      completion = await Promise.race([completionPromise, ackDeadline!])
       console.info('[glm] 已收到 GLM 完整回复，正在解析…')
     } catch (error) {
       // 已经是带明确错误码的失败（流卡住等）就原样上抛，保留定位信息。
@@ -230,12 +287,13 @@ export class GLMChannel implements BrowserChannel {
       if (page.isClosed()) throw new LlmError('glm: 浏览器页面被关闭', 'GLM_PAGE_CLOSED')
       throw new LlmError(
         request.autoSend
-          ? 'glm: 全自动发送后未收到网页响应。可能回车未触发发送（输入框为空或页面结构变化），请人工检查网页后重试。'
-          : 'glm: 已把消息填入浏览器，等待你点击“发送”超时。请点击发送后重试。',
+          ? 'glm: 发送流程在确认网页响应之前就中断了（页面被关闭或网络监听失效）。请人工检查网页后重试。'
+          : 'glm: 等待你点击“发送”期间流程中断（页面被关闭或网络监听失效）。请确认输入框内容后重试。',
         request.autoSend ? 'GLM_AUTO_SEND_TIMEOUT' : 'GLM_MANUAL_SEND_TIMEOUT',
         { cause: error },
       )
     } finally {
+      clearTimeout(ackTimer)
       await markPageTitle(page, undefined, this.titleState)
     }
 

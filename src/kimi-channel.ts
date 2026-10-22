@@ -51,6 +51,15 @@ function matchesKimiCompletion(url: string): boolean {
 }
 
 /**
+ * 发送确认之后等“网页响应流”的上限。
+ *
+ * 只管**发送确认完成之后**那一段：正常 1~3 秒就回响应头，卡住时不该让回合白等
+ * `streamIdleTimeoutMs`（默认 600 秒）。填字与发送确认的耗时不计入这里——早期实现把这个
+ * 窗口挂在填字之前，长审核提示词必然超时，Kimi 答了插件却报“等待回复超时”。
+ */
+export const KIMI_ACK_TIMEOUT_MS = 120_000
+
+/**
  * 解析 Kimi Connect-RPC 流：5 字节帧头（1 字节 flags + 4 字节大端长度）+ JSON 载荷。
  *
  * 事件形态（实测样本）：
@@ -545,11 +554,13 @@ export class KimiBrowserChannel implements BrowserChannel {
       }
 
       // 响应监听必须在“填入/发送”之前挂上，否则会漏掉第一个响应。
-      // 拆成两条分支：`sawResponse` 在响应头到达的瞬间就能置位（给发送确认用），
-      // `completionPromise` 负责等流结束并取回完整响应体。
+      // 但监听本身**不能带超时**：审核提示词可能很长，填字本身就要花几十秒到几分钟，
+      // 原来从填字之前开始计 2 分钟，会在消息还没发出去时就把这一轮判死，而后面的代码
+      // 仍会按下回车——Kimi 确实收到并回答了，插件却报“等待回复超时”。
+      // 真正的等待上限改由 startAckClock() 从发送确认完成那一刻开始计。
       const responsePromise = page.waitForResponse(
         response => response.request().method() === 'POST' && matchesKimiCompletion(response.url()),
-        { timeout: Math.min(config.streamIdleTimeoutMs, 120_000) },
+        { timeout: 0 },
       )
       let sawResponse = false
       responsePromise.then(() => { sawResponse = true }).catch(() => {})
@@ -571,6 +582,29 @@ export class KimiBrowserChannel implements BrowserChannel {
         if (cancelled()) { rejectCancelled(); return }
         controller.signal.addEventListener('abort', rejectCancelled, { once: true })
       })
+
+      // 发送完成之后的等待计时器：到点报“已发出但网页没有响应流”。
+      // 只在发送动作确认之后启动，填字耗时（长提示词可达数分钟）不参与这段窗口。
+      const ackTimeoutMs = Math.min(config.streamIdleTimeoutMs, KIMI_ACK_TIMEOUT_MS)
+      let ackTimer: ReturnType<typeof setTimeout> | undefined
+      let ackDeadline: Promise<never> | undefined
+      const startAckClock = (): void => {
+        clearTimeout(ackTimer)
+        ackDeadline = new Promise<never>((_, reject) => {
+          ackTimer = setTimeout(() => {
+            reject(new LlmError(
+              autoSend
+                ? `kimi: 消息已发送，但 ${Math.round(ackTimeoutMs / 1000)} 秒内没有等到网页的响应流（HTTP 层未捕获到本轮请求）。`
+                  + '请人工检查 Kimi 窗口：对话里若已出现这条消息并开始回答，说明响应被页面拦截或网络中断；'
+                  + '若输入框里还留着内容，说明回车没触发发送。确认后重试本轮任务。'
+                : `kimi: 消息已填入输入框，等待你点击“发送”超时（${Math.round(ackTimeoutMs / 1000)} 秒）。`
+                  + '请确认输入框内容后点击页面上的发送按钮重试。',
+              autoSend ? 'KIMI_RESPONSE_TIMEOUT' : 'KIMI_MANUAL_SEND_TIMEOUT',
+            ))
+          }, ackTimeoutMs)
+        })
+        void ackDeadline.catch(() => {})
+      }
 
       const editor = locateEditor(page)
       if (!(await editor.isVisible().catch(() => false))) {
@@ -626,9 +660,12 @@ export class KimiBrowserChannel implements BrowserChannel {
         console.info('[kimi] 消息已填入 Edge，请在 Kimi 页面点击“发送”…')
       }
 
+      // 发送动作到这里才算完成：从现在开始计“等网页响应”的时间。
+      startAckClock()
+
       let completion: { url: string; status: number; body: Buffer }
       try {
-        completion = await Promise.race([completionPromise, aborted])
+        completion = await Promise.race([completionPromise, aborted, ackDeadline!])
         console.info('[kimi] 已收到 Kimi 完整回复，正在解析…')
       } catch (error) {
         if (error instanceof LlmError) throw error
@@ -645,12 +682,13 @@ export class KimiBrowserChannel implements BrowserChannel {
         }
         throw new LlmError(
           autoSend
-            ? 'kimi: 已自动发送，但等待 Kimi 回复超时（可能页面报了限流或生成中断）。请检查 Kimi 窗口后重试。'
-            : 'kimi: 已把消息填入浏览器，等待你点击“发送”超时。请点击发送后重试。',
+            ? 'kimi: 发送流程在确认网页响应之前就中断了（页面被关闭或网络监听失效）。请人工检查 Kimi 窗口后重试。'
+            : 'kimi: 等待你点击“发送”期间流程中断（页面被关闭或网络监听失效）。请确认输入框内容后重试。',
           autoSend ? 'KIMI_RESPONSE_TIMEOUT' : 'KIMI_MANUAL_SEND_TIMEOUT',
           { cause: error },
         )
       } finally {
+        clearTimeout(ackTimer)
         await markPageTitle(page, undefined, this.titleState).catch(() => {})
       }
 

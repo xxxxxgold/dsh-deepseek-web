@@ -48,6 +48,7 @@ import {
   isBrowserClosedMessage,
   setBrowserWindowTopmost,
   launchManagedBrowser,
+  sendEditorMessage,
   type ManagedBrowserConnection,
 } from './browser-shared.ts'
 
@@ -77,6 +78,16 @@ const RATE_LIMIT_POLL_MS = 800
  * 频控重发期间每一轮都要点一次，更容易踩到）。
  */
 const SEND_ACK_TIMEOUT_MS = 180_000
+/**
+ * 单条消息长度告警线。
+ *
+ * 实测（本机 Edge，chat.deepseek.com 输入框）：10 万字符约 1.1 秒、30 万约 13 秒、
+ * 60 万约 77 秒，接近二次方增长；110 万字符会把页面主线程拖死到连 CDP 都连不上。
+ * 超过这条线就在日志和页面标题上显式提示"正在填入 N 字"，避免被当成卡死。
+ */
+const LONG_TEXT_WARN_CHARS = 200_000
+/** 超过这个长度才在页面状态里显示字数（短文本不打扰）。 */
+const LONG_TEXT_STATUS_CHARS = 100_000
 /** 页面网络镜像保留的最近请求数。 */
 const CAPTURE_KEEP = 20
 /**
@@ -147,6 +158,34 @@ function matchesCompletionUrl(url: string): boolean {
   return /\/chat\/completion\b/i.test(url)
     || /\/chat\/completions?$/i.test(url)
     || /\/conversation\/(chat|completion)/i.test(url)
+}
+
+/**
+ * 判断当前地址是否已经处在“新对话态”（入口页）。
+ *
+ * DeepSeek 的对话地址是 `/a/chat/s/<会话id>`，入口页是根路径 `/`（或 `/a/chat`）。
+ * 在这种页面上点“开启新对话”不会改变 URL，所以不能再用“URL 有没有变”判定成功，
+ * 否则每轮都会退化成整页重载，把填字撞进前端初始化竞态。
+ */
+export function isEntryUrl(current: string, entryUrl: string): boolean {
+  let now: URL
+  let entry: URL
+  try {
+    now = new URL(current)
+    entry = new URL(entryUrl)
+  } catch {
+    return false
+  }
+  if (now.origin !== entry.origin) return false
+  const strip = (path: string): string => path.replace(/\/+$/u, '')
+  const nowPath = strip(now.pathname)
+  const entryPath = strip(entry.pathname)
+  // 入口页配置成带具体会话地址时（用户把某个对话当入口），没有“新对话态”可言。
+  if (/\/chat\/s\//i.test(entryPath)) return false
+  if (nowPath === entryPath) return true
+  // 入口页是根路径时，/a/chat 这类站点首页同样属于新对话态。
+  if (entryPath === '' && (nowPath === '' || nowPath === '/a' || nowPath === '/a/chat')) return true
+  return false
 }
 
 /** 临时文件名：只留安全字符，保留扩展名，避免超长路径。 */
@@ -587,9 +626,26 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
    */
   private async startFreshConversation(page: Page, entryUrl = this.options.config.url): Promise<void> {
     const beforeUrl = page.url()
+    // 已经在入口页（新对话态）时，点击“开启新对话”不会改变地址——DeepSeek 的会话地址形如
+    // /a/chat/s/<id>，入口页就是根路径。旧判定只看 URL 是否变化，于是每一轮都会误判失败、
+    // 回退去整页重载入口页；重载后前端初始化与随后的填字存在竞态，填进去的内容有被清空的
+    // 风险，回车就成了空发。这里先把“本来就在新对话态”识别出来，直接跳过重载。
+    if (isEntryUrl(beforeUrl, entryUrl)) {
+      const clickedAtEntry = await bestEffortNewChat(page)
+      if (clickedAtEntry) console.info('[deepseek-web] 已在入口页（新对话态），无需重载。')
+      await locateEditor(page).waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {})
+      return
+    }
     const existingPages = new Set(page.context().pages())
     const clicked = await bestEffortNewChat(page)
-    await page.waitForTimeout(800)
+    // 网页把“新对话”做成 SPA 路由，点击到地址栏更新常要 1~3 秒：原来固定等 800ms 就判定失败，
+    // 于是几乎每次新会话都走"重开入口页"的兜底——整页重载期间前端还在初始化，紧接着填字有概率被
+    // 前端状态覆盖成空，回车等于没发，旧代码又只按一次回车不确认，最后表现成"未收到网页响应"。
+    // 这里改成轮询等地址真正变化，仍失败才重载。
+    const changeDeadline = Date.now() + 3_000
+    while (clicked && page.url() === beforeUrl && Date.now() < changeDeadline) {
+      await page.waitForTimeout(200)
+    }
     // 某些网页版本会把“新对话”按钮实现成新标签。插件要求所有 dsh 对话
     // 复用同一个网页标签，因此关闭点击产生的额外标签并回退到当前页面。
     await Promise.all(page.context().pages().filter(candidate => candidate !== page
@@ -1345,11 +1401,17 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       ? Math.min(this.options.config.streamIdleTimeoutMs, SEND_ACK_TIMEOUT_MS)
       : SEND_ACK_TIMEOUT_MS
     let waiterActive = true
+    let sawResponse = false
+    // 监听必须在填字之前挂上（否则用户/脚本提前发送会漏掉响应），但监听本身**不能带超时**：
+    // 超长文本的填写可能持续几分钟，原来从填字之前开始计 180 秒，会在消息还没发出去时
+    // 就把这一轮判死，而后续代码仍会按下回车——网页确实收到并回答了，dsh 却报“未收到响应”。
+    // 真正的等待上限改由 startAckClock() 从“发送确认完成”那一刻开始计。
     const waiter = page.waitForResponse(async response => {
       if (response.request().method() !== 'POST') return false
       if (!matchesCompletionUrl(response.url())) return false
+      sawResponse = true
       return true
-    }, { timeout: ackTimeoutMs }).then(async response => {
+    }, { timeout: 0 }).then(async response => {
       await this.markPageStatus(page, request.purpose ? `[dsh 内部辅助：${request.purpose} 生成中]` : '[dsh 网页生成中]').catch(() => {})
       this.emitNotice(
         request,
@@ -1387,6 +1449,27 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       if (request.signal.aborted) abortListener()
     })
     void aborted.catch(() => {})
+    // 发送动作确认完成后的等待计时器：到点报“已发出但网页没有响应流”。
+    // 只在发送之后启动，所以填字耗时（超长文本可达数分钟）不会吃掉这段等待窗口。
+    let ackTimer: ReturnType<typeof setTimeout> | undefined
+    let ackDeadline: Promise<never> | undefined
+    const startAckClock = (): void => {
+      clearTimeout(ackTimer)
+      ackDeadline = new Promise<never>((_, reject) => {
+        ackTimer = setTimeout(() => {
+          reject(new LlmError(
+            autoSend
+              ? `deepseek-web: 消息已发送，但 ${formatDuration(ackTimeoutMs)} 内没有等到网页的响应流（HTTP 层未捕获到本轮请求）。`
+                + '请人工检查网页：对话里若已出现这条消息并开始回答，说明响应被页面拦截或网络中断；'
+                + '若输入框里还留着内容，说明回车没触发发送。确认后重试本轮任务。'
+              : `deepseek-web: 消息已填入输入框，等待你点击“发送”超时（${formatDuration(ackTimeoutMs)}）。`
+                + '请确认输入框内容后点击页面上的发送按钮重试。',
+            autoSend ? 'WEB_AUTO_SEND_TIMEOUT' : 'WEB_MANUAL_SEND_TIMEOUT',
+          ))
+        }, ackTimeoutMs)
+      })
+      void ackDeadline.catch(() => {})
+    }
     let progressTimer: ReturnType<typeof setInterval> | undefined
     let toastTimer: ReturnType<typeof setInterval> | undefined
 
@@ -1444,7 +1527,25 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       // 先清掉可能残留的旧附件，避免上一轮取消后留在输入框里的图串到本轮。
       await this.attachAttachments(page, request)
       request.signal?.throwIfAborted()
+      const textLength = request.text.length
+      if (textLength >= LONG_TEXT_WARN_CHARS) {
+        console.warn(
+          `[deepseek-web] 本轮单条消息 ${textLength} 字。网页输入框填字接近二次方级耗时`
+          + '（实测 30 万字符约 13 秒、60 万约 77 秒、110 万会把页面主线程拖死数分钟），'
+          + `填写期间页面可能毫无反应；响应等待 ${formatDuration(ackTimeoutMs)} 从“发送确认完成”才开始计，不会因此误判超时。`,
+        )
+      }
+      if (textLength >= LONG_TEXT_STATUS_CHARS) {
+        await this.markPageStatus(page, `[dsh 正在填入 ${textLength} 字，请稍候]`).catch(() => {})
+      }
+      const fillStartedAt = Date.now()
       await page.keyboard.insertText(request.text)
+      const fillMs = Date.now() - fillStartedAt
+      if (fillMs >= 5_000) {
+        console.info(
+          `[deepseek-web] 填入 ${textLength} 字耗时 ${formatDuration(fillMs)}（这一步不计入等待网页响应的超时）。`,
+        )
+      }
       if (page === this.page) this.markPageStarted(page)
       if (autoSend) {
         // 全自动：输入框已聚焦（editor.click），先随机停一段再回车发送。
@@ -1454,10 +1555,28 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
           await this.markPageStatus(page, `[dsh 已填入，${(pause / 1000).toFixed(1)}s 后发送]`)
           await this.sleep(pause, request.signal)
         }
-        await editor.focus()
-        await page.keyboard.press('Enter')
         await this.markPageStatus(page, request.purpose ? `[dsh 内部辅助：${request.purpose} 自动发送]` : '[dsh 自动发送中]')
-        console.info('[deepseek-web] 全自动：已输入并回车发送…')
+        // 只按一次回车不够：焦点丢失、输入法吞键、页面改版都会把消息留在输入框里，
+        // 然后我们空等三分钟报“未收到响应”。这里走带确认的发送：
+        // 回车 → 看输入框是否清空（或网络层已看到本轮请求）→ 没清空就点发送按钮 → 再确认，
+        // 每次尝试都记进 attempts，失败时能直接看出是哪一步没成。
+        const outcome = await sendEditorMessage(page, editor, {
+          // 网页端响应头通常 1~3 秒才回，确认窗口不能比它短，否则会把“已发出”误判成“没发出”。
+          verifyTimeoutMs: Math.max(this.options.config.review.sendVerifyMs, 3_000),
+          maxAttempts: 2,
+          pauseMinMs: 0,
+          pauseMaxMs: 0,
+          hasResponse: () => sawResponse,
+          isCancelled: () => request.signal?.aborted ?? false,
+        })
+        if (!outcome.sent) {
+          throw new LlmError(
+            `deepseek-web: 消息已填入输入框，但没能确认发送出去。尝试记录：${outcome.attempts.join('；')}。`
+            + '页面可能改版导致回车与发送按钮都失效——请人工检查网页后重试。',
+            'WEB_SEND_NOT_TRIGGERED',
+          )
+        }
+        console.info(`[deepseek-web] 全自动：已确认发送（方式：${outcome.via}）。`)
       } else {
         // 半自动：网页窗口置顶到屏幕最上方并聚焦输入框，用户直接回车或点击发送
         await page.bringToFront()
@@ -1477,11 +1596,14 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         request,
         'send',
         autoSend
-          ? `已发送 ${request.text.length} 字${attachText}`
+          ? `已确认发送 ${request.text.length} 字${attachText}`
           : `已填入输入框 ${request.text.length} 字${attachText}，等待你在网页点击发送`,
       )
 
-      const winner = await Promise.race([waiter, rateLimited, aborted])
+      // 发送动作到这里才算完成（自动模式已确认发出、半自动已填好等人工点）：
+      // 从现在开始计“等网页响应”的时间，填字耗时（超长文本可达数分钟）不参与。
+      startAckClock()
+      const winner = await Promise.race([waiter, rateLimited, aborted, ackDeadline!])
       // 作废 waiter 的 undefined 不会先于 race 落定；防御性兜底按频控处理
       if (winner === undefined) return { kind: 'rate-limited' }
       if ('kind' in winner) return winner
@@ -1503,12 +1625,13 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       if (await hasRateLimitToast(page)) return { kind: 'rate-limited' }
       throw new LlmError(
         autoSend
-          ? 'deepseek-web: 全自动发送后未收到网页响应。可能回车未触发发送（输入框为空或页面结构变化），请人工检查网页后重试。'
-          : 'deepseek-web: 已把消息填入浏览器，等待你点击“发送”超时。请确认输入框内容后点击页面上的发送按钮重试。',
+          ? 'deepseek-web: 发送流程在确认网页响应之前就中断了（页面被关闭或网络监听失效）。请人工检查网页后重试。'
+          : 'deepseek-web: 等待你点击“发送”期间流程中断（页面被关闭或网络监听失效）。请确认输入框内容后重试。',
         autoSend ? 'WEB_AUTO_SEND_TIMEOUT' : 'WEB_MANUAL_SEND_TIMEOUT',
       )
     } finally {
       waiterActive = false
+      clearTimeout(ackTimer)
       clearInterval(toastTimer)
       if (progressTimer) clearInterval(progressTimer)
       if (abortListener) request.signal?.removeEventListener('abort', abortListener)

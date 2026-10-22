@@ -294,6 +294,14 @@ export interface Config {
   maxToolResultChars: number
   /** 任务锚点最大字符数，防止超长任务每轮重复灌入。 */
   maxGoalChars: number
+  /**
+   * 全量回放历史时单条消息的字符预算（0 表示不限制）。
+   *
+   * 网页输入框填字代价随文本长度接近二次方增长（实测 30 万字符约 13 秒、60 万约 77 秒、
+   * 110 万字符会把浏览器主线程拖死数分钟），而响应等待窗口只有 3 分钟。长任务一旦触发
+   * 全量回放就会稳定超时，所以这里给回放文本设上限，超出时丢弃最早的历史并留下省略说明。
+   */
+  maxReplayChars: number
   /** 可选审核通道（Kimi / GLM 独立审核，或 DeepSeek 同对话自审）。 */
   review: ReviewConfig
   /** 模型疑似想调工具但输出无法解析时，自动注入纠错并请求重试一次。 */
@@ -437,6 +445,7 @@ const schema = z.object({
   compactToolCatalog: z.boolean().default(true),
   maxToolResultChars: markVolatile(z.number().step(1).min(256).default(6_000)),
   maxGoalChars: z.number().step(1).min(64).default(2_000),
+  maxReplayChars: z.number().step(1).min(0).default(400_000),
   focus: z.object({
     enabled: markVolatile(z.boolean().default(true)),
     webWindow: markVolatile(z.boolean().default(true)),
