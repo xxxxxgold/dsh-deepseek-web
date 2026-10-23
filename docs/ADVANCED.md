@@ -7,7 +7,7 @@
 已配置 dsh CLI 时，可以用官方插件管理命令安装同一个包：
 
 ```bash
-dsh plugin --profile desktop add https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-xxxxxgold-0.6.0.tgz
+dsh plugin --profile desktop add https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.0/dsh-deepseek-web-xxxxxgold-0.7.0.tgz
 ```
 
 仅在需要手工管理 profile 时，把以下字段合并到现有清单，保留原有依赖和 bundles：
@@ -15,7 +15,7 @@ dsh plugin --profile desktop add https://github.com/xxxxxgold/dsh-deepseek-web/r
 ```json
 {
   "dependencies": {
-    "dsh-deepseek-web-xxxxxgold": "https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-xxxxxgold-0.6.0.tgz"
+    "dsh-deepseek-web-xxxxxgold": "https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.0/dsh-deepseek-web-xxxxxgold-0.7.0.tgz"
   },
   "dsh": {
     "profile": {

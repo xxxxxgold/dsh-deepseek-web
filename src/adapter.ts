@@ -1,3 +1,24 @@
+/**
+ * 长正文改附件后，输入框里只填这段说明。
+ *
+ * 保留开头 3000 字，让模型第一眼知道本轮任务是什么；正文其余部分在附件里，
+ * 模型读取附件即可拿到完整内容。这个说明必须明确写出附件名，否则模型不知道
+ * 该读哪个文件（网页端可能同时挂着图片附件）。
+ */
+export function buildLongTextNotice(text: string, fileName: string): string {
+  const head = text.slice(0, 3_000)
+  const parts = [
+    `【本轮正文共 ${text.length} 字，已作为附件 ${fileName} 上传】`,
+    '',
+    '以下是开头摘要：',
+    '',
+    head,
+  ]
+  if (text.length > head.length) parts.push('', '……（中间省略，完整内容见附件）')
+  parts.push('', `请先读取附件 ${fileName} 的完整内容，再按其中的要求执行。`)
+  return parts.join('\n')
+}
+
 /** 把冷却分类映射成台账里的失败分类（timeout 单独拆出来，便于看「是超时还是限流」）。 */
 function toLedgerFailure(kind: FailureClass, code: string | undefined): NonNullable<LedgerEntry['failure']> {
   if ((code ?? '').toUpperCase().includes('TIMEOUT')) return 'timeout'
@@ -431,7 +452,26 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     state.roundsSinceProtocol = 0
     state.uploadedImageIds = undefined
 
-    const retry = yield* this.driveTurn({ ...request, text: retryText, initialize: true }, blocks)
+    // 重试正文可能仍然超长：重新生成附件，并丢掉上一版长文本文件（图片附件保留）。
+    const retryAttachment = this.config.longTextAsFile
+      && retryText.length >= this.config.longTextFileThreshold
+      ? this.buildLongTextAttachment(retryText)
+      : undefined
+    const retryPrompt = retryAttachment
+      ? buildLongTextNotice(retryText, retryAttachment.name)
+      : retryText
+    const retryAttachments = [
+      ...(request.attachments ?? []).filter(item => item.kind !== 'file'),
+      ...(retryAttachment ? [retryAttachment] : []),
+    ]
+
+    const retry = yield* this.driveTurn({
+      ...request,
+      text: retryPrompt,
+      fallbackText: retryAttachment ? retryText : undefined,
+      attachments: retryAttachments.length > 0 ? retryAttachments : undefined,
+      initialize: true,
+    }, blocks)
     if (retry.contextLengthExceeded === true) {
       throw new LlmError(
         'deepseek-web: 轮换到新对话后仍提示达到长度上限，请人工检查网页状态。',
@@ -700,6 +740,23 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     return loaded.length > 0 ? loaded : undefined
   }
 
+  /**
+   * 把超长正文包成一个待上传的 .md 附件。
+   *
+   * 文件名带时间戳，网页端预览与模型引用的都是它；`attachmentId` 用
+   * `longtext:` 前缀，和宿主图片 id 区分开（这类附件不跨轮复用，只用于本轮）。
+   */
+  private buildLongTextAttachment(text: string): BrowserImageAttachment {
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15)
+    return {
+      attachmentId: `longtext:${stamp}:${text.length}`,
+      name: `dsh-turn-${stamp}.md`,
+      mimeType: 'text/markdown',
+      data: new TextEncoder().encode(text),
+      kind: 'file',
+    }
+  }
+
   private checkReplyEnd(reply: BrowserTurnResult): void {
     if (reply.finishReason === 'interrupted') throw new LlmError('网页明确报告回复被中断，请重试当前任务。', 'WEB_REPLY_INTERRUPTED')
     if (reply.finishReason === 'max-tokens') throw new LlmError('网页回复达到输出上限，未作为完整交付提交，请缩小单次任务后重试。', 'WEB_REPLY_TRUNCATED')
@@ -745,9 +802,30 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     // 图片直传：把本轮引用读成字节，随请求交给通道上传。
     // 读不出时按 uploadOnError 决定抛错还是跳过（跳过则文本里仍有 [附图] 标记，
     // 模型不会假装看过——那个标记在开关开启时不代表"已上传成功"）。
-    const attachments = rendered.prompt.attachments?.length
+    const imageAttachments = rendered.prompt.attachments?.length
       ? await this.loadAttachments(rendered.prompt.attachments, options.signal)
       : undefined
+
+    // 长文本转文件：网页输入框填字接近二次方级耗时（实测 30 万字符约 13 秒、
+    // 60 万约 77 秒），超过阈值就把正文写成 .md 附件，输入框只填摘要。
+    // 附件没挂上时通道会用 fallbackText 回退填完整正文——慢，但内容不丢。
+    const longTextAttachment = this.config.longTextAsFile
+      && rendered.prompt.text.length >= this.config.longTextFileThreshold
+      ? this.buildLongTextAttachment(rendered.prompt.text)
+      : undefined
+    if (longTextAttachment) {
+      console.info(
+        `[deepseek-web] 本轮正文 ${rendered.prompt.text.length} 字，超过 ${this.config.longTextFileThreshold} 字阈值，`
+        + `改以附件 ${longTextAttachment.name} 上传，输入框只填摘要。`,
+      )
+    }
+    const promptText = longTextAttachment
+      ? buildLongTextNotice(rendered.prompt.text, longTextAttachment.name)
+      : rendered.prompt.text
+    const attachments = [
+      ...(imageAttachments ?? []),
+      ...(longTextAttachment ? [longTextAttachment] : []),
+    ]
 
     // 初始化只更新本轮快照；完整结果被消费后再提交持久状态。
     if (rendered.prompt.initialize) {
@@ -768,8 +846,10 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       reply = yield* this.driveTurnAuto({
         sessionId,
         model,
-        text: rendered.prompt.text,
-        attachments,
+        text: promptText,
+        // 长正文已转附件：文件没挂上时通道回退填这段完整正文。
+        fallbackText: longTextAttachment ? rendered.prompt.text : undefined,
+        attachments: attachments.length > 0 ? attachments : undefined,
         initialize: rendered.prompt.initialize,
         autoSend,
         signal: options.signal,

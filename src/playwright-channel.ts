@@ -1476,12 +1476,22 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       }
 
       // 幂等：频控重发会再次走到这里，已挂上的同名预览不再传一遍。
-      const attached = await page
+      // 图片预览靠 img[alt]；文件卡片没有 img，靠容器文本包含文件名。
+      const imageNames = await page
         .locator(`${ATTACHMENT_PREVIEW_SELECTOR} img`)
         .evaluateAll(nodes => nodes.map(node => node.getAttribute('alt') ?? ''))
         .catch(() => [] as string[])
-      if (files.every(file => attached.includes(file.name))) {
-        console.info('[deepseek-web] 本轮图片已在输入框里，跳过重复上传。')
+      const cardTexts = await page
+        .locator(ATTACHMENT_PREVIEW_SELECTOR)
+        .evaluateAll(nodes => nodes.map(node => node.textContent ?? ''))
+        .catch(() => [] as string[])
+      const alreadyAttached = (file: BrowserImageAttachment): boolean => (
+        file.kind === 'file'
+          ? cardTexts.some(text => text.includes(file.name))
+          : imageNames.includes(file.name)
+      )
+      if (files.every(alreadyAttached)) {
+        console.info(`[deepseek-web] 本轮 ${files.length} 个附件已在输入框里，跳过重复上传。`)
         return files.map(file => file.attachmentId)
       }
 
@@ -1524,7 +1534,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         this.handleUploadFailure(request, new Error(`等待图片解析超时（${config.uploadTimeoutMs}ms）`))
         return []
       }
-      console.info(`[deepseek-web] 已上传 ${files.length} 张图片，网页端解析完成。`)
+      console.info(`[deepseek-web] 已上传 ${files.length} 个附件，网页端解析完成。`)
       return files.map(file => file.attachmentId)
     } catch (error) {
       if (error instanceof LlmError) throw error
@@ -1533,8 +1543,20 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     }
   }
 
-  /** 上传失败出口：按配置抛错或降级（降级只告警，不改正文，也不谎报成功）。 */
+  /**
+   * 上传失败出口：按配置抛错或降级（降级只告警，不改正文，也不谎报成功）。
+   *
+   * 纯长文本文件轮例外：文件失败不抛错——`sendAndWait` 会用 `fallbackText`
+   * 回退填完整正文。抛错反而会让本可完成的任务失败。图片轮仍按配置处理。
+   */
   private handleUploadFailure(request: BrowserTurnRequest, error: Error): void {
+    const files = request.attachments ?? []
+    const hasImages = files.some(item => item.kind !== 'file')
+    const hasLongText = files.some(item => item.kind === 'file')
+    if (!hasImages && hasLongText) {
+      console.warn(`[deepseek-web] 长文本附件上传失败，回退为直接填入完整正文：${error.message}`)
+      return
+    }
     if (this.options.config.uploadOnError === 'abort') {
       throw new LlmError(
         `deepseek-web: 图片上传失败（会话 ${request.sessionId}）：${error.message}`,
@@ -1779,12 +1801,22 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       await page.keyboard.press('Backspace')
       // 先清掉可能残留的旧附件，避免上一轮取消后留在输入框里的图串到本轮。
       // 返回值是「真正挂上去的附件 id」：适配层据此维护跨轮去重集合。
-      uploadedImageIds = [...new Set([
-        ...uploadedImageIds,
-        ...await this.attachAttachments(page, request),
-      ])]
+      const uploaded = await this.attachAttachments(page, request)
+      uploadedImageIds = [...new Set([...uploadedImageIds, ...uploaded])]
       request.signal?.throwIfAborted()
-      const textLength = request.text.length
+      // 长文本转文件时，正文只是摘要：文件没挂上就必须回退填完整正文，
+      // 否则模型会丢掉几十万字的任务数据（比填字慢更糟）。
+      const longTextFiles = (request.attachments ?? []).filter(item => item.kind === 'file')
+      const missingLongText = longTextFiles.some(item => !uploaded.includes(item.attachmentId))
+      const text = missingLongText && request.fallbackText !== undefined
+        ? request.fallbackText
+        : request.text
+      if (missingLongText && request.fallbackText !== undefined) {
+        console.warn(
+          `[deepseek-web] 长文本附件未上传成功，回退为直接填入完整正文（${text.length} 字，会明显变慢）。`,
+        )
+      }
+      const textLength = text.length
       if (textLength >= LONG_TEXT_WARN_CHARS) {
         console.warn(
           `[deepseek-web] 本轮单条消息 ${textLength} 字。网页输入框填字接近二次方级耗时`
@@ -1796,7 +1828,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         await this.markPageStatus(page, `[dsh 正在填入 ${textLength} 字，请稍候]`).catch(() => {})
       }
       const fillStartedAt = Date.now()
-      await page.keyboard.insertText(request.text)
+      await page.keyboard.insertText(text)
       const fillMs = Date.now() - fillStartedAt
       if (fillMs >= 5_000) {
         console.info(

@@ -467,6 +467,18 @@ const schema = z.object({
   maxImagesPerTurn: markVolatile(z.number().step(1).min(0).max(32).default(4)),
   uploadTimeoutMs: markVolatile(z.number().step(1).min(1_000).default(60_000)),
   uploadOnError: markVolatile(z.union(['fallback-text', 'abort']).default('fallback-text')),
+  /**
+   * 长文本转文件附件：单条消息超过阈值时，把正文写成 .md 文件挂进网页输入框，
+   * 正文只留摘要与"请读取附件"的说明。
+   *
+   * 起因是网页输入框填字接近二次方级耗时（实测 30 万字符约 13 秒、60 万约 77 秒、
+   * 110 万会把页面主线程拖死数分钟）。网页端 file input 的 accept 列表包含
+   * `.txt/.md/.csv/.json/.log` 等文本格式，所以长正文可以走附件通道，让网页端
+   * 自己解析成上下文。上传失败时通道会回退为直接填完整正文（慢但内容不丢）。
+   */
+  longTextAsFile: markVolatile(z.boolean().default(true)),
+  /** 触发长文本转文件的字符数。10 万字符填字约 1 秒，12 万起才明显；低于该值不折腾。 */
+  longTextFileThreshold: markVolatile(z.number().step(1).min(10_000).default(120_000)),
   maxSessionPages: markVolatile(z.number().step(1).min(1).max(8).default(3)),
   turnTimeoutMs: z.number().step(1).min(0).default(900_000),
   lockLeaseMs: z.number().step(1).min(0).default(4_500_000),

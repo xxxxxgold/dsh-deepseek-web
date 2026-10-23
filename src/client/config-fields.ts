@@ -105,8 +105,11 @@ export const GROUPS: readonly FieldGroup[] = [
   },
   {
     id: 'image',
-    label: { zh: '图片直传', en: 'Image upload' },
-    hint: { zh: '把图片附件真正上传到网页输入框。', en: 'Upload image attachments into the page composer.' },
+    label: { zh: '图片与长正文', en: 'Images & long text' },
+    hint: {
+      zh: '把图片附件真正上传到网页输入框；超长正文改走文件附件，避免输入框卡顿。',
+      en: 'Upload image attachments into the page composer; long prompts go as a file attachment to avoid a frozen composer.',
+    },
   },
   {
     id: 'review',
@@ -444,6 +447,27 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: {
       zh: '等网页端把图片解析为 SUCCESS 的上限；大图可调大。',
       en: 'How long to wait for the page to parse an image to SUCCESS; raise it for large files.',
+    },
+  },
+  {
+    path: ['longTextAsFile'],
+    group: 'image',
+    kind: 'boolean',
+    label: { zh: '长正文转文件', en: 'Long text as file' },
+    hint: {
+      zh: '正文超过阈值时写成 .md 附件上传，输入框只填摘要；关闭则整段填进输入框。',
+      en: 'When the prompt exceeds the threshold, upload it as a .md attachment and type only a summary; off types the whole prompt.',
+    },
+  },
+  {
+    path: ['longTextFileThreshold'],
+    group: 'image',
+    kind: 'number',
+    label: { zh: '长正文阈值（字）', en: 'Long-text threshold (chars)' },
+    min: 10_000,
+    hint: {
+      zh: '默认 120000。网页输入框填字代价随长度接近二次方增长，12 万字约十几秒。',
+      en: 'Default 120000. Typing cost grows roughly quadratically; 120k chars takes ten-plus seconds.',
     },
   },
 

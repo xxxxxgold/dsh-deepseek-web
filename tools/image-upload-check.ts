@@ -140,7 +140,29 @@ const plain = renderNewWebMessages(
 )
 assert.equal(plain?.prompt.attachments, undefined, '纯文本轮不得带附件')
 
-// 8. replay 时的历史图：只取最近若干张，避免重建对话时重传一大堆旧图。
+// 8. 跨轮去重：第一轮传过 A/B，第二轮纯文字，第三轮新加 C——
+//    C 必须收集；若用户第三轮又把 A 拖进来（同 attachmentId），A 不重传。
+const crossState = freshState()
+renderNewWebMessages(options(messages), crossState, config())
+crossState.initialized = true
+crossState.lastMessageId = 'user-1'
+crossState.uploadedImageIds = ['sha256:r1', 'sha256:r2']
+const third = renderNewWebMessages(
+  options([
+    ...messages,
+    userMessage('user-2', '纯文字追问'),
+    userMessage('user-3', '再来一张，顺便把第一张再贴一次', [ref('r9', 'd.png'), ref('r1', 'a.png')]),
+  ]),
+  crossState,
+  config(),
+)
+assert.deepEqual(
+  third?.prompt.attachments?.map(item => item.attachmentId),
+  ['sha256:r9'],
+  '第三轮新图必须收集，已在网页对话里的旧图不重复上传',
+)
+
+// 9. replay 时的历史图：只取最近若干张，避免重建对话时重传一大堆旧图。
 const historyState = freshState()
 const historyMessages = [
   userMessage('h1', '第一张', [ref('h1', '1.png'), ref('h2', '2.png')]),
