@@ -202,6 +202,28 @@ export interface Config {
     accountCooldownMs: number
   }
   /**
+   * 服务端故障自动重试：网页返回 5xx，或页面提示「服务器暂时不可用」时，
+   * 等一会儿自动重发同一条消息，而不是把这一轮判成「响应格式无法识别」。
+   *
+   * 与 `rateLimit` 刻意分开：频控是账号被判发得太快，要等分钟级冷却、还可能封号；
+   * 服务端故障是 DeepSeek 后端过载/重启，跟账号无关，几十秒到两分钟就恢复，
+   * 也不该触发账号冷却（否则一次后端抖动会让所有会话停 10 分钟）。
+   */
+  serverBusy: {
+    /** 总开关。关掉后服务端故障直接报 WEB_SERVER_BUSY，不自动等待重发。 */
+    enabled: boolean
+    /** 首次等待（毫秒）；指数退避时作为基数。默认 15 秒。 */
+    retryDelayMs: number
+    /** 单轮最多自动重发次数。默认 4 次（15s + 30s + 60s + 120s ≈ 3.75 分钟）。 */
+    maxRetries: number
+    /** 退避曲线：fixed 每次等 retryDelayMs；exponential 按次数翻倍（默认）。 */
+    backoff: 'fixed' | 'exponential'
+    /** 指数退避的单次等待上限（毫秒）。默认 2 分钟。 */
+    retryMaxDelayMs: number
+    /** 抖动比例 0~0.5，避免多实例同一秒重撞。默认 ±20%。 */
+    jitterRatio: number
+  }
+  /**
    * 提示：把「发出消息 / 收到回复 / 频控等待 / 本轮失败」做成对话里可见的一行提示。
    *
    * 主通道是 reasoning 块（可折叠、不污染正文），浏览器页面浮层只辅助等待场景。
@@ -412,6 +434,15 @@ const schema = z.object({
     // 账号级冷却：网页判频控后整账号停手。默认 10 分钟，对齐实测 10~15 分钟冷却窗口；
     // 0 = 关闭（只有本回合退避，其它会话继续打网页——那正是最容易触发 1 天封禁的形态）。
     accountCooldownMs: markVolatile(z.number().step(1).min(0).max(3_600_000).default(600_000)),
+  }).default({}),
+  serverBusy: z.object({
+    enabled: markVolatile(z.boolean().default(true)),
+    // 15s 起、翻倍、120s 封顶：后端抖动通常几十秒到两分钟恢复，等太久只是让用户干坐着。
+    retryDelayMs: markVolatile(z.number().step(1).min(1_000).default(15_000)),
+    maxRetries: markVolatile(z.number().step(1).min(0).default(4)),
+    backoff: markVolatile(z.union(['fixed', 'exponential']).default('exponential')),
+    retryMaxDelayMs: markVolatile(z.number().step(1).min(1_000).default(120_000)),
+    jitterRatio: markVolatile(z.number().step(0.01).min(0).max(0.5).default(0.2)),
   }).default({}),
   notify: z.object({
     enabled: markVolatile(z.boolean().default(true)),

@@ -9,10 +9,12 @@ import { readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  claimNoticeToasts,
   hasRateLimitToast,
   isRateLimitResponse,
   looksLikeRateLimitText,
   markRateLimitToastsSeen,
+  scanNoticeToasts,
   shouldCountRateLimitNode,
 } from '../src/browser-shared.ts'
 import {
@@ -269,16 +271,18 @@ if (!describeFailure({ code: 'SOMETHING_NEW', message: '原始错误' }).include
  * 对源码做结构化断言：判据缺一条就炸。
  */
 const sharedSource = readFileSync(path.join(sourceDir, 'browser-shared.ts'), 'utf8')
-const toastStart = sharedSource.indexOf('export async function hasRateLimitToast')
+// 判据已抽到 scanNoticeToasts（频控与服务端故障共用同一套可见性逻辑），
+// 断言要盯住那个函数体——薄封装调用方只剩两行参数，盯它等于没盯。
+const toastStart = sharedSource.indexOf('export function scanNoticeToasts')
 if (toastStart < 0) {
-  console.error('FAIL: 找不到 hasRateLimitToast，源码断言已失效')
+  console.error('FAIL: 找不到 scanNoticeToasts，源码断言已失效')
   process.exit(1)
 }
-const claimStart = sharedSource.indexOf('export async function markRateLimitToastsSeen')
+const claimStart = sharedSource.indexOf('export function claimNoticeToasts')
 const toastSource = sharedSource.slice(toastStart, claimStart > toastStart ? claimStart : undefined)
 for (const needle of ['checkVisibility', 'params.seenAttr', 'params.noticeId', 'getBoundingClientRect']) {
   if (!toastSource.includes(needle)) {
-    console.error(`FAIL: hasRateLimitToast 缺少判据「${needle}」——隐藏或旧的节点会重新被当成新提示`)
+    console.error(`FAIL: scanNoticeToasts 缺少判据「${needle}」——隐藏或旧的节点会重新被当成新提示`)
     process.exit(1)
   }
 }
@@ -289,7 +293,7 @@ for (const needle of ['checkVisibility', 'params.seenAttr', 'params.noticeId', '
  * 具名函数，整个检测就会 ReferenceError，再被 `.catch(() => false)` 吞掉——
  * 现象是「页面上明明有频控提示，也一律判不出来」。这条断言直接盯转译产物。
  */
-for (const [name, fn] of [['hasRateLimitToast', hasRateLimitToast], ['markRateLimitToastsSeen', markRateLimitToastsSeen]] as const) {
+for (const [name, fn] of [['scanNoticeToasts', scanNoticeToasts], ['claimNoticeToasts', claimNoticeToasts]] as const) {
   if (String(fn).includes('__name')) {
     console.error(`FAIL: ${name} 的 evaluate 回调含 __name(...)，页面端会抛 ReferenceError 并被吞成 false`)
     process.exit(1)

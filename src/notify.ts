@@ -191,6 +191,35 @@ export function describeRateLimitPolicy(policy: RateLimitPolicy | undefined): st
     : `指数 ${formatDuration(base)} 起、单次封顶 ${formatDuration(cap)}`
 }
 
+/** 服务端故障的默认退避基数：首次等 15 秒（后端抖动通常几十秒内恢复）。 */
+export const SERVER_BUSY_BASE_DELAY_MS = 15_000
+
+/** 服务端故障的单次等待上限：2 分钟。 */
+export const SERVER_BUSY_MAX_DELAY_MS = 120_000
+
+/** 服务端故障的默认重试次数：15s + 30s + 60s + 120s ≈ 3.75 分钟。 */
+export const SERVER_BUSY_MAX_RETRIES = 4
+
+/**
+ * 第 `attempt` 次服务端故障后该等多少毫秒（attempt 从 0 开始）。
+ *
+ * 与频控退避刻意分开：频控是账号被判发太快，要等满冷却窗口（分钟级起步）；
+ * 服务端故障是后端过载/重启，恢复得快，等太久只会让用户干坐着。
+ * 曲线：15s → 30s → 60s → 120s（封顶），带 ±20% 抖动。
+ */
+export function serverBusyDelayMs(
+  policy: RateLimitPolicy | undefined,
+  attempt: number,
+  random: () => number = Math.random,
+): number {
+  return rateLimitDelayMs({
+    retryDelayMs: policy?.retryDelayMs ?? SERVER_BUSY_BASE_DELAY_MS,
+    backoff: policy?.backoff ?? 'exponential',
+    retryMaxDelayMs: policy?.retryMaxDelayMs ?? SERVER_BUSY_MAX_DELAY_MS,
+    jitterRatio: policy?.jitterRatio ?? 0.2,
+  }, attempt, random)
+}
+
 /** 失败信息的结构形（LlmError.failure 同形，便于直接传）。 */
 export interface FailureLike {
   readonly code?: string
@@ -205,6 +234,7 @@ export interface FailureLike {
  */
 const FAILURE_HINT: Readonly<Record<string, string>> = Object.freeze({
   WEB_RATE_LIMITED: '网页频控未解除，等 10~15 分钟再发，或先去网页端手动发一条试探',
+  WEB_SERVER_BUSY: '网页服务端暂时不可用（不是账号问题）：插件已自动等待重发仍未恢复，等 1~2 分钟再试即可',
   WEB_ACCOUNT_COOLDOWN: '账号还在频控冷却期，所有会话都已暂停发请求；到点后重试即可',
   WEB_ACCOUNT_BLOCKED: '网页判定账号受限（临时封禁），只能等限制到期；期间别再发请求',
   WEB_LOGIN_EXPIRED: '登录态已失效，请在插件浏览器窗口里重新登录后重试',

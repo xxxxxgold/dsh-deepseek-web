@@ -625,6 +625,74 @@ export const FIELDS: readonly FieldSpec[] = [
   },
 
   {
+    path: ['serverBusy', 'enabled'],
+    group: 'ratelimit',
+    kind: 'boolean',
+    label: { zh: '服务端不可用自动重发', en: 'Retry on server unavailable' },
+    hint: {
+      zh: '网页提示「服务器暂时不可用」或返回 5xx 时，等一会儿自动重发同一条消息。关闭后这类失败会立刻报错。',
+      en: 'When the page says the server is temporarily unavailable or returns 5xx, wait and resend automatically. Off: such failures error out immediately.',
+    },
+  },
+  {
+    path: ['serverBusy', 'retryDelayMs'],
+    group: 'ratelimit',
+    kind: 'number',
+    label: { zh: '服务端故障首次等待（毫秒）', en: 'First delay on server error (ms)' },
+    min: 1000,
+    hint: {
+      zh: '默认 15000（15 秒）。后端抖动通常几十秒内恢复，等太久只是干坐着；指数退避时作为基数。',
+      en: 'Default 15000 (15s). Backend hiccups usually clear within a minute; acts as the base for exponential backoff.',
+    },
+  },
+  {
+    path: ['serverBusy', 'maxRetries'],
+    group: 'ratelimit',
+    kind: 'number',
+    label: { zh: '服务端故障最大重发次数', en: 'Max retries on server error' },
+    min: 0,
+    max: 20,
+    hint: {
+      zh: '默认 4 次（15s + 30s + 60s + 120s ≈ 3.75 分钟）。用尽后才报 WEB_SERVER_BUSY，且不会锁账号冷却。',
+      en: 'Default 4 (15s + 30s + 60s + 120s ≈ 3.75 min). Exhausted retries raise WEB_SERVER_BUSY and never trigger the account cooldown.',
+    },
+  },
+  {
+    path: ['serverBusy', 'retryMaxDelayMs'],
+    group: 'ratelimit',
+    kind: 'number',
+    label: { zh: '服务端故障单次等待上限（毫秒）', en: 'Max single delay on server error (ms)' },
+    min: 1000,
+    hint: {
+      zh: '指数退避封顶，默认 120000（2 分钟）。',
+      en: 'Cap for exponential backoff; default 120000 (2 minutes).',
+    },
+  },
+  {
+    path: ['serverBusy', 'backoff'],
+    group: 'ratelimit',
+    kind: 'select',
+    options: ['exponential', 'fixed'],
+    label: { zh: '服务端故障退避曲线', en: 'Server-error backoff curve' },
+    hint: {
+      zh: 'exponential（默认）：每次翻倍；fixed：每次都等「首次等待」。',
+      en: 'exponential (default): double each time; fixed: always wait the first delay.',
+    },
+  },
+  {
+    path: ['serverBusy', 'jitterRatio'],
+    group: 'ratelimit',
+    kind: 'number',
+    label: { zh: '服务端故障抖动比例（0~0.5）', en: 'Server-error jitter (0–0.5)' },
+    min: 0,
+    max: 0.5,
+    hint: {
+      zh: '默认 0.2（±20%）。',
+      en: 'Default 0.2 (±20%).',
+    },
+  },
+
+  {
     path: ['notify', 'enabled'],
     group: 'notify',
     kind: 'boolean',

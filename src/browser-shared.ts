@@ -31,6 +31,24 @@ export function locateEditor(page: Page): Locator {
 /** 网页端“发送过于频繁/稍后重试”一类频控提示的匹配模式。 */
 export const RATE_LIMIT_PATTERN = /过于频繁|太频繁|发送太快|发送太快了|请.{0,4}稍后.{0,4}(重试|再试)|稍后再试|操作频繁|请求过于|too\s+(many|frequent)|rate[._\s-]?limit(?:ed)?|try\s+again\s+(later|soon)/i
 
+/**
+ * 网页端「服务器暂时不可用 / 服务繁忙」一类**服务端临时故障**的匹配模式。
+ *
+ * 必须与频控严格区分，两者处置方式相反：
+ * - 频控 = 这个账号发得太快，要等 10~15 分钟冷却，继续发会把临时限流拖成封号；
+ * - 服务端故障 = DeepSeek 后端自己过载/重启，跟账号无关，等几十秒到几分钟就恢复。
+ *
+ * 网页上两者都以 toast 出现，而且服务端故障的文案常常带「请稍后重试」——
+ * 早期只按频控判，于是后端抖一下就把账号锁进 10 分钟冷却；而如果完全不认它，
+ * 又会落进 WEB_UNPARSEABLE_RESPONSE（用户看到的正是「本轮运行失败」）。
+ */
+export const SERVER_BUSY_PATTERN = /服务器.{0,10}(不可用|繁忙|开小差|打盹|过载|超时)|服务(暂时|临时)(不可用|繁忙|过载)|服务繁忙|系统繁忙|请求过于繁忙|当前.{0,8}繁忙|暂时无法(提供)?服务|service\s+(is\s+)?(temporarily\s+)?unavailable|server\s+(is\s+)?(busy|overloaded|unavailable)|temporarily\s+unavailable/i
+
+/** 判断一段文本（toast 文案 / 错误体）是否是服务端临时故障提示。 */
+export function looksLikeServerBusyText(text: string): boolean {
+  return SERVER_BUSY_PATTERN.test(text)
+}
+
 /** 判断一段文本（toast 文案）是否是频控提示。 */
 export function looksLikeRateLimitText(text: string): boolean {
   return RATE_LIMIT_PATTERN.test(text)
@@ -45,6 +63,8 @@ export function looksLikeRateLimitText(text: string): boolean {
  */
 export function isRateLimitResponse(status: number, body: string): boolean {
   if (status === 429) return true
+  // 服务端故障文案常带「请稍后重试」，先摘出去，别把后端抖动当成账号频控。
+  if (isServerBusyResponse(status, body)) return false
   const head = body.slice(0, 4_000)
   const isEventStream = /^\s*(data:|event:)/.test(head) || head.includes('\ndata:')
   if (isEventStream) {
@@ -56,6 +76,31 @@ export function isRateLimitResponse(status: number, body: string): boolean {
   const trimmed = body.trim()
   if (trimmed.length === 0 || trimmed.length > 500) return false
   return looksLikeRateLimitText(trimmed)
+}
+
+/**
+ * 服务端临时故障判定：HTTP 502/503/504，或响应体是明确的「服务器暂时不可用」错误帧。
+ *
+ * 只认**明确的错误体**，与频控一样不扫正文：模型正常回答里出现「服务器暂时不可用」
+ * 这句话（比如在讲运维）不该把整轮判成故障。
+ */
+export function isServerBusyResponse(status: number, body: string): boolean {
+  // 网关侧明确的服务不可用：与文案无关
+  if (status === 502 || status === 503 || status === 504) return true
+  const head = body.slice(0, 4_000)
+  const isEventStream = /^\s*(data:|event:)/.test(head) || head.includes('\ndata:')
+  if (isEventStream) {
+    const errorFrame = /"error"\s*:\s*\{[^}]*\}/.exec(head)
+    if (errorFrame !== null) return looksLikeServerBusyText(errorFrame[0])
+    // 网页端另一种错误帧形态：{"type":"error","content":"服务器暂时不可用…"}
+    const typeFrame = /"type"\s*:\s*"error"[^\n]{0,300}/.exec(head)
+    return typeFrame !== null && looksLikeServerBusyText(typeFrame[0])
+  }
+  const trimmed = body.trim()
+  if (trimmed.length === 0 || trimmed.length > 500) return false
+  // 网关错误页（nginx 502 之类）剥标签后只剩一句人话
+  const plain = trimmed.replace(/<[^>]*>/gu, ' ').replace(/\s+/gu, ' ').trim()
+  return looksLikeServerBusyText(plain)
 }
 
 /** 插件自己画在网页右下角的那块浮层的 id（它本身带着频控字眼，必须排除）。 */
@@ -70,6 +115,14 @@ export const PAGE_NOTICE_ID = 'dsh-web-notice'
  * 最后报 WEB_RATE_LIMITED——用户看到的是“网页上什么都没有，却一直失败”。
  */
 export const RATE_LIMIT_SEEN_ATTR = 'data-dsh-rate-limit-seen'
+
+/**
+ * 「服务器暂时不可用」提示的认领标记属性（与频控分开记）。
+ *
+ * 为什么不能复用频控那个属性：两类的判据和处置都不同，共用标记会让一个
+ * 已认领的频控节点顺带把同文案的服务端故障也认领掉，反之亦然。
+ */
+export const SERVER_BUSY_SEEN_ATTR = 'data-dsh-server-busy-seen'
 
 /** 一个候选节点的事实集合（纯数据，便于离线检查覆盖判定规则）。 */
 export interface RateLimitNodeFacts {
@@ -101,24 +154,29 @@ export function shouldCountRateLimitNode(facts: RateLimitNodeFacts): boolean {
   if (facts.childElementCount > 2) return false
   const text = facts.text.trim()
   if (text.length === 0 || text.length > 120) return false
+  // 服务端故障文案也常带「请稍后重试」，命中它就不算频控（处置方式相反）。
+  if (looksLikeServerBusyText(text)) return false
   return looksLikeRateLimitText(text)
 }
 
 /**
- * 页面里是否正显示频控 toast。
+ * 页面内扫描：是否正显示某一类提示（频控 / 服务端不可用）。
  *
- * 与早期版本的区别（都是真实踩过的坑）：
+ * 抽成一个模块级函数，让两类提示共用同一套可见性判据——早期两处各写一份，
+ * 改了一边忘了另一边，线上就出现「页面上明明有提示，却一律判不出来」。
+ *
+ * 判据（都是真实踩过的坑）：
  * 1. 可见性沿祖先链判断（`checkVisibility`），父容器 `display:none` / `opacity:0`
  *    的残留节点不再算“正在显示”；
  * 2. 完全移出视口、零尺寸的节点算已消失；
  * 3. 排除插件自己画的浮层（它的文案本身就能命中原正则，会形成自锁）；
  * 4. 已被之前某一轮认领过的旧节点不再重复计数——只有**这一轮之后新出现的**才算数。
+ *
+ * 注意：函数体会被 `toString()` 后注入页面执行，**不要**在里面写具名函数表达式——
+ * esbuild 的 keepNames 会把它包成 `__name(...)`，而页面里没有这个 helper，
+ * 整个回调会抛错并被 `.catch` 吞成 false。
  */
-export async function hasRateLimitToast(page: Page): Promise<boolean> {
-  // evaluate 回调无法闭包模块常量，把所需常量作为参数传入，保证单一事实来源。
-  // 注意：回调体内**不要**写具名函数表达式——esbuild 的 keepNames 会把它包成
-  // `__name(...)`，而页面里没有这个 helper，整个回调会抛错并被 .catch 吞成 false。
-  return await page.evaluate(params => {
+export function scanNoticeToasts(params: { patternSource: string, seenAttr: string, noticeId: string }): boolean {
     const pattern = new RegExp(params.patternSource, 'i')
     const editors = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [contenteditable="plaintext-only"], [role="textbox"]'))
     const selfPaint = document.getElementById(params.noticeId)
@@ -180,18 +238,34 @@ export async function hasRateLimitToast(page: Page): Promise<boolean> {
         || rect.right <= clipLeft || rect.left >= clipRight)) continue
       return true
     }
-    return false
-  }, { patternSource: RATE_LIMIT_PATTERN.source, seenAttr: RATE_LIMIT_SEEN_ATTR, noticeId: PAGE_NOTICE_ID }).catch(() => false)
+  return false
+}
+
+/** 页面里是否正显示频控 toast。 */
+export async function hasRateLimitToast(page: Page): Promise<boolean> {
+  return await page.evaluate(scanNoticeToasts, {
+    patternSource: RATE_LIMIT_PATTERN.source,
+    seenAttr: RATE_LIMIT_SEEN_ATTR,
+    noticeId: PAGE_NOTICE_ID,
+  }).catch(() => false)
+}
+
+/** 页面里是否正显示「服务器暂时不可用」类提示（与频控分开判定，处置方式相反）。 */
+export async function hasServerBusyToast(page: Page): Promise<boolean> {
+  return await page.evaluate(scanNoticeToasts, {
+    patternSource: SERVER_BUSY_PATTERN.source,
+    seenAttr: SERVER_BUSY_SEEN_ATTR,
+    noticeId: PAGE_NOTICE_ID,
+  }).catch(() => false)
 }
 
 /**
- * 发送前给“此刻页面上已经存在的频控文案节点”打上认领标记。
+ * 页面内认领：给“此刻已经存在的某一类提示节点”打上标记。
  *
- * 语义：从这一轮发送开始，只有**新冒出来**的提示才算新频控。上一轮留下的、
+ * 语义：从这一轮发送开始，只有**新冒出来**的提示才算新提示。上一轮留下的、
  * 或网页历史上早就挂着的，都不会再把本轮拦下来。返回打标记的节点数，仅用于日志。
  */
-export async function markRateLimitToastsSeen(page: Page): Promise<number> {
-  return await page.evaluate(params => {
+export function claimNoticeToasts(params: { patternSource: string, seenAttr: string, noticeId: string }): number {
     const pattern = new RegExp(params.patternSource, 'i')
     const selfPaint = document.getElementById(params.noticeId)
     const elements = Array.from(document.querySelectorAll('div, span, p, section, aside')) as HTMLElement[]
@@ -209,7 +283,29 @@ export async function markRateLimitToastsSeen(page: Page): Promise<number> {
       if (marked >= 50) break
     }
     return marked
-  }, { patternSource: RATE_LIMIT_PATTERN.source, seenAttr: RATE_LIMIT_SEEN_ATTR, noticeId: PAGE_NOTICE_ID }).catch(() => 0)
+}
+
+/**
+ * 发送前给“此刻页面上已经存在的频控文案节点”打上认领标记。
+ *
+ * 少了这一步，上一轮残留的 toast（视觉上消失、节点仍在 DOM 里）会让每一轮
+ * 都在第一拍被判死——网页上明明没有提示，却一直失败。
+ */
+export async function markRateLimitToastsSeen(page: Page): Promise<number> {
+  return await page.evaluate(claimNoticeToasts, {
+    patternSource: RATE_LIMIT_PATTERN.source,
+    seenAttr: RATE_LIMIT_SEEN_ATTR,
+    noticeId: PAGE_NOTICE_ID,
+  }).catch(() => 0)
+}
+
+/** 发送前认领“服务器暂时不可用”类旧节点，避免上一轮的提示把本轮判死。 */
+export async function markServerBusyToastsSeen(page: Page): Promise<number> {
+  return await page.evaluate(claimNoticeToasts, {
+    patternSource: SERVER_BUSY_PATTERN.source,
+    seenAttr: SERVER_BUSY_SEEN_ATTR,
+    noticeId: PAGE_NOTICE_ID,
+  }).catch(() => 0)
 }
 
 export async function ensureChatPage(page: Page, url: string): Promise<void> {

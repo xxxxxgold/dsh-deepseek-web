@@ -29,6 +29,8 @@ import {
   formatNotice,
   noticeEnabled,
   rateLimitDelayMs,
+  serverBusyDelayMs,
+  SERVER_BUSY_MAX_RETRIES,
   type NoticeCategory,
   type NoticeEvent,
 } from './notify.ts'
@@ -44,8 +46,12 @@ import {
   EDITOR_CANDIDATES,
   focusDshWindow,
   hasRateLimitToast,
+  hasServerBusyToast,
   isRateLimitResponse,
+  isServerBusyResponse,
+  looksLikeServerBusyText,
   markRateLimitToastsSeen,
+  markServerBusyToastsSeen,
   PAGE_NOTICE_ID,
   looksLoggedOut,
   looksLoginWall,
@@ -214,6 +220,13 @@ export function parseCompletionBody(body: string): {
   accumulatedUsage?: number
   /** 网页端提示对话长度达到上限（finish_reason=context_length_exceeded）。 */
   contextLengthExceeded?: boolean
+  /**
+   * 网页端提示**服务端临时故障**（「服务器暂时不可用」/ 5xx 错误帧）。
+   *
+   * 与频控分开：这类失败跟账号无关，等一会儿重发就能过；如果当成普通解析失败，
+   * 就会落进 WEB_UNPARSEABLE_RESPONSE（用户看到的正是「本轮运行失败」）。
+   */
+  serverBusy?: boolean
   finishReason?: BrowserTurnResult['finishReason']
 } {
   interface LiveFragment {
@@ -230,6 +243,7 @@ export function parseCompletionBody(body: string): {
   let lastPatchOp = 'APPEND'
   let accumulatedUsage: number | undefined
   let contextLengthExceeded = false
+  let serverBusy = false
   let finishReason: BrowserTurnResult['finishReason']
 
   function observeFinish(value: unknown): void {
@@ -362,6 +376,23 @@ export function parseCompletionBody(body: string): {
       continue
     }
 
+    // 网页端服务端故障提示：{"type":"error","content":"服务器暂时不可用…"}
+    // 或 {"error":{"code":503,"message":"…"}}。必须在正文重建之前拦下：
+    // 否则整个 body 会被当成「解析不出正文」，最终落进 WEB_UNPARSEABLE_RESPONSE。
+    const errorPayload = (json as { error?: unknown }).error
+    if (errorPayload !== undefined || (json as { type?: unknown }).type === 'error') {
+      const errorText = typeof errorPayload === 'string'
+        ? errorPayload
+        : errorPayload !== undefined ? JSON.stringify(errorPayload) : ''
+      const content = String((json as { content?: unknown }).content ?? '')
+      const message = String((json as { message?: unknown }).message ?? '')
+      if (looksLikeServerBusyText(`${errorText} ${content} ${message}`)
+        || /"code"\s*:\s*(502|503|504)\b/u.test(errorText)) {
+        serverBusy = true
+        continue
+      }
+    }
+
     // 网页端长度上限提示：event: hint → {"finish_reason":"context_length_exceeded",…}
     if (
       (json as { finish_reason?: unknown }).finish_reason === 'context_length_exceeded'
@@ -415,6 +446,7 @@ export function parseCompletionBody(body: string): {
       ...finishReason ? { finishReason } : {},
       ...accumulatedUsage !== undefined ? { accumulatedUsage } : {},
       ...contextLengthExceeded ? { contextLengthExceeded: true } : {},
+      ...serverBusy ? { serverBusy: true } : {},
     }
   }
 
@@ -446,6 +478,7 @@ export function parseCompletionBody(body: string): {
         ...finishReason ? { finishReason } : {},
         ...accumulatedUsage !== undefined ? { accumulatedUsage } : {},
         ...contextLengthExceeded ? { contextLengthExceeded: true } : {},
+        ...serverBusy ? { serverBusy: true } : {},
       }
     }
     // 结构化解析一无所获：不可靠，调用方（实时轮询）必须丢弃
@@ -455,15 +488,21 @@ export function parseCompletionBody(body: string): {
       ...finishReason ? { finishReason } : {},
       ...accumulatedUsage !== undefined ? { accumulatedUsage } : {},
       ...contextLengthExceeded ? { contextLengthExceeded: true } : {},
+      ...serverBusy ? { serverBusy: true } : {},
     }
   } catch {
-    // body 不是可解析的结构化载荷（例如误捕获的状态/心跳流）：原始内容不可信
+    // body 不是可解析的结构化载荷（例如误捕获的状态/心跳流）：原始内容不可信。
+    // 但网关错误页 / 纯文本「服务器暂时不可用」要单独认出来——它是可重试的服务端
+    // 故障，而不是「插件没跟上网页改版」，两者给人的提示和处置完全不同。
+    if (!serverBusy && isServerBusyResponse(200, body)) serverBusy = true
     return {
-      text: body.trim(),
+      // 服务端故障帧不是正文：把原始 SSE 塞进 text 会让上层误以为「拿到了回复」。
+      text: serverBusy ? '' : body.trim(),
       reliable: false,
       ...finishReason ? { finishReason } : {},
       ...accumulatedUsage !== undefined ? { accumulatedUsage } : {},
       ...contextLengthExceeded ? { contextLengthExceeded: true } : {},
+      ...serverBusy ? { serverBusy: true } : {},
     }
   }
 }
@@ -1094,17 +1133,79 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     // 默认走指数退避（60s→120s→240s→300s 封顶），覆盖实测 10~15 分钟冷却窗口。
     const rateLimit = this.options.config.rateLimit
     const maxRetries = rateLimit?.enabled === false ? 0 : rateLimit?.maxRetries ?? 4
+    // 服务端临时故障（5xx / 网页「服务器暂时不可用」）：跟账号无关，等一会儿重发即可。
+    // 独立计数、独立退避、不触发账号冷却——把它并进频控会白锁 10 分钟。
+    const serverBusy = this.options.config.serverBusy
+    const busyMaxRetries = serverBusy?.enabled === false
+      ? 0
+      : serverBusy?.maxRetries ?? SERVER_BUSY_MAX_RETRIES
     // 跨回合预算：单回合 maxRetries 只是一层闸；宿主连续续跑时，每回合各重试几次
     // 会叠成几十次请求（竞品记录过 22 分钟 49 次请求随后账号被吊销）。预算活在回合外。
     const budget = this.retryBudget()
     const budgetKey = `deepseek-web:${this.options.config.channel}`
-    for (let attempt = 0; ; attempt++) {
+    let attempt = 0
+    let busyAttempt = 0
+    let busyWaitedMs = 0
+
+    /**
+     * 服务端故障的等待与重发。
+     *
+     * 用尽时抛 WEB_SERVER_BUSY（**不**锁账号冷却）：这是后端的问题，跟这个账号
+     * 有没有被判机器行为毫无关系；锁冷却只会让用户等更久还找不到原因。
+     */
+    const waitForServerRecovery = async (): Promise<void> => {
+      if (busyAttempt >= busyMaxRetries) {
+        throw new LlmError(
+          `deepseek-web: 网页服务端暂时不可用，已自动重试 ${busyMaxRetries} 次仍未恢复`
+          + `${busyWaitedMs > 0 ? `（累计等待 ${formatDuration(busyWaitedMs)}）` : ''}。`
+          + '这是 DeepSeek 后端的问题，跟账号和插件都无关：等 1~2 分钟再试即可。',
+          'WEB_SERVER_BUSY',
+        )
+      }
+      const waitMs = serverBusyDelayMs(serverBusy, busyAttempt)
+      busyWaitedMs += waitMs
+      busyAttempt += 1
+      const delayText = formatDuration(waitMs)
+      console.info(
+        `[deepseek-web] 网页服务端暂时不可用，${delayText} 后自动重发同一条消息`
+        + `（第 ${busyAttempt}/${busyMaxRetries} 次，${describeRateLimitPolicy(serverBusy)}）…`,
+      )
+      this.emitNotice(
+        request,
+        'wait',
+        `网页服务器暂时不可用，${delayText} 后自动重发（第 ${busyAttempt}/${busyMaxRetries} 次）`,
+      )
+      await this.markPageStatus(page, `[dsh 服务端繁忙：${delayText} 后自动重发]`).catch(() => {})
+      await this.waitWithCountdown(page, request, waitMs, busyAttempt, busyMaxRetries)
+      await this.markPageStatus(page, undefined).catch(() => {})
+      this.emitNotice(request, 'retry', `正在第 ${busyAttempt}/${busyMaxRetries} 次重发同一条消息`)
+    }
+
+    while (true) {
       request.signal?.throwIfAborted()
       const outcome = await this.sendAndWait(page, request)
+      // 服务端临时故障先于一切正文判定处理：它可能表现为 5xx 响应，也可能藏在
+      // HTTP 200 的 SSE 里（一个 error 帧）。不拦下来就会落进 WEB_UNPARSEABLE_RESPONSE。
+      if (outcome.kind === 'server-busy') {
+        await waitForServerRecovery()
+        continue
+      }
       if (outcome.kind === 'completed') {
         const parsed = parseCompletionBody(outcome.completion.body)
-        if (outcome.completion.status >= 400) throw new LlmError(
-          `网页返回 HTTP ${outcome.completion.status}，未作为有效回复提交。`, 'WEB_HTTP_ERROR')
+        if (parsed.serverBusy === true) {
+          await waitForServerRecovery()
+          continue
+        }
+        if (outcome.completion.status >= 400) {
+          // 5xx 一律先按服务端故障处理：这类失败跟账号无关，等一会儿重发就能过，
+          // 报成 WEB_HTTP_ERROR 只会让用户以为插件坏了。
+          if (isServerBusyResponse(outcome.completion.status, outcome.completion.body)) {
+            await waitForServerRecovery()
+            continue
+          }
+          throw new LlmError(
+            `网页返回 HTTP ${outcome.completion.status}，未作为有效回复提交。`, 'WEB_HTTP_ERROR')
+        }
         if (!parsed.text && !parsed.reasoning && parsed.contextLengthExceeded !== true
           && !outcome.completion.interrupted && !['max-tokens', 'interrupted'].includes(parsed.finishReason ?? '')) {
           throw new LlmError(
@@ -1158,21 +1259,22 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       }
       const waitMs = rateLimitDelayMs(rateLimit, attempt)
       waitedMs += waitMs
+      attempt += 1
       const delayText = formatDuration(waitMs)
       const jitterPercent = Math.round((rateLimit?.jitterRatio ?? 0.15) * 100)
       console.info(
         `[deepseek-web] 网页提示发送频繁，${delayText} 后自动重发同一条消息`
-        + `（第 ${attempt + 1}/${maxRetries} 次，${describeRateLimitPolicy(rateLimit)}，抖动 ±${jitterPercent}%）…`,
+        + `（第 ${attempt}/${maxRetries} 次，${describeRateLimitPolicy(rateLimit)}，抖动 ±${jitterPercent}%）…`,
       )
       this.emitNotice(
         request,
         'wait',
-        `网页提示发送过于频繁，${delayText} 后自动重发（第 ${attempt + 1}/${maxRetries} 次）`,
+        `网页提示发送过于频繁，${delayText} 后自动重发（第 ${attempt}/${maxRetries} 次）`,
       )
       await this.markPageStatus(page, `[dsh 频控：${delayText} 后自动重发]`).catch(() => {})
-      await this.waitWithCountdown(page, request, waitMs, attempt + 1, maxRetries)
+      await this.waitWithCountdown(page, request, waitMs, attempt, maxRetries)
       await this.markPageStatus(page, undefined).catch(() => {})
-      this.emitNotice(request, 'retry', `正在第 ${attempt + 1}/${maxRetries} 次重发同一条消息`)
+      this.emitNotice(request, 'retry', `正在第 ${attempt}/${maxRetries} 次重发同一条消息`)
     }
   }
 
@@ -1458,7 +1560,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     page: Page,
     request: BrowserTurnRequest,
   ): Promise<
-    { kind: 'completed'; completion: ChatCompletionResponse } | { kind: 'rate-limited' }
+    | { kind: 'completed'; completion: ChatCompletionResponse }
+    | { kind: 'rate-limited' }
+    | { kind: 'server-busy' }
   > {
     // 连续发满 N 轮先静默一阵（防风控），再进入本轮。
     await this.maybeTakeLongRunPause(page, request.signal)
@@ -1554,6 +1658,11 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       const rateLimited = new Promise<{ kind: 'rate-limited' }>(resolve => {
         rateLimitedNow = () => resolve({ kind: 'rate-limited' })
       })
+      // 服务端临时故障走独立信号：它跟账号无关，不能被并进频控（否则会白锁 10 分钟冷却）。
+      let serverBusyNow: (() => void) | undefined
+      const serverBusySignal = new Promise<{ kind: 'server-busy' }>(resolve => {
+        serverBusyNow = () => resolve({ kind: 'server-busy' })
+      })
 
       const editor = locateEditor(page)
       if (!(await editor.isVisible().catch(() => false))) {
@@ -1590,10 +1699,23 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       if (claimedBeforeSend > 0) {
         console.info(`[deepseek-web] 发送前认领 ${claimedBeforeSend} 个已存在的频控文案节点（不计入本轮判定）。`)
       }
+      const claimedBusy = await markServerBusyToastsSeen(page)
+      if (claimedBusy > 0) {
+        console.info(`[deepseek-web] 发送前认领 ${claimedBusy} 个已存在的「服务器不可用」文案节点（不计入本轮判定）。`)
+      }
+      let toastTick = 0
       toastTimer = setInterval(() => {
+        toastTick += 1
         void hasRateLimitToast(page).then(hit => {
           if (hit) rateLimitedNow?.()
         })
+        // 服务端故障提示比 toast 稳定（会一直挂到后端恢复），降到每 3 拍扫一次：
+        // 单次扫描要遍历全页并读 computed style，两个正则都跑满会明显拖慢网页。
+        if (toastTick % 3 === 1) {
+          void hasServerBusyToast(page).then(hit => {
+            if (hit) serverBusyNow?.()
+          })
+        }
       }, RATE_LIMIT_POLL_MS)
 
       request.signal?.throwIfAborted()
@@ -1680,10 +1802,16 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       // 发送动作到这里才算完成（自动模式已确认发出、半自动已填好等人工点）：
       // 从现在开始计“等网页响应”的时间，填字耗时（超长文本可达数分钟）不参与。
       startAckClock()
-      const winner = await Promise.race([waiter, rateLimited, aborted, ackDeadline!])
+      const winner = await Promise.race([waiter, rateLimited, serverBusySignal, aborted, ackDeadline!])
       // 作废 waiter 的 undefined 不会先于 race 落定；防御性兜底按频控处理
       if (winner === undefined) return { kind: 'rate-limited' }
       if ('kind' in winner) return winner
+      // 服务端故障必须先于频控判定：两者文案可能重叠（都带「请稍后重试」），
+      // 但处置相反——判成频控会把账号锁进 10 分钟冷却，而它其实只是后端抖了一下。
+      if (isServerBusyResponse(winner.status, winner.body)) {
+        console.warn(`[deepseek-web] 响应判定为服务端暂时不可用（HTTP ${winner.status}）。`)
+        return { kind: 'server-busy' }
+      }
       // 只认明确的错误体（429 / 非流式短错误文本 / 流里的独立 error 帧）。
       // 早期版本扫正文前 2000 字，一句“失败的话可以稍后再试”就会把整轮判成频控。
       if (isRateLimitResponse(winner.status, winner.body)) {
@@ -1698,7 +1826,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       if (page.isClosed()) {
         throw new LlmError('deepseek-web: 浏览器页面被关闭', 'WEB_PAGE_CLOSED')
       }
-      // 超时兜底：toast 可能出现在两次轮询之间又已消失，最后确认一次
+      // 超时兜底：toast 可能出现在两次轮询之间又已消失，最后确认一次。
+      // 服务端故障先判——它的文案常带「请稍后重试」，被当成频控就会白锁账号。
+      if (await hasServerBusyToast(page)) return { kind: 'server-busy' }
       if (await hasRateLimitToast(page)) return { kind: 'rate-limited' }
       throw new LlmError(
         autoSend
