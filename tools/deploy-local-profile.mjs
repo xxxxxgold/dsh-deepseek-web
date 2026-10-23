@@ -66,13 +66,14 @@ const sourceHash = sha256(sourceLib)
 const sourceBytes = statSync(sourceLib).size
 
 /**
- * tgz 文件名里带产物哈希前缀。
+ * tgz 文件名里带**整包内容**的哈希前缀，打完包才能定名（见下方打包段）。
  *
- * pnpm 对同一个 `file:` 路径会按内容寻址缓存：如果文件名不变，改了代码重装也可能
- * 直接复用 store 里的旧解包结果。把哈希写进文件名，内容一变路径就变，pnpm 必然
- * 重新解包，避免「改了、装了、还是旧代码」这种最难查的假修复。
+ * pnpm 对同一个 `file:` 路径按内容寻址缓存：文件名不变就复用 store 里的旧解包结果。
+ * 早先这里只哈希 `lib/index.js`，于是「只改了 README / INSTALL / tools / 文档」的
+ * 提交会拿到同一个 tgz 名 —— pnpm 判定 Already up to date，profile 里永远是旧文档。
+ * 现在改为哈希整个 tgz（`npm pack` 对同样内容逐字节稳定），任何文件变动都会换名。
  */
-const TGZ_NAME = `${PACKAGE}-${pkg.version}-${sourceHash.slice(0, 12)}.tgz`
+const TGZ_PREFIX = `${PACKAGE}-${pkg.version}-`
 
 
 /** DSH 自带的 pnpm（存在就用它，保证与宿主的 pnpm 版本、store 一致）。 */
@@ -120,14 +121,14 @@ const profiles = readdirSync(profilesRoot, { withFileTypes: true })
 
 // ── 1. 打包（只打一次，所有 profile 共用同一份 tgz）─────────────────────────
 const stashDir = join(profilesRoot, '_local-pkgs')
-const stashTgz = join(stashDir, TGZ_NAME)
+let tgzName = `${TGZ_PREFIX}<整包哈希>.tgz`
+let stashTgz = ''
 
 if (args.dryRun) {
-  console.info(`[deploy] [dry-run] 会执行 npm-pack 生成 ${TGZ_NAME}（源 ${sourceBytes} 字节，sha256 ${sourceHash.slice(0, 16)}…）`)
+  console.info(`[deploy] [dry-run] 会执行 npm-pack，并按整个 tgz 的 sha256 定名为 ${TGZ_PREFIX}<12 位哈希>.tgz（源 lib/index.js ${sourceBytes} 字节，sha256 ${sourceHash.slice(0, 16)}…）`)
 } else {
   mkdirSync(stashDir, { recursive: true })
   const tmpDir = join(stashDir, '.pack-tmp')
-  mkdirSync(tmpDir, { recursive: true })
   console.info('[deploy] 打包…')
   rmSync(tmpDir, { recursive: true, force: true })
   mkdirSync(tmpDir, { recursive: true })
@@ -136,17 +137,22 @@ if (args.dryRun) {
     stdio: 'inherit',
     shell: true,
   })
-  // npm pack 只会输出 <name>-<version>.tgz（忽略我们想要的哈希后缀），
-  // 所以打包完成后取那个文件、按产物哈希改名，再作为本次部署的 tgz。
+  // npm pack 只会输出 <name>-<version>.tgz（没有我们要的哈希后缀），所以先打包、
+  // 再按**整个 tgz 的 sha256** 改名：README / INSTALL / tools 的改动同样会换名，
+  // 不会因为 lib 字节没变而被 pnpm 判定 Already up to date。
   const packedTgz = readdirSync(tmpDir).filter(name => name.endsWith('.tgz'))
   if (packedTgz.length !== 1) fail(`打包产物异常：${tmpDir} 下找到 ${packedTgz.length} 个 tgz（${packedTgz.join('、') || '无'}）`)
-  copyFileSync(join(tmpDir, packedTgz[0]), stashTgz)
+  const packedPath = join(tmpDir, packedTgz[0])
+  const tgzHash = sha256(packedPath)
+  tgzName = `${TGZ_PREFIX}${tgzHash.slice(0, 12)}.tgz`
+  stashTgz = join(stashDir, tgzName)
+  copyFileSync(packedPath, stashTgz)
   rmSync(tmpDir, { recursive: true, force: true })
-  console.info(`[deploy] tgz 就位：${stashTgz}（${statSync(stashTgz).size} 字节）`)
+  console.info(`[deploy] tgz 就位：${stashTgz}（${statSync(stashTgz).size} 字节，sha256 ${tgzHash.slice(0, 16)}…）`)
 }
 
 // ── 2. 逐 profile 改依赖声明并安装 ────────────────────────────────────────
-const spec = `file:../_local-pkgs/${TGZ_NAME}`
+const spec = `file:../_local-pkgs/${tgzName}`
 const pnpm = resolvePnpm()
 let deployed = 0
 let skipped = 0
@@ -210,6 +216,20 @@ for (const profile of profiles) {
   const text = readFileSync(target, 'utf8')
   const build = /const BUILD = "([^"]+)"/u.exec(text)?.[1] ?? '(无构建标识)'
   console.info(`[deploy]   ✓ ${statSync(target).size} 字节，sha256 ${targetHash.slice(0, 16)}…，构建标识 ${build}`)
+
+  // 文档也要跟着走：以前只校验 lib，纯文档提交会静默留在旧版本，装完看到的还是旧说明。
+  for (const doc of ['README.md', 'INSTALL.md']) {
+    const repoDoc = join(repoRoot, doc)
+    const instDoc = join(installedDir, doc)
+    if (!existsSync(repoDoc)) continue
+    if (!existsSync(instDoc)) {
+      fail(`profile=${profile} 装进去的包里没有 ${doc}`)
+    }
+    if (sha256(instDoc) !== sha256(repoDoc)) {
+      fail(`profile=${profile} 的 ${doc} 与仓库不一致，部署未生效（检查 tgz 是否复用了缓存）`)
+    }
+  }
+  console.info('[deploy]   ✓ README.md / INSTALL.md 与仓库一致')
   deployed++
 }
 
