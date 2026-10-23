@@ -14,3 +14,6 @@ node_modules/
 AGENTS.md
 .gitattributes
 tmp/
+
+# 本机 OPS 面板会话产物（不属于插件源码）
+.dsh-ops/
