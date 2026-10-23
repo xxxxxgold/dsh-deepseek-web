@@ -1,6 +1,6 @@
 # 中文安装速查
 
-本项目发行包：`dsh-deepseek-web-littlecar30@0.6.0`，适用于 dsh 桌面版 0.2+。
+本项目发行包：`dsh-deepseek-web-xxxxxgold@0.6.0`，适用于 dsh 桌面版 0.2+。
 
 ## 新用户：在桌面版输入包名安装
 
@@ -10,7 +10,7 @@
 4. 选择 `deepseek-web`，在插件自动打开的 Edge 窗口登录 DeepSeek。
 
 ```text
-dsh-deepseek-web-littlecar30@0.6.0
+dsh-deepseek-web-xxxxxgold@0.6.0
 ```
 
 无需安装 Node.js、克隆源码或手改配置文件。安装包内已带 host/client 编译产物。
@@ -20,16 +20,16 @@ dsh-deepseek-web-littlecar30@0.6.0
 
 插件管理界面目前不支持自动更新。先记下自定义配置，在插件页卸载旧版，
 再按上面步骤安装并重启。0.2.12 及以前包名为 `dsh-deepseek-web`，
-0.2.13 起包名为 `dsh-deepseek-web-littlecar30`，不要同时启用两者。
+0.2.13 起包名为 `dsh-deepseek-web-xxxxxgold`，不要同时启用两者。
 卸载保留 `%LOCALAPPDATA%\DshDeepSeekWeb\` 中的浏览器登录态和运行数据；不用删除状态文件。
 安装后打开 **设置 → DeepSeek 网页** 检查自定义设置（插件详情里 `llm-deepseek-web` 行的 **配置** 是同一份表单）。
 
 ## 其他安装入口与常见问题
 
-- **GitHub 链接**：在「添加插件」粘贴 `https://github.com/LittleCar30/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-littlecar30-0.6.0.tgz`。
-- **本地安装包**：从 [Release](https://github.com/LittleCar30/dsh-deepseek-web/releases/latest) 下载 `.tgz`，
-  在「添加插件」输入框粘贴完整绝对路径，例如 `C:\Users\你的用户名\Downloads\dsh-deepseek-web-littlecar30-0.6.0.tgz`。
-- **npm（已发布）**：[发行页](https://www.npmjs.com/package/dsh-deepseek-web-littlecar30)，在「添加插件」填 `dsh-deepseek-web-littlecar30@0.6.0`。
+- **GitHub 链接**：在「添加插件」粘贴 `https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-xxxxxgold-0.6.0.tgz`。
+- **本地安装包**：从 [Release](https://github.com/xxxxxgold/dsh-deepseek-web/releases/latest) 下载 `.tgz`，
+  在「添加插件」输入框粘贴完整绝对路径，例如 `C:\Users\你的用户名\Downloads\dsh-deepseek-web-xxxxxgold-0.6.0.tgz`。
+- **npm（已发布）**：[发行页](https://www.npmjs.com/package/dsh-deepseek-web-xxxxxgold)，在「添加插件」填 `dsh-deepseek-web-xxxxxgold@0.6.0`。
   刚发布时选 npm 官方源；中国大陆镜像源可能尚未同步。
 - **不能安装 `dsh-deepseek-web`**：npm 上这个名字属于另一位作者，不是本项目；务必使用完整新名字或本项目 Release 链接。
 - **下载失败**：安装界面展开「查看安装详情」查看原因。npm 镜像可帮助下载依赖，不能代替访问 GitHub。
@@ -45,7 +45,7 @@ dsh-deepseek-web-littlecar30@0.6.0
 只有选择 `browser: attach` 时，才需要手动启动 CDP 浏览器：
 
 ```bash
-node node_modules/dsh-deepseek-web-littlecar30/tools/browser-keeper.mjs --port 9333
+node node_modules/dsh-deepseek-web-xxxxxgold/tools/browser-keeper.mjs --port 9333
 ```
 
 启动桌面版后，模型选择 `deepseek-web`；默认发送模式需要用户在网页中人工点击“发送”。
@@ -70,8 +70,8 @@ node node_modules/dsh-deepseek-web-littlecar30/tools/browser-keeper.mjs --port 9
 Kimi / GLM 需要先运行对应的登录工具，并保持审核浏览器的 CDP 端口可用：
 
 ```bash
-node node_modules/dsh-deepseek-web-littlecar30/tools/open-login-kimi.mjs
-node node_modules/dsh-deepseek-web-littlecar30/tools/open-login-glm.mjs
+node node_modules/dsh-deepseek-web-xxxxxgold/tools/open-login-kimi.mjs
+node node_modules/dsh-deepseek-web-xxxxxgold/tools/open-login-glm.mjs
 ```
 
 ## 验证安装

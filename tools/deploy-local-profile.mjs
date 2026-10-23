@@ -4,13 +4,13 @@
  * 为什么需要这个脚本
  * ------------------
  * 桌面 DSH 加载的是
- *   ~/.dsh/profiles/<profile>/node_modules/dsh-deepseek-web-littlecar30/lib/index.js
+ *   ~/.dsh/profiles/<profile>/node_modules/dsh-deepseek-web-xxxxxgold/lib/index.js
  * 这份「已安装副本」与开发目录（本仓库 lib/）是两个独立文件，互不关联。只在仓库里
  * `npm run build` 再重启 dsh，加载的仍然是旧副本——这就是「明明改了代码、重启了、
  * 线上还是老行为」的第一重根因。
  *
  * 第二重根因（本脚本要堵死的）：profile 里的依赖原来声明成
- *   "dsh-deepseek-web-littlecar30": "github:xxxxxgold/dsh-deepseek-web"
+ *   "dsh-deepseek-web-xxxxxgold": "github:xxxxxgold/dsh-deepseek-web"
  * 插件管理器任何一次 pnpm 安装/更新都会按这个声明从 GitHub 重新拉上游 tarball，
  * 把本地构建整个覆盖回旧版本。于是「修好了 → 某次装插件 → 又坏了」，表现和
  * 「根本没修」一模一样。
@@ -51,7 +51,7 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const PACKAGE = 'dsh-deepseek-web-littlecar30'
+const PACKAGE = 'dsh-deepseek-web-xxxxxgold'
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'))
 const sourceLib = join(repoRoot, 'lib', 'index.js')

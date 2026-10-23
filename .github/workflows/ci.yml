@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tarball=$(ls dsh-deepseek-web-littlecar30-*.tgz | head -n 1)
+          tarball=$(ls dsh-deepseek-web-xxxxxgold-*.tgz | head -n 1)
           echo "tarball: $tarball"
           smoke="$RUNNER_TEMP/pack-smoke"
           rm -rf "$smoke"
@@ -58,7 +58,7 @@ jobs:
           npm init -y >/dev/null
           npm install --no-audit --no-fund "$GITHUB_WORKSPACE/$tarball"
           for f in lib/index.js lib/client.js dsh.patch.yml cordis.yml README.md CHANGELOG.md; do
-            test -f "node_modules/dsh-deepseek-web-littlecar30/$f" || { echo "missing $f in tarball"; exit 1; }
+            test -f "node_modules/dsh-deepseek-web-xxxxxgold/$f" || { echo "missing $f in tarball"; exit 1; }
           done
           echo "pack smoke OK"
 

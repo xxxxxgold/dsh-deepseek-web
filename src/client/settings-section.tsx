@@ -14,7 +14,7 @@
  * 菜单只在设置壳在场时出现（`ctx.slots.inject('settings.section', …)`），
  * 文案走 `ctx.locale` 的 zh/en 字典，导航标签只占一个短词。
  *
- * @module dsh-deepseek-web-littlecar30/client/settings-section
+ * @module dsh-deepseek-web-xxxxxgold/client/settings-section
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'

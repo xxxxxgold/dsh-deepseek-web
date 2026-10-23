@@ -1,5 +1,5 @@
 /**
- * dsh-deepseek-web-littlecar30 插件的浏览器半侧。
+ * dsh-deepseek-web-xxxxxgold 插件的浏览器半侧。
  *
  * 这里注册两处界面与一个兜底：
  *
@@ -12,7 +12,7 @@
  * 0.1 时代的 `ctx.settingsScope` / `SettingsScope` / `settings.plugin.item` 在 0.2 中已全部移除，
  * 由上面两处取代。
  *
- * @module dsh-deepseek-web-littlecar30/client
+ * @module dsh-deepseek-web-xxxxxgold/client
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 // 类型-only：拉起 ctx.slots / ctx.sessions / ctx.uiConversation / ctx.configForms / ctx.locale
@@ -46,7 +46,7 @@ export function apply(ctx: ClientContext): void {
     registerSettingsSection(sub as unknown as SettingsSectionContext)
   })
 
-  // 配置页：侧栏「插件」页 → 组合包 dsh-deepseek-web-littlecar30 → 行 llm-deepseek-web 上多出「配置」入口
+  // 配置页：侧栏「插件」页 → 组合包 dsh-deepseek-web-xxxxxgold → 行 llm-deepseek-web 上多出「配置」入口
   ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
     name: 'plugins.row.config',
     key: ROW_CONFIG_KEY,

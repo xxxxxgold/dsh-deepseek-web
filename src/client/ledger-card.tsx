@@ -8,7 +8,7 @@
  * 卡片是**纯只读**的：不写配置、不触发保存、不影响草稿。取不到数据时只显示
  * 一行说明（老宿主没有 `webServer` 服务，或桌面壳没暴露该端口），绝不弹错。
  *
- * @module dsh-deepseek-web-littlecar30/client/ledger-card
+ * @module dsh-deepseek-web-xxxxxgold/client/ledger-card
  */
 
 import { useCallback, useEffect, useState } from 'react'

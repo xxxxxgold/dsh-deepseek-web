@@ -1,5 +1,5 @@
 {
-  "name": "dsh-deepseek-web-littlecar30",
+  "name": "dsh-deepseek-web-xxxxxgold",
   "description": "DeepSeek Harness 桌面版网页通道插件：通过真实 Edge/Chrome 使用 DeepSeek 免费网页版，支持可选 Kimi/GLM 审核和中文配置页。",
   "version": "0.6.0",
   "type": "module",
@@ -108,13 +108,13 @@
     "typescript": "^5.9.3"
   },
   "license": "MIT",
-  "author": "LittleCar30",
+  "author": "xxxxxgold",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/LittleCar30/dsh-deepseek-web.git"
+    "url": "git+https://github.com/xxxxxgold/dsh-deepseek-web.git"
   },
-  "homepage": "https://github.com/LittleCar30/dsh-deepseek-web#readme",
+  "homepage": "https://github.com/xxxxxgold/dsh-deepseek-web#readme",
   "bugs": {
-    "url": "https://github.com/LittleCar30/dsh-deepseek-web/issues"
+    "url": "https://github.com/xxxxxgold/dsh-deepseek-web/issues"
   }
 }

@@ -6,7 +6,7 @@
  *
  * 所有颜色、圆角都取宿主主题变量，深浅色主题自动跟随；变量缺失时给同语义回退值。
  *
- * @module dsh-deepseek-web-littlecar30/client/settings-styles
+ * @module dsh-deepseek-web-xxxxxgold/client/settings-styles
  */
 
 /** 样式元素 id：重复挂载时复用它，避免 HMR 或多次激活堆叠。 */

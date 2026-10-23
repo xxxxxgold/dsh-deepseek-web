@@ -8,7 +8,7 @@
 
 真实 Edge / Chrome · 半自动与全自动 · 默认只展示结果 · 可选 Kimi / GLM 审核
 
-[![npm](https://img.shields.io/npm/v/dsh-deepseek-web-littlecar30?style=flat-square&color=168c92&label=npm)](https://www.npmjs.com/package/dsh-deepseek-web-littlecar30) [![Release](https://img.shields.io/github/v/release/LittleCar30/dsh-deepseek-web?style=flat-square&color=477cce&label=release)](https://github.com/LittleCar30/dsh-deepseek-web/releases/latest) [![License](https://img.shields.io/badge/license-MIT-69798b?style=flat-square)](LICENSE) [![DSH](https://img.shields.io/badge/DSH-community_plugin-6b74b4?style=flat-square)](https://github.com/deepseek-ai/deepseek-harness)
+[![npm](https://img.shields.io/npm/v/dsh-deepseek-web-xxxxxgold?style=flat-square&color=168c92&label=npm)](https://www.npmjs.com/package/dsh-deepseek-web-xxxxxgold) [![Release](https://img.shields.io/github/v/release/xxxxxgold/dsh-deepseek-web?style=flat-square&color=477cce&label=release)](https://github.com/xxxxxgold/dsh-deepseek-web/releases/latest) [![License](https://img.shields.io/badge/license-MIT-69798b?style=flat-square)](LICENSE) [![DSH](https://img.shields.io/badge/DSH-community_plugin-6b74b4?style=flat-square)](https://github.com/deepseek-ai/deepseek-harness)
 
 [快速安装](#quick-start) · [功能一览](#features) · [工作原理](#how-it-works) · [常见问题](#faq) · [更新记录](CHANGELOG.md) · [赞助支持](#sponsor)
 
@@ -26,14 +26,14 @@
 4. 选择 `deepseek-web`，在自动打开的浏览器窗口登录 DeepSeek；网页填入消息后，点击发送。
 
 ```text
-dsh-deepseek-web-littlecar30
+dsh-deepseek-web-xxxxxgold
 ```
 
-当前正式版为 **0.6.0**。需要固定版本时，填 `dsh-deepseek-web-littlecar30@0.6.0`。
+当前正式版为 **0.6.0**。需要固定版本时，填 `dsh-deepseek-web-xxxxxgold@0.6.0`。
 希望消息填入后自动发送，可改选 `deepseek-web-auto`。
 
 > [!IMPORTANT]
-> 本项目的 npm 包名是 **`dsh-deepseek-web-littlecar30`**。
+> 本项目的 npm 包名是 **`dsh-deepseek-web-xxxxxgold`**。
 > npm 的 `dsh-deepseek-web` 属于另一位作者，不是本仓库的发行包。
 > 从本项目旧版升级时，先记下自定义设置、卸载旧包，再安装新版并重启。
 > 不要同时启用新旧包；正常卸载保留浏览器登录态和运行数据。
@@ -44,13 +44,13 @@ dsh-deepseek-web-littlecar30
 在同一个「添加插件」输入框粘贴发行包链接，也可以安装：
 
 ```text
-https://github.com/LittleCar30/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-littlecar30-0.6.0.tgz
+https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-xxxxxgold-0.6.0.tgz
 ```
 
-或从 [Release](https://github.com/LittleCar30/dsh-deepseek-web/releases/latest) 下载 `.tgz`，粘贴文件的完整绝对路径，例如：
+或从 [Release](https://github.com/xxxxxgold/dsh-deepseek-web/releases/latest) 下载 `.tgz`，粘贴文件的完整绝对路径，例如：
 
 ```text
-C:\Users\你的用户名\Downloads\dsh-deepseek-web-littlecar30-0.6.0.tgz
+C:\Users\你的用户名\Downloads\dsh-deepseek-web-xxxxxgold-0.6.0.tgz
 ```
 
 发行包已包含 host/client 编译产物。安装依赖仍需要网络；镜像尚未同步时选择 npm 官方源。
@@ -87,7 +87,7 @@ C:\Users\你的用户名\Downloads\dsh-deepseek-web-littlecar30-0.6.0.tgz
 两个入口读写同一份配置：
 
 - **设置 → DeepSeek 网页**（推荐）：按「网页连接 / 网页模型与发送 / 风控模式 / 图片直传 / 审核通道 / 频控自动重发 / 过程提示 / 浏览器自愈 / 登录探活 / 工具与委托 / 窗口聚焦 / 压缩摘要」十二组排布，常用参数一页改完（回合超时、锁租约等进阶字段仍走 profile patch，见[进阶文档](docs/ADVANCED.md#配置)）。
-- **插件 → `dsh-deepseek-web-littlecar30` → `llm-deepseek-web` → 配置**：插件管理器里的同一份表单。
+- **插件 → `dsh-deepseek-web-xxxxxgold` → `llm-deepseek-web` → 配置**：插件管理器里的同一份表单。
 
 页面上的行为：
 
@@ -217,7 +217,7 @@ chat.deepseek.com 一致。插件不自己拼上传接口，只触发网页端�
 <details>
 <summary><b>安装失败，或者安装后没有模型？</b></summary>
 
-先确认包名是 `dsh-deepseek-web-littlecar30`，安装源选择 npm 官方源。
+先确认包名是 `dsh-deepseek-web-xxxxxgold`，安装源选择 npm 官方源。
 安装后点击「立即启用」并重启；在插件页检查 `llm-deepseek-web` 是否启用、有没有错误。
 
 如果下载 GitHub 链接失败，可改用 npm 包名安装。
@@ -281,7 +281,7 @@ RELEASING.md         维护者发布流程
 
 ## 反馈问题
 
-通过 [GitHub Issues](https://github.com/LittleCar30/dsh-deepseek-web/issues) 提供插件与 dsh 版本、
+通过 [GitHub Issues](https://github.com/xxxxxgold/dsh-deepseek-web/issues) 提供插件与 dsh 版本、
 使用的发送模式、复现步骤，以及相关错误或最后一段回复。日志中的登录凭证请先隐藏。
 
 <a id="sponsor"></a>

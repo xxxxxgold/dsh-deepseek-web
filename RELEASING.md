@@ -1,7 +1,7 @@
 # 维护者发布流程
 
-本仓库的 npm 包名为 `dsh-deepseek-web-littlecar30`，GitHub 仓库为
-`LittleCar30/dsh-deepseek-web`。npm 的 `dsh-deepseek-web` 属于其他作者，不能用于本项目发布。
+本仓库的 npm 包名为 `dsh-deepseek-web-xxxxxgold`，GitHub 仓库为
+`xxxxxgold/dsh-deepseek-web`。npm 的 `dsh-deepseek-web` 属于其他作者，不能用于本项目发布。
 
 ## 发布前
 
@@ -17,7 +17,7 @@
 ```bash
 npm login --auth-type=web --registry=https://registry.npmjs.org
 npm whoami --registry=https://registry.npmjs.org
-npm publish ./dsh-deepseek-web-littlecar30-0.6.0.tgz --access public --tag latest --registry=https://registry.npmjs.org
+npm publish ./dsh-deepseek-web-xxxxxgold-0.6.0.tgz --access public --tag latest --registry=https://registry.npmjs.org
 ```
 
 登录应在保持运行的交互终端中完成；临时登录链接失效时重新发起登录。
@@ -27,7 +27,7 @@ npm publish ./dsh-deepseek-web-littlecar30-0.6.0.tgz --access public --tag lates
 确认 npm 返回发布成功后，再查询公开注册表验证版本、仓库信息和安装包完整性：
 
 ```bash
-npm view dsh-deepseek-web-littlecar30 version dist-tags repository dist.integrity --json --registry=https://registry.npmjs.org
+npm view dsh-deepseek-web-xxxxxgold version dist-tags repository dist.integrity --json --registry=https://registry.npmjs.org
 ```
 
 之后将 README / INSTALL 的 npm 入口改为已发布状态。刚发布的版本优先使用官方源，镜像可能稍后同步。

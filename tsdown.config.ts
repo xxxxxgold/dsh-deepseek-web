@@ -1,12 +1,12 @@
 /**
- * Standalone client bundle build for the dsh-deepseek-web-littlecar30 plugin.
+ * Standalone client bundle build for the dsh-deepseek-web-xxxxxgold plugin.
  * The client entry imports only React at runtime; dsh services are type-only
  * imports supplied by the desktop host. Keeping this config self-contained
  * lets the plugin rebuild after the upstream dsh source checkout is removed.
  */
 import { fileURLToPath } from 'node:url'
 
-const ID = 'dsh-deepseek-web-littlecar30'
+const ID = 'dsh-deepseek-web-xxxxxgold'
 const externals = new Set<string>(['react', 'react/jsx-runtime'])
 
 export default {

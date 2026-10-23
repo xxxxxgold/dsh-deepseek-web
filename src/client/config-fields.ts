@@ -7,7 +7,7 @@
  * 这里的字段都必须在 `src/config.ts` 里标了 `.volatile()`，否则宿主的
  * `settings.describe()` 不会把它们投影进可写命名空间。
  *
- * @module dsh-deepseek-web-littlecar30/client/config-fields
+ * @module dsh-deepseek-web-xxxxxgold/client/config-fields
  */
 
 /** 一步路径，对应 Host settings 写入操作的 `path`。 */

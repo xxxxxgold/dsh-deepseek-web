@@ -7,7 +7,7 @@
 已配置 dsh CLI 时，可以用官方插件管理命令安装同一个包：
 
 ```bash
-dsh plugin --profile desktop add https://github.com/LittleCar30/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-littlecar30-0.6.0.tgz
+dsh plugin --profile desktop add https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-xxxxxgold-0.6.0.tgz
 ```
 
 仅在需要手工管理 profile 时，把以下字段合并到现有清单，保留原有依赖和 bundles：
@@ -15,11 +15,11 @@ dsh plugin --profile desktop add https://github.com/LittleCar30/dsh-deepseek-web
 ```json
 {
   "dependencies": {
-    "dsh-deepseek-web-littlecar30": "https://github.com/LittleCar30/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-littlecar30-0.6.0.tgz"
+    "dsh-deepseek-web-xxxxxgold": "https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-xxxxxgold-0.6.0.tgz"
   },
   "dsh": {
     "profile": {
-      "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-deepseek-web-littlecar30"]
+      "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-deepseek-web-xxxxxgold"]
     }
   }
 }
@@ -27,7 +27,7 @@ dsh plugin --profile desktop add https://github.com/LittleCar30/dsh-deepseek-web
 
 之后在该 profile 目录执行宿主使用的包管理器安装命令，再重启。
 本地文件使用 `file:` 绝对路径。包内的 `dsh.bundle.patch` 会自动加载 host/client。
-手动 patch 启动和源码开发可用 `dsh web --patch node_modules/dsh-deepseek-web-littlecar30/dsh.patch.yml`；
+手动 patch 启动和源码开发可用 `dsh web --patch node_modules/dsh-deepseek-web-xxxxxgold/dsh.patch.yml`；
 普通桌面版安装不需要这一步。
 
 ## 首次使用
@@ -40,7 +40,7 @@ dsh plugin --profile desktop add https://github.com/LittleCar30/dsh-deepseek-web
 如果选择 `browser: attach`，才需要先启动带 CDP 端口的外部浏览器：
 
 ```bash
-node node_modules/dsh-deepseek-web-littlecar30/tools/browser-keeper.mjs \
+node node_modules/dsh-deepseek-web-xxxxxgold/tools/browser-keeper.mjs \
   --profile "%LOCALAPPDATA%\DshDeepSeekWeb\edge-profile" \
   --port 9333 --url https://chat.deepseek.com
 ```
@@ -71,7 +71,7 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 ## 配置
 
 配置入口有两个：**设置 → DeepSeek 网页**（12 组 59 项常用参数，保存即写回 profile 的
-`cordis.patch.yml`），以及桌面版“插件”页面 → `dsh-deepseek-web-littlecar30` →
+`cordis.patch.yml`），以及桌面版“插件”页面 → `dsh-deepseek-web-xxxxxgold` →
 `llm-deepseek-web` → “配置”（同一份表单）。下表的进阶字段（回合/流超时、锁租约等）
 仍没有表单入口，直接在 patch 的 `config` 中写入；**并发上限、标签页上限、防风控停顿、
 账号冷却、工具目录预算、登录探活** 已并入表单，其中防风控相关项集中在「风控模式」分组，
@@ -135,7 +135,7 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `review.sendRetries` | `2` | 发送未被确认时的重试轮数（每轮 = 回车 + 点发送按钮兜底） |
 | `review.fetchRetries` | `1` | 获取回复失败后的自动重试次数（`0` 关闭）；每次重试前都会丢弃旧连接并重新连浏览器 |
 
-完整字段和默认值见 [`src/config.ts`](https://github.com/LittleCar30/dsh-deepseek-web/blob/main/src/config.ts)。配置文件中的 profile、状态和
+完整字段和默认值见 [`src/config.ts`](https://github.com/xxxxxgold/dsh-deepseek-web/blob/main/src/config.ts)。配置文件中的 profile、状态和
 校准数据默认保存在 `%LOCALAPPDATA%\DshDeepSeekWeb\`，不会写入插件安装目录。
 
 ### 会话隔离、并发上限与排队
@@ -227,10 +227,10 @@ warning，不假装全绿。
 登录和协议检查工具都在 `tools/`：
 
 ```bash
-node node_modules/dsh-deepseek-web-littlecar30/tools/open-login-kimi.mjs
-node node_modules/dsh-deepseek-web-littlecar30/tools/inspect-kimi.mjs
-node node_modules/dsh-deepseek-web-littlecar30/tools/open-login-glm.mjs
-node node_modules/dsh-deepseek-web-littlecar30/tools/glm-status.mjs --turn
+node node_modules/dsh-deepseek-web-xxxxxgold/tools/open-login-kimi.mjs
+node node_modules/dsh-deepseek-web-xxxxxgold/tools/inspect-kimi.mjs
+node node_modules/dsh-deepseek-web-xxxxxgold/tools/open-login-glm.mjs
+node node_modules/dsh-deepseek-web-xxxxxgold/tools/glm-status.mjs --turn
 ```
 
 审核证据会优先读取工具实际写入的文件，并在达到 `maxEvidenceChars` 时标注截断。
