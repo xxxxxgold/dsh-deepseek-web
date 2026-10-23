@@ -181,15 +181,29 @@ export function validateActions(
   return problems
 }
 
-/** 剥掉 ```json ... ``` 以及模型可能带上的前后缀，找到最靠后的 JSON 对象。 */
+/** 病态输入下最多尝试的候选起点数（前 N + 后 N），防止退化成 O(n²)。 */
+const MAX_JSON_STARTS = 32
+
+/** 剥掉 ```json ... ``` 以及模型可能带上的前后缀，找到最靠前的可解析 JSON 对象。 */
 export function extractJsonObject(text: string): unknown | undefined {
   let candidate = text.trim()
   // 去掉整体围栏
   const fenced = candidate.match(/^```(?:json)?\s*([\s\S]*?)```\s*$/i)
   if (fenced) candidate = fenced[1]!.trim()
 
-  // 模型偶发把 JSON 放在 prose 中间：直接找最长的 { ... } 平衡段
-  for (let start = candidate.indexOf('{'); start >= 0; start = candidate.indexOf('{', start + 1)) {
+  // 收集所有 `{` 起点；数量过多时只取首尾两批（工具调用通常在开头或末尾）。
+  // 旧实现对每个起点都重扫到文本结尾，正文含大量未闭合 `{` 时会退化成 O(n²)。
+  if (!candidate.includes('}')) return undefined
+  const starts: number[] = []
+  for (let i = candidate.indexOf('{'); i >= 0; i = candidate.indexOf('{', i + 1)) starts.push(i)
+  if (starts.length === 0) return undefined
+  const ordered =
+    starts.length <= MAX_JSON_STARTS * 2
+      ? starts
+      : [...new Set([...starts.slice(0, MAX_JSON_STARTS), ...starts.slice(-MAX_JSON_STARTS)])]
+
+  // 每个起点都从括号/字符串的干净状态起算，保证与旧实现同语义（孤立引号不会污染后续候选）。
+  for (const start of ordered) {
     let depth = 0
     let inString = false
     let escape = false
