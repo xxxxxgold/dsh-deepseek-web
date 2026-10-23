@@ -9,7 +9,7 @@ import type { BrowserChannel, BrowserTurnRequest, BrowserTurnResult } from '../s
 import { PlaywrightBrowserChannel, parseCompletionBody } from '../src/playwright-channel.ts'
 import { Config } from '../src/config.ts'
 import { liveConfig } from '../src/live-config.ts'
-import { buildAuxiliaryPrompt, renderNewWebMessages } from '../src/protocol.ts'
+import { buildAuxiliaryPrompt, renderNewWebMessages, WEB_MARKERS } from '../src/protocol.ts'
 import { looksLikeUnfinishedHandoff } from '../src/response.ts'
 import { AsyncLock } from '../src/async-lock.ts'
 
@@ -124,7 +124,7 @@ try {
   await consume(adapter, options(resumed))
   const prompt = channel.ordinary.at(-1)!
   assert.equal(prompt.initialize, true)
-  assert.ok(prompt.text.includes('<compacted-summary>') && prompt.text.includes('历史助手回复'))
+  assert.ok(prompt.text.includes('<compacted-summary>') && prompt.text.includes(WEB_MARKERS.history))
   assert.ok(prompt.text.includes('input.txt') && prompt.text.includes('文档内容'))
   assert.ok(prompt.text.includes(goal) && !prompt.text.includes(directive))
   assert.equal((await ordinaryState()).goalText, goal)
@@ -141,7 +141,7 @@ try {
   await consume(legacy, options([checkpoint('cp1'), result]))
   const legacyState = JSON.parse(await readFile(legacyFile, 'utf8')).task
   assert.equal(legacyState.goalText, undefined)
-  assert.ok(legacyChannel.ordinary[0]!.text.includes('[任务接续]'))
+  assert.ok(legacyChannel.ordinary[0]!.text.includes(WEB_MARKERS.resume))
   assert.ok(!legacyChannel.ordinary[0]!.text.includes(directive))
   // 重启后缺少网页归属证据时强制回放。
   legacyChannel.isConversationActive = () => false

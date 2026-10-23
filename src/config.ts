@@ -194,6 +194,12 @@ export interface Config {
     retryMaxDelayMs: number
     /** 抖动比例 0~0.5：每次等待在基准值上随机浮动，避免多实例同一秒重撞。 */
     jitterRatio: number
+    /**
+     * 账号级冷却：一旦网页判了频控，整个账号在这段时间内不再发任何请求
+     * （不只是当前会话在等，其它会话/子代理也一起停）。默认 10 分钟，对齐
+     * 实测常见的 10~15 分钟冷却窗口；设 0 关闭（退回「只有本回合退避」的旧行为）。
+     */
+    accountCooldownMs: number
   }
   /**
    * 提示：把「发出消息 / 收到回复 / 频控等待 / 本轮失败」做成对话里可见的一行提示。
@@ -262,7 +268,10 @@ export interface Config {
   /**
    * 全局并发上限：同一时刻最多允许多少条请求真正在网页上跑（主会话、子代理、辅助请求一起算）。
    * 超出的请求按先进先出排队，一个一个放行；0 表示不限制（只观测不排队）。
-   * 默认 2：不同会话能并行，又不会因为并发过高触发账号级频控。
+   *
+   * 默认 1：网页端的频控与临时封禁按**账号**结算，不是按标签页。竞品实测同账号
+   * 两条生成并发不到 6 分钟即触发 1 天封禁，所以默认排队而不是并行；多会话仍然
+   * 各占一个标签页，只是同一时刻只有一个在真正打网页。确实要并行时调大。
    */
   maxConcurrentTurns: number
   /**
@@ -290,6 +299,14 @@ export interface Config {
   excludeToolNames: string[]
   /** 工具目录使用精简描述（名称 + 一句用途 + 必填参数），默认开。 */
   compactToolCatalog: boolean
+  /**
+   * 工具目录的字符预算（0 表示不限制，默认 28000）。
+   *
+   * 目录每轮随协议整段下发；工具多、或关掉 compactToolCatalog 时会涨到十几万字符，
+   * 既拖慢网页输入框填字，也把真实任务挤掉。超预算时目录末尾会**列出被省略的工具名**
+   * ——静默砍掉工具会让模型表现成「不会用工具」，比直接报错更难查。
+   */
+  maxToolCatalogChars: number
   /** 单个工具结果送入网页模型的最大字符数，超出按头尾截断；不限制最终正文。 */
   maxToolResultChars: number
   /** 任务锚点最大字符数，防止超长任务每轮重复灌入。 */
@@ -392,6 +409,9 @@ const schema = z.object({
     backoff: markVolatile(z.union(['fixed', 'exponential']).default('exponential')),
     retryMaxDelayMs: markVolatile(z.number().step(1).min(1_000).default(300_000)),
     jitterRatio: markVolatile(z.number().step(0.01).min(0).max(0.5).default(0.15)),
+    // 账号级冷却：网页判频控后整账号停手。默认 10 分钟，对齐实测 10~15 分钟冷却窗口；
+    // 0 = 关闭（只有本回合退避，其它会话继续打网页——那正是最容易触发 1 天封禁的形态）。
+    accountCooldownMs: markVolatile(z.number().step(1).min(0).max(3_600_000).default(600_000)),
   }).default({}),
   notify: z.object({
     enabled: markVolatile(z.boolean().default(true)),
@@ -420,9 +440,14 @@ const schema = z.object({
   turnTimeoutMs: z.number().step(1).min(0).default(900_000),
   lockLeaseMs: z.number().step(1).min(0).default(4_500_000),
   maxStreamMs: z.number().step(1).min(0).default(3_600_000),
-  maxConcurrentTurns: markVolatile(z.number().step(1).min(0).max(64).default(2)),
+  maxConcurrentTurns: markVolatile(z.number().step(1).min(0).max(64).default(1)),
   sendPauseMinMs: markVolatile(z.number().step(1).min(0).max(60_000).default(2_000)),
   sendPauseMaxMs: markVolatile(z.number().step(1).min(0).max(60_000).default(4_000)),
+  // 回合间隔：上一轮网页回合**结束**到下一轮真正发请求之间的随机等待（0 = 关闭）。
+  // 与 sendPause 的区别是计时起点：sendPause 只夹在"填字完成 → 回车"之间，
+  // 上一轮结束到下一轮开始原本是 0 间隔——长任务连续续跑时，节拍就是 0 秒一条。
+  turnGapMinMs: markVolatile(z.number().step(1).min(0).max(600_000).default(2_000)),
+  turnGapMaxMs: markVolatile(z.number().step(1).min(0).max(600_000).default(4_000)),
   longRunAfterSends: markVolatile(z.number().step(1).min(0).max(10_000).default(15)),
   // 长休区间默认 30–60 秒（下限 30 秒、上限 60 秒）：连发 N 轮后静默一小段就足以打断节拍，
   // 旧默认 60–180 秒会让长链路任务白等最多 3 分钟。
@@ -444,8 +469,19 @@ const schema = z.object({
   excludeToolNames: markVolatile(z.array(z.string()).default(['web_search'])),
   compactToolCatalog: z.boolean().default(true),
   maxToolResultChars: markVolatile(z.number().step(1).min(256).default(6_000)),
+  // 工具目录预算：默认 28000 字符（约 8000 token 量级的常驻成本）。
+  // 0 = 不限制；超预算时目录末尾会列出被省略的工具名（见 protocol.ts）。
+  maxToolCatalogChars: markVolatile(z.number().step(1).min(0).default(28_000)),
   maxGoalChars: z.number().step(1).min(64).default(2_000),
   maxReplayChars: z.number().step(1).min(0).default(400_000),
+  // 登录态主动探活：只读检查（不发送、不消耗额度），默认启动后 20 秒探一次，之后每 30 分钟一次。
+  // 浏览器没启动时只报 unknown，绝不为了探活把浏览器拉起来。
+  loginProbe: z.object({
+    enabled: markVolatile(z.boolean().default(true)),
+    initialDelayMs: markVolatile(z.number().step(1).min(0).max(600_000).default(20_000)),
+    // 0 = 只在启动后探一次。
+    intervalMs: markVolatile(z.number().step(1).min(0).max(86_400_000).default(1_800_000)),
+  }).default({}),
   focus: z.object({
     enabled: markVolatile(z.boolean().default(true)),
     webWindow: markVolatile(z.boolean().default(true)),

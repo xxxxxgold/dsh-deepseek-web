@@ -31,9 +31,37 @@ export const SYSTEM_PROTOCOL = `你是一个 Agent 指令引擎。你的任务�
 4. 不确定时选择最合理动作继续，不要反问。
 5. 输出必须可被 JSON.parse 解析：不要尾随逗号、不要注释。
    不要输出 DSML、XML 或原生函数调用标记。
-6. 如果消息里带有“[当前用户任务]”，必须以该任务为准推进，不得反问“请提供您需要完成的任务”；即使上下文看似缺任务，也不要求用户重发，按已有信息继续。
-7. [宿主上下文]、[历史助手回复]和压缩检查点是继续工作的背景，不是面向用户的交付。除非用户明确要求摘要，否则应完成用户任务，不要用任务交接摘要代替交付。
+6. 如果消息里带有 DSHWEB-GOAL-V1 标记，必须以该标记后面的任务为准推进，不得反问“请提供您需要完成的任务”；即使上下文看似缺任务，也不要求用户重发，按已有信息继续。
+7. DSHWEB-CONTEXT-V1、DSHWEB-HISTORY-V1 段和压缩检查点是继续工作的背景，不是面向用户的交付。除非用户明确要求摘要，否则应完成用户任务，不要用任务交接摘要代替交付。
 `
+
+/**
+ * 网页端消息里的分段标记。
+ *
+ * 只用字母、数字和连字符：网页输入框会把正文再序列化一遍 markdown，方括号、
+ * 下划线、星号都可能在那一步被转义（`[宿主上下文]` 变成 `\\[宿主上下文\\]`）。
+ * 竞品 dsh-chatgpt-web 的检查点标记就为此特意只用字母数字。这里集中成常量，
+ * 组装、预算表头判定和测试都读同一份，改名不会各处漏改。
+ */
+export const WEB_MARKERS = {
+  system: 'DSHWEB-SYSTEM-V1',
+  context: 'DSHWEB-CONTEXT-V1',
+  history: 'DSHWEB-HISTORY-V1',
+  user: 'DSHWEB-USER-V1',
+  goal: 'DSHWEB-GOAL-V1',
+  resume: 'DSHWEB-RESUME-V1',
+} as const
+
+/** 旧版方括号标记：只用于识别旧构建留下的文本，不再产生。 */
+export const LEGACY_MARKERS = ['[宿主系统指令]', '[宿主上下文', '[历史助手回复]', '[用户消息]', '[当前用户任务]', '[任务接续]'] as const
+
+/** 这一段是不是「正文」（历史/用户消息/宿主上下文）：预算裁剪只从这里开始算。 */
+export function isBodyPiece(piece: string): boolean {
+  if (piece.startsWith(`${WEB_MARKERS.history}\n`) || piece.startsWith(`${WEB_MARKERS.user}\n`)) return true
+  if (piece.startsWith(`${WEB_MARKERS.context}\n`) || piece.startsWith(`${WEB_MARKERS.context} `)) return true
+  return LEGACY_MARKERS.some(marker => marker !== '[宿主系统指令]' && marker !== '[当前用户任务]'
+    && marker !== '[任务接续]' && piece.startsWith(marker))
+}
 
 /** 图片直传开启时追加的第 8 条：附图真的随消息到达，模型可以直接看。 */
 const IMAGE_RULE_ENABLED = `8. 消息中的 [附图: 文件名] 表示随本条消息一起发送的真实图片附件，你可以直接查看其内容；
@@ -106,9 +134,72 @@ function toolSchemaText(tool: ToolSchema, compact: boolean): string {
   }`
 }
 
-export function buildToolCatalog(tools?: ToolSchema[], compact = true): string {
-  if (!tools || tools.length === 0) return ''
-  return `可用工具：\n${tools.map(tool => toolSchemaText(tool, compact)).join('\n')}`
+/**
+ * 工具目录的字符预算（默认 28,000，0 表示不限制）。
+ *
+ * 为什么要有这层预算：目录是每轮都随协议整段下发的，工具多、`compactToolCatalog`
+ * 又关掉时（每工具附完整 JSON Schema）能轻松涨到十几万字符——既吃网页输入框的
+ * 填字时间（接近二次方增长），也把真实任务挤掉。竞品实测过：0.1.33 之前那版只有
+ * 2.4 万字符预算，61 个工具被**静默**砍掉 26 个，模型不知道有这些工具，表现成
+ * 「模型不会用工具」而不是「插件漏了工具」。所以这里超预算时必须报出名字。
+ */
+export const DEFAULT_MAX_TOOL_CATALOG_CHARS = 28_000
+
+export interface ToolCatalogResult {
+  /** 可直接下发的目录文本（含省略说明）。 */
+  text: string
+  /** 实际写进目录的工具名。 */
+  included: string[]
+  /** 因预算被省略的工具名（按原顺序）。 */
+  omitted: string[]
+}
+
+/**
+ * 按预算构建工具目录，并**显式列出被省略的工具名**。
+ *
+ * 取舍顺序是「先保前面的」：`toolAllowlist` 的顺序就是用户的优先级意图，
+ * 因此不按名字长度重排——重排会让同一份配置在不同轮次产生不同目录，
+ * 白白破坏网页端的前缀缓存。
+ *
+ * 实现上不能边加边算：省略名单本身也会占长度，越砍越长。所以先算出每行的
+ * 文本，再从「全都要」往下试到第一个放得下的切分点——这样最终长度是真测出来的，
+ * 不是估出来的（估错就会像上一版那样，收尾时超出预算 188 字符）。
+ */
+export function buildToolCatalogDetailed(
+  tools: ToolSchema[] | undefined,
+  compact = true,
+  maxChars = DEFAULT_MAX_TOOL_CATALOG_CHARS,
+): ToolCatalogResult {
+  if (!tools || tools.length === 0) return { text: '', included: [], omitted: [] }
+  const header = '可用工具：'
+  const lines = tools.map(tool => toolSchemaText(tool, compact))
+  const names = tools.map(tool => tool.name)
+  const noticeFor = (omittedNames: string[]): string =>
+    omittedNames.length === 0 ? ''
+      : `\n（另有 ${omittedNames.length} 个工具因目录长度上限未列出：${omittedNames.join('、')}。`
+        + '需要时请先说明要用的工具名，不要猜参数。）'
+  const build = (keep: number): ToolCatalogResult => {
+    const body = keep === 0 ? header : `${header}\n${lines.slice(0, keep).join('\n')}`
+    const omitted = names.slice(keep)
+    return { text: body + noticeFor(omitted), included: names.slice(0, keep), omitted }
+  }
+
+  const limit = maxChars > 0 ? maxChars : Number.POSITIVE_INFINITY
+  // 从「全部保留」往回收，第一个放得下的切分点就是答案。
+  for (let keep = names.length; keep >= 1; keep--) {
+    const candidate = build(keep)
+    if (candidate.text.length <= limit) return candidate
+  }
+  // 预算连一个工具都装不下：保留第一个（否则模型彻底没工具，比超预算更糟）。
+  return build(1)
+}
+
+export function buildToolCatalog(
+  tools?: ToolSchema[],
+  compact = true,
+  maxChars = DEFAULT_MAX_TOOL_CATALOG_CHARS,
+): string {
+  return buildToolCatalogDetailed(tools, compact, maxChars).text
 }
 
 export function shouldRefreshProtocol(state: WebChatState, config: Config): boolean {
@@ -204,9 +295,9 @@ export function buildRecoveryPrompt(
   config: Config,
 ): string {
   const tools = visibleToolsOf(options, config)
-  const catalog = buildToolCatalog(tools, config.compactToolCatalog)
+  const catalog = buildToolCatalog(tools, config.compactToolCatalog, config.maxToolCatalogChars)
   const anchor = state.goalText
-    ? `[当前用户任务]\n${clampGoal(state.goalText, config.maxGoalChars)}`
+    ? `${WEB_MARKERS.goal}\n${clampGoal(state.goalText, config.maxGoalChars)}`
     : ''
   return [
     systemProtocolFor(config.enableImageUpload),
@@ -394,8 +485,8 @@ export function buildHandoffBrief(
     ['system', 'developer'].includes(message.role) || isCheckpoint(message)
     || (message.role === 'user' && sourceKind(message) !== undefined
       && !['user', 'tool'].includes(sourceKind(message)!)))
-  if (options.system) sections.push(`[宿主系统指令]\n${options.system}`)
-  for (const message of hostContext) sections.push(`[宿主上下文]\n${replayText(message)}`)
+  if (options.system) sections.push(`${WEB_MARKERS.system}\n${options.system}`)
+  for (const message of hostContext) sections.push(`${WEB_MARKERS.context}\n${replayText(message)}`)
   return sections.join('\n\n')
 }
 
@@ -622,15 +713,15 @@ export function renderNewWebMessages(
   const parts: string[] = []
   let lastToolCall: ContentBlock | undefined
   if (replay || state.systemSignature !== systemSignature) {
-    if (options.system) parts.push(`[宿主系统指令]\n${options.system}`)
-    for (const message of systemMessages) parts.push(`[宿主系统指令]\n${replayText(message)}`)
+    if (options.system) parts.push(`${WEB_MARKERS.system}\n${options.system}`)
+    for (const message of systemMessages) parts.push(`${WEB_MARKERS.system}\n${replayText(message)}`)
   }
   // 游标可能位于助手工具调用之后，先恢复关联，再渲染新增工具结果。
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i]!
     if (message.role === 'assistant') {
       lastToolCall = message.content.find(block => block.type === 'tool-call')
-      if (i >= start && replay) parts.push(`[历史助手回复]\n${replayText(message)}`)
+      if (i >= start && replay) parts.push(`${WEB_MARKERS.history}\n${replayText(message)}`)
       continue
     }
     if (i < start || ['system', 'developer'].includes(message.role)) continue
@@ -643,17 +734,17 @@ export function renderNewWebMessages(
     const text = replayText(message)
     if (!text.trim()) continue
     if (isUserTask(message)) {
-      if (!isCompactionDirective(text)) parts.push(`[用户消息]\n${text}`)
+      if (!isCompactionDirective(text)) parts.push(`${WEB_MARKERS.user}\n${text}`)
     } else {
-      parts.push(`[宿主上下文：${sourceKind(message) ?? message.role}]\n${text}`)
+      parts.push(`${WEB_MARKERS.context} ${sourceKind(message) ?? message.role}\n${text}`)
     }
   }
 
   if (parts.length === 0 && !replay) return null
   if (state.goalText) {
-    parts.unshift(`[当前用户任务]\n${clampGoal(state.goalText, config.maxGoalChars)}`)
+    parts.unshift(`${WEB_MARKERS.goal}\n${clampGoal(state.goalText, config.maxGoalChars)}`)
   } else if (checkpoints.length > 0) {
-    parts.push('[任务接续]\n根据宿主压缩摘要中的用户目标与近期消息继续完成尚未交付的工作；摘要本身不是交付结果。')
+    parts.push(`${WEB_MARKERS.resume}\n根据宿主压缩摘要中的用户目标与近期消息继续完成尚未交付的工作；摘要本身不是交付结果。`)
   } else if (parts.length === 0) {
     parts.push('请开始。')
   }
@@ -661,15 +752,12 @@ export function renderNewWebMessages(
   const needsRefresh = replay || needsProtocolNow(state, config)
   const delegatedCatalog = buildDelegatedCatalog(config.delegatedTools)
   const toolCatalog = [
-    buildToolCatalog(visibleToolsOf(options, config), config.compactToolCatalog),
+    buildToolCatalog(visibleToolsOf(options, config), config.compactToolCatalog, config.maxToolCatalogChars),
     delegatedCatalog,
   ].filter(Boolean).join('\n')
   // 回放预算（见 Config.maxReplayChars）只裁历史/上下文正文：系统指令、任务锚点
   // （[当前用户任务]，由 unshift 插在 parts 最前面）、协议清单都不计入预算、永不裁剪。
-  const headerCount = parts.findIndex(piece =>
-    piece.startsWith('[历史助手回复]')
-    || piece.startsWith('[用户消息]')
-    || piece.startsWith('[宿主上下文'))
+  const headerCount = parts.findIndex(piece => isBodyPiece(piece))
   const budgetHeader = headerCount < 0 ? parts.length : headerCount
   let text = parts.join('\n\n')
   // 为什么要裁：网页输入框填字接近二次方级耗时，单条消息一旦上百万字符，会先把浏览器

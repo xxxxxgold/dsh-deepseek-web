@@ -160,7 +160,7 @@ try {
   // ---- 1. 跨会话并行：主会话 + 子代理同时请求，网页回合必须重叠 ----
   {
     const channel = new TimedChannel(400)
-    const adapter = new DeepSeekWebAdapter(makeConfig('parallel'), channel)
+    const adapter = new DeepSeekWebAdapter(makeConfig('parallel', { maxConcurrentTurns: 2 }), channel)
     const startedAt = Date.now()
     const [main, child] = await Promise.all([
       consume(adapter, makeOptions('main-session')),
@@ -230,7 +230,7 @@ try {
   {
     // 主请求回合耗时 700ms，辅助请求回合只需 120ms：并行时辅助请求应在主请求结束前返回。
     const channel = new TimedChannel(kind => kind === 'isolated' ? 120 : 700)
-    const adapter = new DeepSeekWebAdapter(makeConfig('auxiliary'), channel)
+    const adapter = new DeepSeekWebAdapter(makeConfig('auxiliary', { maxConcurrentTurns: 2 }), channel)
     const auxOptions = makeOptions('busy-session', 'session-title')
     const main = consume(adapter, makeOptions('busy-session'))
     await new Promise(resolve => setTimeout(resolve, 80))

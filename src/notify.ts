@@ -205,6 +205,10 @@ export interface FailureLike {
  */
 const FAILURE_HINT: Readonly<Record<string, string>> = Object.freeze({
   WEB_RATE_LIMITED: '网页频控未解除，等 10~15 分钟再发，或先去网页端手动发一条试探',
+  WEB_ACCOUNT_COOLDOWN: '账号还在频控冷却期，所有会话都已暂停发请求；到点后重试即可',
+  WEB_ACCOUNT_BLOCKED: '网页判定账号受限（临时封禁），只能等限制到期；期间别再发请求',
+  WEB_LOGIN_EXPIRED: '登录态已失效，请在插件浏览器窗口里重新登录后重试',
+  WEB_UI_CHANGED: '页面结构变了：输入框或发送按钮已找不到。多半是网页改版，先升级插件；急需用时在网页端手动发一条',
   WEB_TURN_TIMEOUT: '单回合超过上限，检查网页是否卡在生成中，或调大 turnTimeoutMs',
   WEB_TURN_FAILED: '网页对话中途异常，重试本轮；反复失败时看插件日志里的原始报错',
   WEB_AUTO_SEND_TIMEOUT: '网页 3 分钟没响应，可能卡住或掉登录，重试会重新走一遍',

@@ -154,7 +154,7 @@ export function parseKimiCompletion(input: Buffer | string): { text: string; rea
   const reasoning = collect(thinkBlocks, thinkOrder)
   if (!text && !reasoning) {
     // 落盘原始样本，便于继续校准
-    const dir = path.join(process.env.LOCALAPPDATA ?? '', 'DshDeepSeekWeb', 'calibration')
+    const dir = defaultProfileDir('calibration')
     const file = path.join(dir, `kimi-unparsed-${Date.now()}.bin`)
     void import('node:fs/promises')
       .then(fs => fs.mkdir(dir, { recursive: true }).then(() => fs.writeFile(file, buffer)))

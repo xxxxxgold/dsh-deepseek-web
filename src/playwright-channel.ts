@@ -33,16 +33,22 @@ import {
   type NoticeEvent,
 } from './notify.ts'
 import { AsyncLock } from './async-lock.ts'
+import { AccountCooldown, sharedCooldown } from './cooldown.ts'
+import { TurnRetryBudget, sharedRetryBudget } from './retry-policy.ts'
+import type { LoginProbeResult } from './login-probe.ts'
+import { computeTurnGap, sharedPacer, type TurnPacer } from './pacing.ts'
 import {
   bestEffortNewChat,
   connectBrowser,
   defaultProfileDir,
+  EDITOR_CANDIDATES,
   focusDshWindow,
   hasRateLimitToast,
   isRateLimitResponse,
   markRateLimitToastsSeen,
   PAGE_NOTICE_ID,
   looksLoggedOut,
+  looksLoginWall,
   locateEditor,
   ensureChatPage,
   isBrowserClosedMessage,
@@ -152,6 +158,11 @@ export interface PlaywrightChannelOptions {
   config: Config
   /** 显式指定 profile 目录（测试/工具脚本用）。 */
   profileDir?: string
+  /** 账号冷却计时器（测试注入可控时钟；缺省用进程级单例，跨热重载保留）。 */
+  cooldown?: AccountCooldown
+  /** 跨回合重试预算（测试注入；缺省用进程级单例）。 */
+  retryBudget?: TurnRetryBudget
+  pacer?: TurnPacer
 }
 
 function matchesCompletionUrl(url: string): boolean {
@@ -494,6 +505,11 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   /** 页面原始标题，用于状态标记前缀的清除/还原。 */
   private readonly originalTitles = new WeakMap<Page, string>()
   private readonly options: PlaywrightChannelOptions
+  /** 账号级冷却：进程级共享，热重载/多实例都读同一份（见 cooldown.ts）。 */
+  private readonly cooldownState: AccountCooldown
+  /** 跨回合重试预算：同样进程级共享（见 retry-policy.ts）。 */
+  private readonly retryBudgetState: TurnRetryBudget
+  private readonly pacerState: TurnPacer
   private readonly profileDir: string
   private managedConnection: ManagedBrowserConnection | undefined
   /** 连续请求计数与最后一次请求时间（防风控长休用，见 maybeTakeLongRunPause）。 */
@@ -504,6 +520,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
 
   constructor(options: PlaywrightChannelOptions) {
     this.options = options
+    this.cooldownState = options.cooldown ?? sharedCooldown()
+    this.retryBudgetState = options.retryBudget ?? sharedRetryBudget()
+    this.pacerState = options.pacer ?? sharedPacer()
     // 空串等价于「用默认目录」：设置页里清空 profileDir 就是在表达这个意思，
     // 而 Config 里该字段的默认值也是空串，所以这里按 falsy 兜底。
     this.profileDir = options.profileDir
@@ -1044,11 +1063,41 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   private async turnOnPage(page: Page, request: BrowserTurnRequest): Promise<BrowserTurnResult> {
     const startedAt = Date.now()
     let waitedMs = 0
+    // 账号级冷却：网页已经判过频控就不要继续打。这里拦在发请求之前，而不是等
+    // 网页再拒一次——冷却期里的每一次尝试都算一次机器行为。
+    const cooldown = this.cooldown()
+    const coolingMs = cooldown.remainingMs()
+    if (coolingMs > 0) {
+      const snapshot = cooldown.snapshot()
+      throw new LlmError(
+        `deepseek-web: 账号仍在频控冷却中，还需等待 ${formatDuration(coolingMs)}。`
+        + `${snapshot.reason !== undefined ? `（上次原因：${snapshot.reason}）` : ''}`
+        + '冷却期内不会再向网页发送任何请求，避免把临时限流拖成封号。',
+        'WEB_ACCOUNT_COOLDOWN',
+      )
+    }
+    // 回合间隔：从「上一轮网页回合结束」起算的随机等待。sendPause 只夹在
+    // 「填字完成 → 回车」之间，上一轮结束到下一轮开始原本是 0 间隔——长任务连续
+    // 续跑时那正是最像脚本的节拍（真人不会每 0 秒接一条）。0 = 关闭。
+    const gapMs = computeTurnGap(
+      this.pacerState.lastEnd(),
+      Date.now(),
+      this.options.config.turnGapMinMs,
+      this.options.config.turnGapMaxMs,
+    )
+    if (gapMs > 0) {
+      console.info(`[deepseek-web] 距上一轮结束不足 ${formatDuration(gapMs)}，先等一会儿再发（回合间隔）。`)
+      await this.sleep(gapMs, request.signal)
+    }
     // 频控自动重发：网页提示“发送过于频繁”时等待后重发同一条消息，
     // 而不是中断回合报错；重试用尽才抛 WEB_RATE_LIMITED。
     // 默认走指数退避（60s→120s→240s→300s 封顶），覆盖实测 10~15 分钟冷却窗口。
     const rateLimit = this.options.config.rateLimit
     const maxRetries = rateLimit?.enabled === false ? 0 : rateLimit?.maxRetries ?? 4
+    // 跨回合预算：单回合 maxRetries 只是一层闸；宿主连续续跑时，每回合各重试几次
+    // 会叠成几十次请求（竞品记录过 22 分钟 49 次请求随后账号被吊销）。预算活在回合外。
+    const budget = this.retryBudget()
+    const budgetKey = `deepseek-web:${this.options.config.channel}`
     for (let attempt = 0; ; attempt++) {
       request.signal?.throwIfAborted()
       const outcome = await this.sendAndWait(page, request)
@@ -1081,13 +1130,29 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
           `用时 ${formatDuration(Date.now() - startedAt)}，收到 ${parsed.text.length} 字`
           + `${waitedMs > 0 ? `（含频控等待 ${formatDuration(waitedMs)}）` : ''}`,
         )
+        // 真的拿到一轮完整回复 = 网页愿意继续服务：提前解除冷却标记、清掉重试账。
+        cooldown.clear()
+        budget.reset(budgetKey)
         return result
       }
       if (attempt >= maxRetries) {
+        // 重试用尽：锁住整个账号，而不只是让本回合失败。其它会话/子代理随后的
+        // 请求会在 turnOnPage 入口被同一把锁挡下，不再往网页上撞。
+        const coolMs = rateLimit?.accountCooldownMs ?? 600_000
+        cooldown.block(coolMs, '网页提示发送过于频繁，自动重发已用尽')
         throw new LlmError(
           `deepseek-web: 网页提示发送过于频繁，已自动重发 ${maxRetries} 次仍未成功`
           + `${waitedMs > 0 ? `（累计等待 ${formatDuration(waitedMs)}）` : ''}。`
+          + `${coolMs > 0 ? `账号已进入 ${formatDuration(coolMs)} 冷却，期间所有会话都不会再发请求。` : ''}`
           + '请稍后在网页端手动发送，或稍后重试本任务。',
+          'WEB_RATE_LIMITED',
+        )
+      }
+      // 跨回合预算：用尽就直接停手，不再进本回合的退避等待。
+      if (!budget.take(budgetKey)) {
+        throw new LlmError(
+          'deepseek-web: 最近 30 分钟内自动重发次数已用尽，为避免账号被判机器行为，本轮不再重试。'
+          + '请等冷却结束后再试，或先去网页端手动发一条确认账号可用。',
           'WEB_RATE_LIMITED',
         )
       }
@@ -1111,9 +1176,18 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     }
   }
 
+  /** 账号冷却计时器（进程级共享；状态接口给设置页/自检读）。 */
+  cooldown(): AccountCooldown {
+    return this.cooldownState
+  }
+
+  /** 跨回合重试预算（进程级共享；自检与台账读它）。 */
+  retryBudget(): TurnRetryBudget {
+    return this.retryBudgetState
+  }
+
   /** 该页面是否由本通配给某个 dsh 会话（清理残留标签页时判断归属）。 */
-  private ownedPage(page: Page): boolean {
-    if (page === this.page) return true
+  private ownedPage(page: Page): boolean {    if (page === this.page) return true
     return this.assignedPage(page)
   }
 
@@ -1494,10 +1568,13 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
               'WEB_LOGIN_REQUIRED',
             )
           }
+          // 页面改版专用错误码：登录态正常但输入框找不到，只可能是站点结构变了。
+          // 单独分类的意义是让人一眼知道「该升级插件」而不是「该重新登录」。
           throw new LlmError(
-            'deepseek-web: 未找到聊天输入框。请确认浏览器停留在 chat.deepseek.com 的对话页；'
-            + '若刚切换过页面请稍等片刻后重试。',
-            'WEB_EDITOR_NOT_FOUND',
+            'deepseek-web: 未找到聊天输入框，页面结构很可能已经改版（登录态正常时才会走到这里）。'
+            + `已尝试的选择器：${EDITOR_CANDIDATES.join(' | ')}。`
+            + '请升级插件；急需用时可在网页端手动发送一条。',
+            'WEB_UI_CHANGED',
           )
         }
       }
@@ -1631,6 +1708,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       )
     } finally {
       waiterActive = false
+      // 记下「上一次真正碰网页的回合结束」时刻：下一轮的随机间隔按它起算。
+      // 成功与失败都算——失败的重发同样消耗了账号配额。
+      this.pacerState.noteEnded()
       clearTimeout(ackTimer)
       clearInterval(toastTimer)
       if (progressTimer) clearInterval(progressTimer)
@@ -1916,11 +1996,40 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     }
   }
 
+  /**
+   * 只读登录态探活。
+   *
+   * 刻意**不调用 `ensureReady()`**：探活是后台例行检查，不该因为一次定时检查
+   * 就把浏览器拉起来（没有浏览器时返回 `unknown`）。有会话页时优先用它，否则用
+   * 锚点页；页面已关就说明浏览器那边已经不在了。
+   */
+  async probeLogin(): Promise<LoginProbeResult> {
+    const checkedAt = Date.now()
+    if (!this.browser || !this.context) {
+      return { status: 'unknown', detail: '浏览器还没启动，无法探活（探活不会主动拉起浏览器）', checkedAt }
+    }
+    if (!this.browser.isConnected()) {
+      return { status: 'expired', detail: '浏览器连接已断开', checkedAt }
+    }
+    const page = this.page && !this.page.isClosed() ? this.page : this.mostRecentState()?.page
+    if (page === undefined || page.isClosed()) {
+      return { status: 'unknown', detail: '还没有可用的会话页', checkedAt }
+    }
+    if (await looksLoggedOut(page, ['sign_in', 'sign-in', 'login', 'auth'])) {
+      return { status: 'expired', detail: '页面已跳到登录入口', checkedAt }
+    }
+    if (await looksLoginWall(page)) {
+      return { status: 'expired', detail: '页面显示登录墙（输入框可用但发送被禁用）', checkedAt }
+    }
+    return { status: 'ok', checkedAt }
+  }
+
   async dispose(): Promise<void> {
     if (this.options.config.browser === 'attach') {
       this.sessionPages.clear()
       this.creatingPages.clear()
       this.pendingPages.clear()
+      this.autoSendSessions.clear()
       this.page = undefined
       return
     }
@@ -1928,6 +2037,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     this.sessionPages.clear()
     this.creatingPages.clear()
     this.pendingPages.clear()
+    this.autoSendSessions.clear()
     const managed = this.managedConnection
     this.managedConnection = undefined
     await managed?.browser.close().catch(() => {})

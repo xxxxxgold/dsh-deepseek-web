@@ -75,6 +75,18 @@ const CSS = `
 .dsweb-status-error{color:var(--dsw-alias-label-error)}
 .dsweb-status-warn{color:var(--dsw-alias-state-warn-primary)}
 .dsweb-actions{display:flex;align-items:center;gap:8px;margin-left:auto}
+.dsweb-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:4px 0}
+.dsweb-stat{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md,8px);background:var(--dsw-alias-bg-layer-1,transparent)}
+.dsweb-stat-value{font-size:16px;line-height:22px;font-weight:600;font-variant-numeric:tabular-nums}
+.dsweb-stat-label{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}
+.dsweb-chips{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.dsweb-checks{display:flex;flex-direction:column;gap:6px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md,8px)}
+.dsweb-check{display:flex;align-items:flex-start;gap:8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
+.dsweb-check-icon{flex:none;width:12px;text-align:center;font-weight:600}
+.dsweb-check-ok .dsweb-check-icon{color:var(--dsw-alias-state-success-primary)}
+.dsweb-check-warning .dsweb-check-icon{color:var(--dsw-alias-state-warn-primary)}
+.dsweb-check-error .dsweb-check-icon{color:var(--dsw-alias-label-error)}
+.dsweb-check-detail{display:block;margin-top:2px;color:var(--dsw-alias-label-tertiary);white-space:pre-wrap;word-break:break-all}
 `
 
 /**

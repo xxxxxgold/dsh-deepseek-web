@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: build + offline checks + pack (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build host and client bundles
+        run: npm run build
+
+      - name: Offline regression checks
+        run: npm run test:parsers
+
+      - name: Host bundle is importable and exports apply()
+        run: node --input-type=module -e "const m = await import('./lib/index.js'); if (typeof m.apply !== 'function') throw new Error('apply missing'); console.log('host exports:', Object.keys(m).join(', '))"
+
+      - name: Pack the release tarball
+        run: npm pack
+
+      - name: Install the tarball into a clean directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball=$(ls dsh-deepseek-web-littlecar30-*.tgz | head -n 1)
+          echo "tarball: $tarball"
+          smoke="$RUNNER_TEMP/pack-smoke"
+          rm -rf "$smoke"
+          mkdir -p "$smoke"
+          cd "$smoke"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "$GITHUB_WORKSPACE/$tarball"
+          for f in lib/index.js lib/client.js dsh.patch.yml cordis.yml README.md CHANGELOG.md; do
+            test -f "node_modules/dsh-deepseek-web-littlecar30/$f" || { echo "missing $f in tarball"; exit 1; }
+          done
+          echo "pack smoke OK"
+
+      - name: No build-machine paths leaked into the bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -a -n -E 'D:[\\/]dsh|[A-Za-z]:[\\/]+Users[\\/]|/home/runner/work/' lib/index.js lib/client.js; then
+            echo "::error::build machine paths leaked into the bundles"
+            exit 1
+          fi
+          echo "no build-host paths in bundles"

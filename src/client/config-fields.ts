@@ -32,6 +32,7 @@ export type FieldGroupId =
   | 'ratelimit'
   | 'notify'
   | 'browserrecovery'
+  | 'probe'
   | 'tools'
   | 'focus'
   | 'compaction'
@@ -137,6 +138,14 @@ export const GROUPS: readonly FieldGroup[] = [
     hint: {
       zh: '浏览器或网页标签被关掉时先提示、再自动重启（重连）并重发本轮消息。只处理「被关掉」这类事故；频控、超时、手动取消不走这里。',
       en: 'When the browser or the tab is closed, notify first, then restart (or reconnect) and resend the turn automatically. Only closure accidents are handled here; rate limits, timeouts and cancellations are not.',
+    },
+  },
+  {
+    id: 'probe',
+    label: { zh: '登录探活', en: 'Login probe' },
+    hint: {
+      zh: '后台只读检查网页登录态（不发送、不消耗额度）。失效时只提醒，绝不拦住发送——探活判断错了不该拦人。浏览器没启动时只记「无法判断」，不会为了探活把浏览器拉起来。',
+      en: 'Background read-only check of the page login state (nothing is sent, no quota used). A failure only warns and never blocks a send. When the browser is not running it reports “unknown” instead of starting it.',
     },
   },
   {
@@ -283,6 +292,28 @@ export const FIELDS: readonly FieldSpec[] = [
     },
   },
   {
+    path: ['maxToolCatalogChars'],
+    group: 'model',
+    kind: 'number',
+    label: { zh: '工具目录预算（字符）', en: 'Tool catalog budget (characters)' },
+    min: 0,
+    hint: {
+      zh: '工具清单写进提示词的总预算，默认 28000。超预算时先缩描述、装不下就只留名字，并在末尾列出被省略的工具名——不会静默砍掉让模型「不会用工具」。0 = 不限制。',
+      en: 'Total budget for the tool list in the prompt; default 28000. Over budget, descriptions shrink first, then only names remain, and omitted tool names are listed at the end — never silently dropped. 0 = unlimited.',
+    },
+  },
+  {
+    path: ['maxReplayChars'],
+    group: 'model',
+    kind: 'number',
+    label: { zh: '历史回放预算（字符）', en: 'Replay budget (characters)' },
+    min: 0,
+    hint: {
+      zh: '新标签页或新会话重建上下文时，允许回放的历史正文字符上限，默认 400000。调大不是「越安全」：网页输入框填字代价接近二次方，30 万字符约 13 秒、60 万约 77 秒。0 = 不限制。',
+      en: 'Character budget for replaying history when a tab or conversation is rebuilt; default 400000. Bigger is not safer: filling the page composer scales near-quadratically (300k chars ≈ 13s, 600k ≈ 77s). 0 = unlimited.',
+    },
+  },
+  {
     path: ['maxConcurrentTurns'],
     group: 'risk',
     kind: 'number',
@@ -328,6 +359,30 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: {
       zh: '停顿上限，默认 4000。必须在下限与上限之间随机取值——固定间隔方差为零，是最明显的机器特征。',
       en: 'Upper bound, default 4000. Always pick randomly inside the range: a fixed interval has zero variance and is the clearest bot signature.',
+    },
+  },
+  {
+    path: ['turnGapMinMs'],
+    group: 'risk',
+    kind: 'number',
+    label: { zh: '回合间隔下限（毫秒）', en: 'Turn gap min (ms)' },
+    min: 0,
+    max: 600_000,
+    hint: {
+      zh: '上一轮网页回合结束到下一轮真正发请求之间的随机等待下限，默认 2000。与「发送前停顿」的区别是计时起点：那个只夹在填字→回车之间，这个管的是回合与回合之间，长任务连续续跑时才看得出差别。与上限同为 0 则关闭。',
+      en: 'Lower bound of the random wait between the end of one web turn and the next request; default 2000. Unlike the pre-send pause (measured between filling and sending), this covers turn-to-turn spacing. Set both bounds to 0 to disable.',
+    },
+  },
+  {
+    path: ['turnGapMaxMs'],
+    group: 'risk',
+    kind: 'number',
+    label: { zh: '回合间隔上限（毫秒）', en: 'Turn gap max (ms)' },
+    min: 0,
+    max: 600_000,
+    hint: {
+      zh: '回合间隔上限，默认 4000，在下限与上限之间随机取值。固定值方差为零是最明显的机器特征。',
+      en: 'Upper bound of the turn gap; default 4000, randomized inside the range. A fixed value has zero variance and is the clearest bot signature.',
     },
   },
   {
@@ -556,6 +611,18 @@ export const FIELDS: readonly FieldSpec[] = [
       en: 'Randomise each delay around the base value; default 0.15 (±15%). Keeps multiple instances from hitting the same second.',
     },
   },
+  {
+    path: ['rateLimit', 'accountCooldownMs'],
+    group: 'ratelimit',
+    kind: 'number',
+    label: { zh: '账号级冷却（毫秒）', en: 'Account cooldown (ms)' },
+    min: 0,
+    max: 3_600_000,
+    hint: {
+      zh: '自动重发用尽后，整个账号进入冷却多久，默认 600000（10 分钟）。冷却期内所有会话都快速失败、不再向网页发任何请求——同账号其它会话继续打，正是最容易触发 1 天封禁的形态。0 = 关闭。',
+      en: 'How long the whole account cools down after resends are exhausted; default 600000 (10 min). While cooling, every session fails fast and nothing reaches the page — other sessions hammering the same account is exactly what triggers a one-day ban. 0 = off.',
+    },
+  },
 
   {
     path: ['notify', 'enabled'],
@@ -682,6 +749,39 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: {
       zh: '每行一个；只写进提示词交给网页端自带能力，不在本地执行。',
       en: 'One per line; only written into the prompt for the page’s own abilities, never executed locally.',
+    },
+  },
+
+  {
+    path: ['loginProbe', 'enabled'],
+    group: 'probe',
+    kind: 'boolean',
+    label: { zh: '启用登录探活', en: 'Enable login probe' },
+    hint: {
+      zh: '关掉后完全不做后台检查，登录过期仍会在下一次发送时当场报错。',
+      en: 'Off: no background checks at all; an expired login still fails loudly on the next send.',
+    },
+  },
+  {
+    path: ['loginProbe', 'initialDelayMs'],
+    group: 'probe',
+    kind: 'number',
+    label: { zh: '启动后首次探活延迟（毫秒）', en: 'First probe delay (ms)' },
+    min: 0,
+    hint: {
+      zh: '默认 20000（20 秒）：等网页把登录态渲染完再判断。',
+      en: 'Default 20000 (20s): let the page finish rendering the login state first.',
+    },
+  },
+  {
+    path: ['loginProbe', 'intervalMs'],
+    group: 'probe',
+    kind: 'number',
+    label: { zh: '探活间隔（毫秒）', en: 'Probe interval (ms)' },
+    min: 0,
+    hint: {
+      zh: '默认 1800000（30 分钟）。填 0 = 只在启动后探一次。',
+      en: 'Default 1800000 (30 min). 0 = probe once after startup only.',
     },
   },
 
@@ -916,6 +1016,8 @@ export const RISK_PRESETS: readonly RiskPreset[] = [
     values: [
       { path: ['sendPauseMinMs'], value: 0 },
       { path: ['sendPauseMaxMs'], value: 0 },
+      { path: ['turnGapMinMs'], value: 0 },
+      { path: ['turnGapMaxMs'], value: 0 },
       { path: ['longRunAfterSends'], value: 0 },
     ],
   },
@@ -929,6 +1031,8 @@ export const RISK_PRESETS: readonly RiskPreset[] = [
     values: [
       { path: ['sendPauseMinMs'], value: 2_000 },
       { path: ['sendPauseMaxMs'], value: 4_000 },
+      { path: ['turnGapMinMs'], value: 2_000 },
+      { path: ['turnGapMaxMs'], value: 4_000 },
       { path: ['longRunAfterSends'], value: 15 },
       { path: ['longRunPauseMinMs'], value: 30_000 },
       { path: ['longRunPauseMaxMs'], value: 60_000 },
@@ -944,6 +1048,8 @@ export const RISK_PRESETS: readonly RiskPreset[] = [
     values: [
       { path: ['sendPauseMinMs'], value: 5_000 },
       { path: ['sendPauseMaxMs'], value: 9_000 },
+      { path: ['turnGapMinMs'], value: 5_000 },
+      { path: ['turnGapMaxMs'], value: 9_000 },
       { path: ['longRunAfterSends'], value: 10 },
       { path: ['longRunPauseMinMs'], value: 120_000 },
       { path: ['longRunPauseMaxMs'], value: 300_000 },

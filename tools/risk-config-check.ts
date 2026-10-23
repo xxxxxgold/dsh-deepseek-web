@@ -1,7 +1,7 @@
 /**
  * 校验「风控模式」菜单配置与运行时配置齐平（离线可复现，不需要浏览器）：
  * 1. FIELDS 里每个字段的 path 都能在解析后的默认配置上取到值（否则设置页显示空、保存被宿主拒）；
- * 2. 风控分组恰好 7 个可编辑字段，且都标了 .volatile()（否则不进 settings.describe()，菜单里看不到）；
+ * 2. 风控分组恰好 9 个可编辑字段，且都标了 .volatile()（否则不进 settings.describe()，菜单里看不到）；
  * 3. 三档预设的每个 path 都真实存在，且默认配置恰好命中「均衡」档；
  * 4. 套用任一档位后 matchRiskPreset 必须回读为同一档（apply → match 往返一致）。
  */
@@ -21,6 +21,8 @@ const RISK_FIELD_PATHS = [
   'maxSessionPages',
   'sendPauseMinMs',
   'sendPauseMaxMs',
+  'turnGapMinMs',
+  'turnGapMaxMs',
   'longRunAfterSends',
   'longRunPauseMinMs',
   'longRunPauseMaxMs',

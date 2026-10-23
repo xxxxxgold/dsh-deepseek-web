@@ -42,6 +42,7 @@ import {
   type RiskPreset,
 } from './config-fields.ts'
 import { ROW_ENTRY_ID } from './config-page.tsx'
+import { LedgerCard } from './ledger-card.tsx'
 
 /** locale 命名空间；字典键与设置页文案一一对应。 */
 export const LOCALE_NAMESPACE = 'dsh-deepseek-web'
@@ -140,6 +141,29 @@ const STATIC_COPY = {
     listPlaceholder: '每行一个',
     shortcut: 'Ctrl+S 保存',
     unknownError: '未知错误',
+    'ledger.lang': 'zh',
+    'ledger.title': '调用台账（只读）',
+    'ledger.hint': '按天记录本机最近的网页调用元信息（不含对话内容与凭证），保留 7 天。相邻间隔只统计真正打过网页的成功对话轮，排队时间不算。',
+    'ledger.unavailable': '读不到台账：宿主没有提供 webServer 服务，或当前页面不是本机同源。这只影响这张卡片，不影响发送。',
+    'ledger.empty': '还没有记录（要么还没真正发过请求，要么刚装不久）。',
+    'ledger.total': '近 7 天调用',
+    'ledger.chat': '其中对话轮',
+    'ledger.failed': '失败次数',
+    'ledger.minGap': '最短间隔',
+    'ledger.medianGap': '中位间隔',
+    'ledger.p90Gap': 'p90 间隔',
+    'ledger.tight': '出现过 30 秒以内的连环请求——这正是最容易被判机器行为的形态，建议调大发送间隔或长休轮数。',
+    'ledger.failures': '失败分布：',
+    'ledger.days': '按天',
+    'ledger.perDay': ' 次',
+    'ledger.minutes': '{m} 分 {s} 秒',
+    'doctor.title': '安装自检',
+    'doctor.hint': '只报事实、不做修复。默认只跑静态检查（配置 / 浏览器 / 目录 / 构建标识），不会为了自检启动浏览器。',
+    'doctor.run': '运行自检',
+    'doctor.running': '自检中…',
+    'doctor.unavailable': '自检接口不可用（同上：宿主没有 webServer 服务）。也可以在命令行运行 npm run doctor。',
+    'doctor.ready': 'Doctor result: ready（有 warning 但无 error）',
+    'doctor.notReady': 'Doctor result: not ready（存在 error，按上面的条目逐项排查）',
   },
   en: {
     nav: 'DeepSeek Web',
@@ -180,6 +204,29 @@ const STATIC_COPY = {
     listPlaceholder: 'One per line',
     shortcut: 'Ctrl+S to save',
     unknownError: 'unknown error',
+    'ledger.lang': 'en',
+    'ledger.title': 'Call ledger (read-only)',
+    'ledger.hint': 'Daily metadata about this machine’s web calls (no message content, no credentials), kept for 7 days. Gaps only count successful chat turns that actually reached the web page; queueing time is excluded.',
+    'ledger.unavailable': 'Cannot read the ledger: the host exposes no webServer service, or this page is not same-origin. Only this card is affected — sending still works.',
+    'ledger.empty': 'No entries yet (either nothing was really sent, or the plugin was just installed).',
+    'ledger.total': 'Calls (7d)',
+    'ledger.chat': 'Chat turns',
+    'ledger.failed': 'Failures',
+    'ledger.minGap': 'Shortest gap',
+    'ledger.medianGap': 'Median gap',
+    'ledger.p90Gap': 'p90 gap',
+    'ledger.tight': 'A back-to-back request under 30 seconds was observed — the clearest machine-behaviour signal. Consider larger send gaps or a longer long-run pause.',
+    'ledger.failures': 'Failures: ',
+    'ledger.days': 'Per day',
+    'ledger.perDay': ' calls',
+    'ledger.minutes': '{m}m {s}s',
+    'doctor.title': 'Install self-check',
+    'doctor.hint': 'Reports facts only; it never fixes anything. Only static checks run by default (config / browser / directories / build id) — no browser is started for a self-check.',
+    'doctor.run': 'Run self-check',
+    'doctor.running': 'Checking…',
+    'doctor.unavailable': 'Self-check route unavailable (same reason: no webServer service). You can also run npm run doctor from a shell.',
+    'doctor.ready': 'Doctor result: ready (warnings allowed, no errors)',
+    'doctor.notReady': 'Doctor result: not ready (errors found — work through the items above)',
   },
 } as const
 
@@ -565,6 +612,8 @@ function SettingsSectionBody({ form, useSettingsForm, t, reload }: BodyProps): J
           </section>
         )
       })}
+
+      <LedgerCard t={t} />
 
       <footer className="dsweb-footer">
         <span className={STATUS_CLASS[status.tone]} role="status" aria-live="polite">{status.text}</span>

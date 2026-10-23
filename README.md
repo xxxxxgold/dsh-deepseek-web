@@ -29,7 +29,7 @@
 dsh-deepseek-web-littlecar30
 ```
 
-当前正式版为 **0.2.14**。需要固定版本时，填 `dsh-deepseek-web-littlecar30@0.2.14`。
+当前正式版为 **0.6.0**。需要固定版本时，填 `dsh-deepseek-web-littlecar30@0.6.0`。
 希望消息填入后自动发送，可改选 `deepseek-web-auto`。
 
 > [!IMPORTANT]
@@ -44,13 +44,13 @@ dsh-deepseek-web-littlecar30
 在同一个「添加插件」输入框粘贴发行包链接，也可以安装：
 
 ```text
-https://github.com/LittleCar30/dsh-deepseek-web/releases/download/v0.2.14/dsh-deepseek-web-littlecar30-0.2.14.tgz
+https://github.com/LittleCar30/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-littlecar30-0.6.0.tgz
 ```
 
 或从 [Release](https://github.com/LittleCar30/dsh-deepseek-web/releases/latest) 下载 `.tgz`，粘贴文件的完整绝对路径，例如：
 
 ```text
-C:\Users\你的用户名\Downloads\dsh-deepseek-web-littlecar30-0.2.14.tgz
+C:\Users\你的用户名\Downloads\dsh-deepseek-web-littlecar30-0.6.0.tgz
 ```
 
 发行包已包含 host/client 编译产物。安装依赖仍需要网络；镜像尚未同步时选择 npm 官方源。
@@ -86,7 +86,7 @@ C:\Users\你的用户名\Downloads\dsh-deepseek-web-littlecar30-0.2.14.tgz
 
 两个入口读写同一份配置：
 
-- **设置 → DeepSeek 网页**（推荐）：按「网页连接 / 网页模型与发送 / 图片直传 / 审核通道 / 频控自动重发 / 工具与委托 / 窗口聚焦 / 压缩摘要」八组排布，常用参数一页改完（超时、并发、防风控停顿等进阶字段仍走 profile patch，见[进阶文档](docs/ADVANCED.md#配置)）。
+- **设置 → DeepSeek 网页**（推荐）：按「网页连接 / 网页模型与发送 / 风控模式 / 图片直传 / 审核通道 / 频控自动重发 / 过程提示 / 浏览器自愈 / 登录探活 / 工具与委托 / 窗口聚焦 / 压缩摘要」十二组排布，常用参数一页改完（回合超时、锁租约等进阶字段仍走 profile patch，见[进阶文档](docs/ADVANCED.md#配置)）。
 - **插件 → `dsh-deepseek-web-littlecar30` → `llm-deepseek-web` → 配置**：插件管理器里的同一份表单。
 
 页面上的行为：
@@ -123,6 +123,23 @@ flowchart LR
 正常任务使用工作标签；dsh 的内部摘要与标题请求使用独立临时标签，完成、失败或取消后关闭。
 半自动模式下，内部请求也需要点击发送；全自动模式会自动发送。
 
+<a id="self-check"></a>
+## 自检与调用台账
+
+设置页底部是一张只读卡片，数据全部来自本机，不出网：
+
+- **调用台账**：按天记录每次网页调用的时间、用途（对话 / 辅助 / 审核）、结果与失败分类，只保留最近 7 天，**不记录对话内容与任何凭证**。卡片直接给出相邻对话间隔的最短 / 中位 / p90——最短间隔最能说明有没有连环请求。
+- **本机自检**：点一下按钮就跑一遍浏览器可执行文件、profile 可写性、登录态、输入框与发送按钮选择器、当前节流参数。检查项只报事实，不做修复，末尾给出 `ready` / `not ready`。
+
+命令行等价物：
+
+```bash
+npm run doctor             # 全量（会连接或拉起浏览器）
+npm run doctor -- --offline  # 只看静态项，不碰浏览器
+```
+
+「账号是否被限流」这类本地无法证明的事，自检会明确报 warning 而不是装作全部正常。
+
 <a id="faq"></a>
 ## 常见问题
 
@@ -153,6 +170,25 @@ dsh 的内部压缩请求可能要求生成英文交接摘要，它应作为后�
 
 升级并重启后继续原任务即可，无需删除状态文件。宿主历史已经缺少任务信息时，需重新说明任务。
 [查看压缩接续的恢复条件与限制](docs/ADVANCED.md#context-recovery)。
+
+</details>
+
+<details>
+<summary><b>同时开几个会话，会抢同一个网页标签吗？</b></summary>
+
+不会。**每个 dsh 会话独占一个网页标签页**，主会话和它派生的子代理也各拿一个
+（两个不同的 sessionId），各自带一把会话锁，所以不同会话可以同时跑，同一会话的
+多个请求仍然串行（它们共用同一个网页对话）。
+
+三个边界：
+
+- 标签页上限是 `maxSessionPages`（默认 3）。超了会回收「最久未用且当前没在跑」的那一页；
+  被回收的会话下次请求会重新回放一遍宿主上下文，**任务不会丢，只是那条会慢一点**。
+- dsh 内部的压缩摘要、会话标题这类辅助请求走**一次性临时标签页**，用完就关，
+  不占上面这个上限，也不占会话锁。
+- 但全局还有 `maxConcurrentTurns`（默认 1）：多会话各占自己的标签页，同一时刻只有
+  一条请求真正打网页，其余按先进先出排队。原因是网页端的频控和临时封禁按**账号**结算，
+  不是按标签页——同时开两条生成最容易触发。
 
 </details>
 
@@ -218,11 +254,13 @@ Windows 默认数据目录是 `%LOCALAPPDATA%\DshDeepSeekWeb\`，可在配置中
 npm install
 npm run build
 npm run test:parsers
+npm run doctor     # 可选：本机体检（浏览器 / profile / 登录态 / 输入框 / 调用节奏）
 npm pack
 ```
 
 构建生成 `lib/index.js` 与 `lib/client.js`，发行包无需用户编译。
-11 项离线检查覆盖 SSE 解析、工具动作、频控、用量、长委托回复、辅助调用隔离与压缩接续。
+35 项离线检查覆盖 SSE 解析、工具动作、频控、冷却与重试预算、调用台账、工具目录预算、用量、长委托回复、辅助调用隔离与压缩接续。
+`npm run doctor` 只报事实不做修复，`--offline` 跳过需要拉起浏览器的检查。
 浏览器隔离使用模拟页面验证；网页登录、站点结构及发送行为需要真实网页另行验证。
 
 <details>

@@ -25,10 +25,23 @@ export class AsyncLock {
   private tail: Promise<void> = Promise.resolve()
   /** 当前排队中的请求数（只用于观测与日志，不含已持有者）。 */
   private waiters = 0
+  /** 当前持有锁的请求数（正常是 0 或 1；租约强制释放后可能短暂重叠）。 */
+  private held = 0
 
   /** 排队中的请求数（快照）。 */
   get pending(): number {
     return this.waiters
+  }
+
+  /**
+   * 这把锁现在还有没有人在用（持有中或有人排队）。
+   *
+   * 给调用方做「空闲即回收」用：按会话建锁的 Map 如果不回收，
+   * 每开一个新会话就永久留下一个锁对象，长跑的宿主会慢慢涨。
+   * 判断必须保守——宁可多留一会儿，也不能删掉一把可能有人排队的锁。
+   */
+  get busy(): boolean {
+    return this.held > 0 || this.waiters > 0
   }
 
   async acquire(signal?: AbortSignal, options: AcquireOptions = {}): Promise<() => void> {
@@ -47,6 +60,7 @@ export class AsyncLock {
     const settle = (): void => {
       if (released) return
       released = true
+      if (this.held > 0) this.held--
       if (leaseTimer) {
         clearTimeout(leaseTimer)
         leaseTimer = undefined
@@ -76,6 +90,7 @@ export class AsyncLock {
       signal?.throwIfAborted()
       this.waiters--
       counted = false
+      this.held++
 
       if (options.maxHoldMs && options.maxHoldMs > 0) {
         const { maxHoldMs } = options

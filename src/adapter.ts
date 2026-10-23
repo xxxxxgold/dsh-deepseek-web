@@ -1,3 +1,9 @@
+/** 把冷却分类映射成台账里的失败分类（timeout 单独拆出来，便于看「是超时还是限流」）。 */
+function toLedgerFailure(kind: FailureClass, code: string | undefined): NonNullable<LedgerEntry['failure']> {
+  if ((code ?? '').toUpperCase().includes('TIMEOUT')) return 'timeout'
+  return kind
+}
+
 /**
  * deepseek-web LlmAdapter：把网页版对话包装成 Harness 的流式模型调用。
  *
@@ -38,15 +44,24 @@ import {
   stripProtocolPrefix,
   systemProtocolFor,
   visibleToolsOf,
+  WEB_MARKERS,
 } from './protocol.ts'
 import type { ImageAttachmentRef } from './protocol.ts'
 import { buildReviewEvidence } from './protocol.ts'
+import {
+  Ledger,
+  type LedgerEntry,
+  type LedgerPurpose,
+  type LedgerSummary,
+} from './ledger.ts'
+import { classifyFailureCode, type FailureClass } from './cooldown.ts'
 import { SessionRegistry, type ChannelTokenTotals, type WebChatState } from './session-state.ts'
 import { ConcurrencyGate } from './concurrency-gate.ts'
 import type { ReviewVerdict } from './reviewer.ts'
 import { formatNotice, noticeEnabled, type NoticeEvent, type NoticePayload } from './notify.ts'
 import os from 'node:os'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { AsyncLock } from './async-lock.ts'
 
 /** 拆出委托动作（如 web_search/web_fetch）：本地校验与执行都不含它们。 */
@@ -151,6 +166,8 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   private readonly onUsage?: (totals: ChannelTokenTotals) => void
   /** 图片附件读取器；缺省表示宿主没提供附件服务，图片退回文本标记。 */
   private readonly readImage?: ReadImageAttachment
+  /** 调用台账：按天记请求密度的元信息（不记正文、不记凭证）。 */
+  private readonly ledger: Ledger
 
   constructor(
     config: Config,
@@ -169,6 +186,10 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const defaultStateFile = config.stateFile
       ?? path.join(appDataRoot, 'DshDeepSeekWeb', 'session-state.json')
     this.sessions = new SessionRegistry({ file: defaultStateFile })
+    // 台账跟状态文件放同一目录：生产环境仍是 %LOCALAPPDATA%\DshDeepSeekWeb\call-ledger.json，
+    // 但离线回归把 stateFile 指到临时目录时，测试数据不会写进用户的真实台账
+    // （否则自检卡片会把测试跑出来的 0ms 间隔当成真实使用统计）。
+    this.ledger = new Ledger({ file: path.join(path.dirname(defaultStateFile), 'call-ledger.json') })
     this.gate = new ConcurrencyGate(() => this.config.maxConcurrentTurns)
     this.warnAboutTimeoutConfig()
   }
@@ -220,7 +241,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     }
   }
 
-  /** 按会话取锁：首次使用时创建，进程内长期复用（锁本身无状态，只有排队链）。 */
+  /** 按会话取锁：首次使用时创建，释放后由 releaseLock() 回收（锁本身无状态，只有排队链）。 */
   private lockFor(key: string): AsyncLock {
     let lock = this.sessionLocks.get(key)
     if (!lock) {
@@ -228,6 +249,20 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       this.sessionLocks.set(key, lock)
     }
     return lock
+  }
+
+  /**
+   * 释放后回收空闲锁。
+   *
+   * 为什么要有：锁是按会话（以及「会话::用途」）建的，会话结束没有任何回调通知插件，
+   * 不回收就是每开一个新会话永久留下一个锁对象——长跑宿主 + 大量子代理会话会慢慢涨。
+   * 只在 busy=false（没人持有、没人排队）时删：此时 Map 里删掉不会有第二个持有者，
+   * 下一个请求会重新建一把新锁，语义与复用等价。
+   */
+  private releaseLock(key: string, lock: AsyncLock): void {
+    if (this.sessionLocks.get(key) !== lock) return
+    if (lock.busy) return
+    this.sessionLocks.delete(key)
   }
 
   /** 读取通道 token 用量总计（宿主注册设置命名空间时用作初始值）。 */
@@ -381,7 +416,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const brief = buildHandoffBrief(options, state)
     // 原消息若已带协议前缀则剥掉，避免与新对话首条消息里的协议重复
     const bodyText = stripProtocolPrefix(request.text)
-    const catalog = buildToolCatalog(visibleToolsOf(options, this.config), this.config.compactToolCatalog)
+    const catalog = buildToolCatalog(visibleToolsOf(options, this.config), this.config.compactToolCatalog, this.config.maxToolCatalogChars)
     const retryText = [
       systemProtocolFor(this.config.enableImageUpload),
       catalog && `当前任务上下文可用的工具：\n${catalog}`,
@@ -420,8 +455,19 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     return Math.max(0, Math.round(accumulated - baseline))
   }
 
+  /** 台账摘要（设置页只读卡片 / 自检读）。 */
+  async ledgerSummary(): Promise<LedgerSummary> {
+    await this.ledger.load()
+    return this.ledger.summary()
+  }
+
   async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     const sessionId = options.sessionId ?? 'anonymous'
+    // 台账的 `at` 用「真正开始打网页」的时刻，而不是进入 stream 的时刻：
+    // 排队等会话锁/并发名额的时间不该算进相邻对话间隔，否则台账会把排队误报成请求过密。
+    let webStartedAt = Date.now()
+    // 失败码只在 catch 里赋值；finally 用它记台账（成功时为 undefined）。
+    let failureCode: string | undefined
     // 锁粒度 = 会话。不同会话（主会话 vs 它派生的子代理）各自持锁、各自用网页标签页，
     // 可以真并行；同一会话的多个网页回合仍然串行，因为共用一个网页对话。
     // 辅助请求（compaction / session-title）走一次性临时标签页，锁键再带上 purpose：
@@ -471,6 +517,8 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         ),
       })
       const gateWaitedMs = Date.now() - gateStartedAt
+      // 名额到手才算「真的开始打网页」：排队时间不计入台账的请求间隔。
+      webStartedAt = Date.now()
       const gateStats = this.gate.stats()
       if (gateWaitedMs >= 500 || gateStats.pending > 0) {
         console.info(
@@ -506,6 +554,10 @@ export class DeepSeekWebAdapter extends LlmAdapter {
           if (!completed) this.replaySessions.add(sessionId)
         }
       }
+    } catch (error) {
+      // 台账只记分类，不记正文：把失败码留下来给 finally 用。
+      failureCode = error instanceof LlmError ? error.code : 'WEB_TURN_FAILED'
+      throw error
     } finally {
       if (queueLog) clearTimeout(queueLog)
       if (watchdog) clearTimeout(watchdog)
@@ -519,6 +571,43 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       gateRelease = undefined
       releaseGate?.()
       releaseOnce()
+      this.releaseLock(lockKey, lock)
+      // 记账放在放锁之后：台账写盘再慢也不该占着并发名额。
+      // 仍然要 await：台账文件与状态文件同目录，调用方（尤其是离线回归）
+      // 会在流结束后立刻清理临时目录，后台写盘会撞上「目录已删 / 非空」。
+      await this.recordLedger(options, webStartedAt, completed, failureCode)
+    }
+  }
+
+  /**
+   * 往调用台账记一笔（元信息，不含正文）。
+   *
+   * 失败分类复用 cooldown 的归类口径，保证「进冷却」与「台账里算失败」是同一套判据，
+   * 不会出现台账显示一片正常、实际却已经被限流的情况。
+   */
+  private async recordLedger(
+    options: GenerateOptions,
+    startedAt: number,
+    completed: boolean,
+    failureCode: string | undefined,
+  ): void {
+    const purpose: LedgerPurpose = options.purpose === undefined
+      ? 'chat'
+      : options.purpose === 'compaction' || options.purpose === 'session-title'
+        ? 'auxiliary'
+        : 'review'
+    const kind = classifyFailureCode(failureCode)
+    const entry: LedgerEntry = {
+      at: startedAt,
+      purpose,
+      outcome: completed ? 'ok' : 'failed',
+      durationMs: Date.now() - startedAt,
+      ...completed ? {} : { failure: toLedgerFailure(kind, failureCode), ...failureCode !== undefined ? { code: failureCode } : {} },
+    }
+    try {
+      await this.ledger.record(entry)
+    } catch {
+      // 台账是观测工具，任何写入失败都不该影响真实发送
     }
   }
 
@@ -565,6 +654,11 @@ export class DeepSeekWebAdapter extends LlmAdapter {
    * 把本轮图片引用读成可以上传的字节。
    * 单张读失败按 `uploadOnError` 处理：`abort` 直接抛错；`fallback-text` 跳过该张，
    * 正文里仍留着 `[附图: 文件名]` 标记，但该张确实没上去（不会假装成功）。
+   *
+   * 同一张图在**同一轮**里只上传一次：按字节 sha256 去重。网页端对重复的
+   * `ref_file_ids` 会整轮拒绝（并让该会话后续每轮都失败），而宿主完全可能把同
+   * 一张图以两个 attachmentId 交过来（例如用户重复拖入、或压缩后重现）。去重只影响
+   * 上传列表，`[附图: N]` 标记与正文顺序保持不变。
    */
   private async loadAttachments(
     refs: readonly ImageAttachmentRef[],
@@ -572,11 +666,19 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   ): Promise<BrowserImageAttachment[] | undefined> {
     if (!this.readImage) return undefined
     const loaded: BrowserImageAttachment[] = []
+    const seen = new Set<string>()
     for (const ref of refs) {
       signal?.throwIfAborted()
       try {
         const image = await this.readImage(ref)
-        if (image) loaded.push(image)
+        if (!image) continue
+        const digest = createHash('sha256').update(image.data).digest('hex')
+        if (seen.has(digest)) {
+          console.info(`[deepseek-web] 同一张图本轮已上传过，跳过重复附件：${image.name}`)
+          continue
+        }
+        seen.add(digest)
+        loaded.push(image)
       } catch (error) {
         if (this.config.uploadOnError === 'abort') {
           throw new LlmError(
@@ -906,7 +1008,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
           '[审核反馈] 独立审核员认为当前产出未通过审核，请修正后重新输出。',
           verdict.issues.length > 0 ? `问题：\n${verdict.issues.map(item => `- ${item}`).join('\n')}` : '',
           verdict.suggestions.length > 0 ? `建议：\n${verdict.suggestions.map(item => `- ${item}`).join('\n')}` : '',
-          state.goalText ? `[当前用户任务]\n${state.goalText}` : '',
+          state.goalText ? `${WEB_MARKERS.goal}\n${state.goalText}` : '',
           '若需要调用工具，请只输出 JSON 动作；否则输出修正后的最终正文。',
         ].filter(Boolean).join('\n\n')
         const revised = yield* this.driveTurnAuto({

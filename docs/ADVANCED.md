@@ -7,7 +7,7 @@
 已配置 dsh CLI 时，可以用官方插件管理命令安装同一个包：
 
 ```bash
-dsh plugin --profile desktop add https://github.com/LittleCar30/dsh-deepseek-web/releases/download/v0.2.14/dsh-deepseek-web-littlecar30-0.2.14.tgz
+dsh plugin --profile desktop add https://github.com/LittleCar30/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-littlecar30-0.6.0.tgz
 ```
 
 仅在需要手工管理 profile 时，把以下字段合并到现有清单，保留原有依赖和 bundles：
@@ -15,7 +15,7 @@ dsh plugin --profile desktop add https://github.com/LittleCar30/dsh-deepseek-web
 ```json
 {
   "dependencies": {
-    "dsh-deepseek-web-littlecar30": "https://github.com/LittleCar30/dsh-deepseek-web/releases/download/v0.2.14/dsh-deepseek-web-littlecar30-0.2.14.tgz"
+    "dsh-deepseek-web-littlecar30": "https://github.com/LittleCar30/dsh-deepseek-web/releases/download/v0.6.0/dsh-deepseek-web-littlecar30-0.6.0.tgz"
   },
   "dsh": {
     "profile": {
@@ -70,11 +70,12 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 
 ## 配置
 
-配置入口有两个：**设置 → DeepSeek 网页**（9 组 34 项常用参数，保存即写回 profile 的
+配置入口有两个：**设置 → DeepSeek 网页**（12 组 59 项常用参数，保存即写回 profile 的
 `cordis.patch.yml`），以及桌面版“插件”页面 → `dsh-deepseek-web-littlecar30` →
 `llm-deepseek-web` → “配置”（同一份表单）。下表的进阶字段（回合/流超时、锁租约等）
-仍没有表单入口，直接在 patch 的 `config` 中写入；**并发上限、标签页上限与防风控停顿**
-已并入表单的「风控模式」分组，并带「关闭 / 均衡 / 严格」一键档位。
+仍没有表单入口，直接在 patch 的 `config` 中写入；**并发上限、标签页上限、防风控停顿、
+账号冷却、工具目录预算、登录探活** 已并入表单，其中防风控相关项集中在「风控模式」分组，
+并带「关闭 / 均衡 / 严格」一键档位。
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
@@ -89,8 +90,9 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `maxToolResultChars` | `6000` | 工具结果送入网页模型的字符上限，按头尾截断；不截断最终正文或网页委托结果 |
 | `streamIdleTimeoutMs` | `600000` | 网页流空闲超时（毫秒），默认 10 分钟。自动发送时「回车 → 看到响应头」这一段另由 `SEND_ACK_TIMEOUT_MS`（3 分钟）封顶，所以实际不会等满 10 分钟；人工发送（`sendMode: manual`）不吃这个值，固定给 3 分钟等你点发送。`review.streamIdleTimeoutMs` 同默认 `600000`（10 分钟），审核首响应另封顶 2 分钟 |
 | `maxSessionPages` | `3` | 同时保留的会话标签页上限（每个并发会话独占一页）；超出按“最久未用且当前没在跑”的页回收，`1`–`8` |
-| `maxConcurrentTurns` | `2` | 全局并发上限：同一时刻最多几条请求真在网页上跑（主会话/子代理/辅助请求一起算）；超出的按先进先出排队，`0` 表示不限制 |
+| `maxConcurrentTurns` | `1` | 全局并发上限：同一时刻最多几条请求真在网页上跑（主会话/子代理/辅助请求一起算）；超出的按先进先出排队，`0` 表示不限制。默认 `1` 是因为网页端的频控与临时封禁按**账号**结算，不是按标签页——多会话仍各自占一个标签页，但同一时刻只有一个在真正打网页 |
 | `sendPauseMinMs` / `sendPauseMaxMs` | `2000` / `4000` | 全自动发送时，消息填入输入框之后、按回车之前的随机停留区间（毫秒）；真人不会打完字立刻回车，固定延迟方差≈0 反而是机器特征。两者为 `0` 即关闭 |
+| `turnGapMinMs` / `turnGapMaxMs` | `2000` / `4000` | **回合间隔**：上一轮网页回合结束到下一轮真正发请求之间的随机等待区间（毫秒）。与 `sendPause*` 的区别是计时起点——那个只管「填字完成 → 回车」，这个管回合与回合之间。长任务连续续跑时，旧行为是上一轮结束立刻发下一条（0 间隔），最像脚本。两者为 `0` 即关闭 |
 | `longRunAfterSends` | `15` | 连续发满多少轮后强制静默一段（防风控），`0` 关闭；10 分钟内无请求即视为断开、重新计数 |
 | `longRunPauseMinMs` / `longRunPauseMaxMs` | `30000` / `60000` | 上面那次强制静默的随机区间（毫秒），默认 30–60 秒 |
 | `turnTimeoutMs` | `900000` | 单个网页回合上限，超时中止并报错，`0` 表示不限制 |
@@ -102,6 +104,7 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `rateLimit.backoff` | `exponential` | 退避曲线：`exponential` 每次翻倍；`fixed` 每次都等 `retryDelayMs` |
 | `rateLimit.retryMaxDelayMs` | `300000` | 单次等待封顶（毫秒），防止退避越滚越长把回合拖死 |
 | `rateLimit.jitterRatio` | `0.15` | 每次等待在基准值上随机浮动 ±15%，避免多实例同一秒重撞 |
+| `rateLimit.accountCooldownMs` | `600000` | 自动重发用尽后，给**整个账号**上一把冷却锁（毫秒）：冷却期内所有会话都不再向网页发请求，直接报 `WEB_ACCOUNT_COOLDOWN`。`0` 关闭——但那意味着一个会话被限流后别的会话照打网页，正是最容易触发 1 天封禁的形态 |
 | `notify.enabled` | `true` | 过程提示总开关（关掉后对话里和浏览器里都不再有提示） |
 | `notify.session` | `true` | 主对话提示（前缀 `[DSH]`）：发送、接收、完成、频控等待/重发、失败 |
 | `notify.review` | `true` | 审核提示（前缀 `[DSH·审核]`），与会话提示分开显示 |
@@ -114,6 +117,11 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `browserRecovery.delayMs` | `2000` | 重新拉起浏览器前的等待（毫秒），给系统回收窗口句柄 |
 | `toolAllowlist` | 常用文件/终端工具 | 暴露给网页模型的工具白名单 |
 | `excludeToolNames` | `['web_search']` | 强制隐藏的工具名 |
+| `maxToolCatalogChars` | `28000` | 单次下发给网页模型的工具目录字符预算。超预算时先逐条退让、只留能装下的工具，并在末尾**点名列出被省略的工具**（静默砍工具会让模型表现成「不会用工具」）；`0` 不限制 |
+| `maxReplayChars` | `400000` | 全量回放历史时单条消息的字符上限。网页输入框填字代价接近二次方增长（30 万字符约 13 秒、60 万约 77 秒、110 万会拖死主线程），超预算按消息粒度丢弃最早的历史并留一行省略说明；系统指令与协议清单不计入预算；`0` 关闭 |
+| `loginProbe.enabled` | `true` | 是否在后台只读检查网页登录态（不发送、不消耗额度）。失效时只提醒，不拦发送 |
+| `loginProbe.initialDelayMs` | `20000` | 启动后多久做第一次探活（毫秒） |
+| `loginProbe.intervalMs` | `1800000` | 之后每隔多久探一次（毫秒，默认 30 分钟）；`0` 只探一次 |
 | `review.enabled` | `false` | 是否启用交付审核 |
 | `review.provider` | 发行 patch 为 `deepseek-web`；schema 为 `kimi` | `deepseek-web`、`kimi` 或 `glm` |
 | `review.debugPort` | `9334` | Kimi 审核浏览器 CDP 端口 |
@@ -137,15 +145,20 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 （它们共用同一个网页对话）。
 
 但同一个 DeepSeek 账号的网页端并发不是无限的，并发太高会一起触发“发送过于频繁”。
-因此插件还有一层全局并发网关：`maxConcurrentTurns`（默认 `2`）。当前正在网页上跑的
+因此插件还有一层全局并发网关：`maxConcurrentTurns`（默认 `1`）。当前正在网页上跑的
 请求数达到上限后，新的请求按到达顺序**先进先出排队**，每结束一个就放行下一个：
 
 - 想更并行：把 `maxConcurrentTurns` 调到 3–4，同时把 `maxSessionPages` 调到不小于它；
-- 想更稳（频繁限流）：降到 `1`，等于全局串行，一次只跑一个会话；
+  这会提高被网页判「同时开多个窗口」的风险，账号重要时不要这么做；
+- 默认 `1`：多会话仍各占自己的标签页，但同一时刻只有一个在真打网页；
 - `0` 表示完全不限制（只计数、不排队），一般不建议——高并发下所有会话会一起重试退避。
 
 排队超过 3 秒会在日志里打印“会话 xxx 排队中/并发上限已满”，与“卡死”区分开；
 关掉窗口或取消生成时，排队中的请求会立即退出队列，不会占住名额。
+
+自动重发用尽后，账号级冷却（`rateLimit.accountCooldownMs`，默认 10 分钟）会把**所有会话**
+一起暂停：冷却期内的请求不发往网页，直接报 `WEB_ACCOUNT_COOLDOWN` 并说明剩余时间。
+这把锁跨进程内的通道实例存在，改配置或热重载都不会绕过它。
 
 ### 只返回结果与长回复
 
@@ -158,6 +171,50 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 网页委托（如 `web_search` / `web_fetch`）返回的正文会完整展示，不再因超过
 6000 字符而丢失末尾结论。`maxToolResultChars` 仍用于限制送入网页模型的工具结果，
 审核证据的长度限制也继续生效。网页自身的生成或上下文长度上限仍由站点决定。
+
+## 自检与调用台账
+
+两个能力都只读、只在本机：不发送消息、不消耗网页额度、不上传任何数据。
+
+### `npm run doctor`：本机体检
+
+```bash
+npm run doctor                # 全量：静态项 + 需要浏览器的项
+npm run doctor -- --offline   # 只跑静态项，完全不碰浏览器
+```
+
+退出码 `0` = ready，`1` = not ready。检查项逐条给 `✓ / ! / ✗` 与一行说明：
+
+| 检查 | 内容 |
+| --- | --- |
+| `browser-executable` | `msedge` / `chrome` 两个通道分别查，命中就打印可执行文件路径 |
+| `browser-channel-missing` | 配置里选的通道本机没有，直接把两个通道的查找路径列出来 |
+| `profile` | profile 目录能否真正写入（写一个临时文件再删，比 `access(W_OK)` 可信）；`attach` 模式跳过这项 |
+| `state-file` | 会话游标文件所在目录是否可写 |
+| `build` | 磁盘上的代码构建标识 vs `%LOCALAPPDATA%\DshDeepSeekWeb\loaded-build.json` 里记的加载戳——不一致说明「改代码、重启、线上还是老行为」 |
+| `ledger` | 台账里近 7 天的调用次数、失败数、相邻对话间隔的最短/中位/p90；最短间隔 < 30 秒判 warning |
+| `cdp` | 已在跑的 CDP 端口是否可连（连着就直接复用，不再二次启动浏览器） |
+| `login` | 只读判断登录态：跳登录页 / 登录墙 |
+| `editor` / `send-button` | 输入框与发送按钮的选择器命中情况（跑一遍候选表，输出 `n/m 命中：…`）；发送按钮找不到只判 warning，纯回车站点本来就没有 |
+| `pacing` | 回显当前的发送间隔、长休、并发上限、标签页上限、回放预算 |
+| `account-standing` | **永远是 warning**：本地无法证明账号没被限流，请到网页确认一次 |
+
+设计口径与竞品 `dsh-chatgpt-web` 的 doctor 一致：**只报事实，不做修复**；本地证明不了的事一律
+warning，不假装全绿。
+
+### 调用台账
+
+`src/ledger.ts` 把每次网页调用记到 `%LOCALAPPDATA%\DshDeepSeekWeb\call-ledger.json`：
+
+- 每条只有 `{at, purpose, outcome, failure?, code?, durationMs?}` —— **没有对话内容，没有凭证**。
+- `purpose` 分 `chat` / `auxiliary` / `review`；`failure` 分 `rate-limit` / `account-blocked` / `login` / `network` / `timeout` / `other`。
+- 滚动保留 7 天，按天归档；写盘走临时文件 + `rename` 原子替换，文件损坏时从空台账开始，绝不影响真实发送。
+- 统计口径：相邻对话间隔**只算 `purpose === 'chat'` 且成功的记录**——失败重试会把最短间隔压成无意义的 2 秒，辅助请求是高频旁路。
+
+设置页底部（十二组配置之后）是这张卡片的只读视图：六格统计、失败分布、按天列表，
+以及一个「运行自检」按钮（点了才会去连浏览器）。数据走同源只读路由
+`/api/dsh-deepseek-web/ledger` 与 `/api/dsh-deepseek-web/doctor`，围栏要求 Host 是 loopback、
+拒绝 `sec-fetch-site: cross-site`、Origin 必须同源；没有 `webServer` 服务的老宿主上这段自动不注册。
 
 ## 审核通道
 

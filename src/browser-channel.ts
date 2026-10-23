@@ -7,7 +7,6 @@
  * @module dsh-deepseek-web/browser-channel
  */
 
-import type { LlmError } from '@deepseek-ai/dsh-llm'
 import type { Config } from './config.ts'
 import type { NoticePayload } from './notify.ts'
 

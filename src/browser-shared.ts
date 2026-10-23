@@ -642,7 +642,13 @@ function browserCandidates(channel: 'msedge' | 'chrome'): string[] {
     : ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium']
 }
 
-function resolveBrowserExecutable(channel: 'msedge' | 'chrome'): string | undefined {
+/**
+ * 解析当前平台上的浏览器可执行文件。
+ *
+ * 导出给 doctor 用：自检要能回答「本机到底有没有 Edge/Chrome、装在哪」，
+ * 而不是等启动时才抛 BROWSER_NOT_FOUND。返回 undefined 表示没找到。
+ */
+export function resolveBrowserExecutable(channel: 'msedge' | 'chrome'): string | undefined {
   return browserCandidates(channel).find(candidate => existsSync(candidate))
 }
 

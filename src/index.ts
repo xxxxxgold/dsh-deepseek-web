@@ -20,6 +20,12 @@ import { PlaywrightBrowserChannel } from './playwright-channel.ts'
 import { KimiBrowserChannel } from './kimi-channel.ts'
 import { GLMChannel } from './glm-channel.ts'
 import { DeepSeekSelfReviewer, GlmReviewer, KimiReviewer } from './reviewer.ts'
+import { defaultProfileDir } from './browser-shared.ts'
+import { runDoctor } from './doctor.ts'
+import { registerBridgeRoutes, type BridgeContext } from './ledger-route.ts'
+import { LoginProbeScheduler, summarizeLoginProbe } from './login-probe.ts'
+import os from 'node:os'
+import path from 'node:path'
 
 export const name = 'llm-deepseek-web'
 export const inject = ['llm']
@@ -118,6 +124,48 @@ export function apply(ctx: Context, config: Config): void {
       void glmChannel.dispose().catch(() => {})
     }
   }, 'llm-deepseek-web')
+
+  // 登录态主动探活：只读判断，不发送、不消耗额度。默认启动后 20 秒探一次、
+  // 之后每 30 分钟一次；浏览器没起来时只记 unknown，绝不为了探活拉起浏览器。
+  // 失效时走提示通道提醒一次——但**不阻塞发送**：探活是旁路，判断错了不该拦住用户。
+  if (live.loginProbe.enabled) {
+    const probe = new LoginProbeScheduler({
+      target: channel,
+      initialDelayMs: live.loginProbe.initialDelayMs,
+      intervalMs: live.loginProbe.intervalMs,
+      onResult: (result) => {
+        if (result.status === 'expired') {
+          ctx.logger.warn(`[llm-deepseek-web] ${summarizeLoginProbe(result)}；请在网页窗口重新登录。`)
+        } else {
+          ctx.logger.info(`[llm-deepseek-web] ${summarizeLoginProbe(result)}`)
+        }
+      },
+    })
+    ctx.effect(() => {
+      probe.start()
+      return () => probe.stop()
+    }, 'llm-deepseek-web: login probe')
+  }
+
+  // 设置页的「调用台账 / 自检」需要一个只读数据通道：台账落在本地文件里，
+  // 浏览器半侧读不到文件系统。`webServer` 是可选的（headless / TUI 宿主没有），
+  // 所以不写进 `inject`，改用可选注入——没有它时插件照常工作，只是看不到那张卡片。
+  ctx.inject(['webServer'], (sub) => {
+    const appDataRoot = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local')
+    const stateFile = live.stateFile || path.join(appDataRoot, 'DshDeepSeekWeb', 'session-state.json')
+    // 台账和状态文件同目录（与 adapter 的取法一致），自定义 stateFile 时卡片才指得对。
+    const ledgerFile = path.join(path.dirname(stateFile), 'call-ledger.json')
+    const profileDir = live.profileDir || defaultProfileDir('edge-profile')
+    sub.effect(
+      () => registerBridgeRoutes(sub as unknown as BridgeContext, {
+        readLedger: () => adapter.ledgerSummary(),
+        readDoctor: wantLive => runDoctor({ config: live, profileDir, stateFile, live: wantLive }),
+        ledgerFile,
+        build: BUILD,
+      }),
+      'llm-deepseek-web: readonly bridge',
+    )
+  })
 
   ctx.logger.info(
     `[llm-deepseek-web] provider "${PROVIDER}" registered`
