@@ -264,12 +264,72 @@ function parseDsml(text: string): WebToolAction[] | undefined {
   return actions.length ? actions : undefined
 }
 
+/**
+ * 模型偶尔改用 XML 标签包一个 OpenAI 风格调用：
+ * `<tool_call>{"name":"read","arguments":{...}}</tool_call>`。
+ *
+ * 只认「整条回复就是这一个调用块」：同名标签夹在散文中间时通常是示例代码，
+ * 误执行比不执行更糟。标签内 JSON 必须自带工具名，参数可缺省。
+ */
+const XML_TOOL_CALL_TAGS = ['tool_calls', 'tool_call', 'function_calls', 'function_call'] as const
+
+function xmlPayloadToActions(payload: unknown): WebToolAction[] | undefined {
+  const items = Array.isArray(payload) ? payload : [payload]
+  const actions: WebToolAction[] = []
+  for (const item of items) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) return undefined
+    const obj = item as Record<string, unknown>
+    const name = typeof obj.name === 'string' && obj.name.trim()
+      ? obj.name.trim()
+      : typeof obj.tool === 'string' && obj.tool.trim() ? obj.tool.trim() : undefined
+    if (!name) return undefined
+    let rawParams = obj.arguments ?? obj.params ?? obj.parameters ?? {}
+    // OpenAI 的 arguments 常是「JSON 字符串」而不是对象。
+    if (typeof rawParams === 'string') {
+      try {
+        rawParams = JSON.parse(rawParams) as unknown
+      } catch {
+        return undefined
+      }
+    }
+    if (typeof rawParams !== 'object' || rawParams === null || Array.isArray(rawParams)) return undefined
+    actions.push({ tool: name, params: rawParams as Record<string, unknown> })
+  }
+  return actions.length > 0 ? actions : undefined
+}
+
+function parseXmlToolCall(text: string): WebToolAction[] | undefined {
+  const candidate = text.replace(/^```(?:xml|json)?\s*([\s\S]*?)```$/i, '$1').trim()
+  for (const tag of XML_TOOL_CALL_TAGS) {
+    const matched = candidate.match(
+      new RegExp(`^<\\s*${tag}\\s*>\\s*([\\s\\S]*?)\\s*<\\s*/\\s*${tag}\\s*>$`, 'i'),
+    )
+    if (!matched) continue
+    let payload: unknown
+    try {
+      payload = JSON.parse(matched[1]!)
+    } catch {
+      return undefined
+    }
+    return xmlPayloadToActions(payload)
+  }
+  return undefined
+}
+
 export function parseWebReply(text: string): ParsedWebReply {
   const trimmed = text.trim()
   if (/<\/?[｜|]{2}DSML[｜|]{2}/.test(trimmed)) {
     const actions = parseDsml(trimmed)
     // DSML 中的 JSON 参数不能被误解析成另一个顶层动作。
     return { hasActions: !!actions, actions: actions ?? [], text: trimmed }
+  }
+  const xmlActions = parseXmlToolCall(trimmed)
+  if (xmlActions) {
+    return {
+      hasActions: true,
+      actions: xmlActions.map(action => ({ ...action, params: normalizeParams(action) })),
+      text: trimmed,
+    }
   }
   const parsed = extractJsonObject(trimmed)
   if (parsed && typeof parsed === 'object') {
@@ -318,6 +378,9 @@ export function looksLikeIntendedToolReply(text: string): boolean {
   const trimmed = text.trim()
   if (trimmed.length === 0) return true
   if (/<\/?[｜|]{2}DSML[｜|]{2}/.test(trimmed)) return true
+  // 标签形态能解析时 parseWebReply 已经接手；走到这里说明标签内 JSON 坏了，
+  // 此时必须纠错——否则一坨 <tool_call> 会被当成最终回答交给用户。
+  if (/<\s*\/?\s*(?:tool_calls?|function_calls?|invoke)\b/i.test(trimmed)) return true
   // 最终报告可以包含 JSON 代码示例；仅拦截整条回复的动作信封。
   const candidate = trimmed.replace(/^```(?:json)?\s*([\s\S]*?)(?:```)?$/i, '$1').trim()
   if (/^\{\s*["']?(?:actions|tool|action)["']?\s*:/i.test(candidate)) return true
