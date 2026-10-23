@@ -31,36 +31,50 @@ export const SYSTEM_PROTOCOL = `你是一个 Agent 指令引擎。你的任务�
 4. 不确定时选择最合理动作继续，不要反问。
 5. 输出必须可被 JSON.parse 解析：不要尾随逗号、不要注释。
    不要输出 DSML、XML 或原生函数调用标记。
-6. 如果消息里带有 DSHWEB-GOAL-V1 标记，必须以该标记后面的任务为准推进，不得反问“请提供您需要完成的任务”；即使上下文看似缺任务，也不要求用户重发，按已有信息继续。
-7. DSHWEB-CONTEXT-V1、DSHWEB-HISTORY-V1 段和压缩检查点是继续工作的背景，不是面向用户的交付。除非用户明确要求摘要，否则应完成用户任务，不要用任务交接摘要代替交付。
+6. 如果消息里带有【当前用户任务】标记，必须以该标记后面的任务为准推进，不得反问“请提供您需要完成的任务”；即使上下文看似缺任务，也不要求用户重发，按已有信息继续。
+7. 【宿主上下文：…】、【历史助手回复】段和压缩检查点是继续工作的背景，不是面向用户的交付。除非用户明确要求摘要，否则应完成用户任务，不要用任务交接摘要代替交付。
 `
 
 /**
  * 网页端消息里的分段标记。
  *
- * 只用字母、数字和连字符：网页输入框会把正文再序列化一遍 markdown，方括号、
- * 下划线、星号都可能在那一步被转义（`[宿主上下文]` 变成 `\\[宿主上下文\\]`）。
- * 竞品 dsh-chatgpt-web 的检查点标记就为此特意只用字母数字。这里集中成常量，
- * 组装、预算表头判定和测试都读同一份，改名不会各处漏改。
+ * 括号用全角【】而不是半角 []：网页输入框会把正文再序列化一遍 markdown，
+ * 半角方括号会被当成链接语法转义（`[宿主上下文]` 变成 `\\[宿主上下文\\]`），
+ * 模型看到的是畸形标记。全角字符不参与 markdown 语法，原样保留。
+ * 文字保持中文，网页端一眼能认出这是宿主注入的分段，不是用户自己说的话。
+ * 这里集中成常量，组装、预算表头判定和测试都读同一份，改名不会各处漏改。
  */
 export const WEB_MARKERS = {
-  system: 'DSHWEB-SYSTEM-V1',
-  context: 'DSHWEB-CONTEXT-V1',
-  history: 'DSHWEB-HISTORY-V1',
-  user: 'DSHWEB-USER-V1',
-  goal: 'DSHWEB-GOAL-V1',
-  resume: 'DSHWEB-RESUME-V1',
+  system: '【宿主系统指令】',
+  /** 前缀：不带来源时渲染成「【宿主上下文】」，带来源时是「【宿主上下文：kind】」。 */
+  context: '【宿主上下文',
+  history: '【历史助手回复】',
+  user: '【用户消息】',
+  goal: '【当前用户任务】',
+  resume: '【任务接续】',
 } as const
 
-/** 旧版方括号标记：只用于识别旧构建留下的文本，不再产生。 */
-export const LEGACY_MARKERS = ['[宿主系统指令]', '[宿主上下文', '[历史助手回复]', '[用户消息]', '[当前用户任务]', '[任务接续]'] as const
+/** 历史标记：只用于识别旧构建留下的文本，不再产生。 */
+export const LEGACY_MARKERS = [
+  // 0.6.0 的纯字母标记
+  'DSHWEB-SYSTEM-V1', 'DSHWEB-CONTEXT-V1', 'DSHWEB-HISTORY-V1',
+  'DSHWEB-USER-V1', 'DSHWEB-GOAL-V1', 'DSHWEB-RESUME-V1',
+  // 0.5.x 及更早的半角方括号标记
+  '[宿主系统指令]', '[宿主上下文', '[历史助手回复]', '[用户消息]', '[当前用户任务]', '[任务接续]',
+] as const
+
+/** 不属于正文的标记（系统指令 / 任务锚点 / 接续提示）：预算裁剪不从这里起算。 */
+const NON_BODY_MARKERS = new Set<string>([
+  WEB_MARKERS.system, WEB_MARKERS.goal, WEB_MARKERS.resume,
+  'DSHWEB-SYSTEM-V1', 'DSHWEB-GOAL-V1', 'DSHWEB-RESUME-V1',
+  '[宿主系统指令]', '[当前用户任务]', '[任务接续]',
+])
 
 /** 这一段是不是「正文」（历史/用户消息/宿主上下文）：预算裁剪只从这里开始算。 */
 export function isBodyPiece(piece: string): boolean {
   if (piece.startsWith(`${WEB_MARKERS.history}\n`) || piece.startsWith(`${WEB_MARKERS.user}\n`)) return true
-  if (piece.startsWith(`${WEB_MARKERS.context}\n`) || piece.startsWith(`${WEB_MARKERS.context} `)) return true
-  return LEGACY_MARKERS.some(marker => marker !== '[宿主系统指令]' && marker !== '[当前用户任务]'
-    && marker !== '[任务接续]' && piece.startsWith(marker))
+  if (piece.startsWith(`${WEB_MARKERS.context}：`) || piece.startsWith(`${WEB_MARKERS.context}】`)) return true
+  return LEGACY_MARKERS.some(marker => !NON_BODY_MARKERS.has(marker) && piece.startsWith(marker))
 }
 
 /** 图片直传开启时追加的第 8 条：附图真的随消息到达，模型可以直接看。 */
@@ -486,7 +500,7 @@ export function buildHandoffBrief(
     || (message.role === 'user' && sourceKind(message) !== undefined
       && !['user', 'tool'].includes(sourceKind(message)!)))
   if (options.system) sections.push(`${WEB_MARKERS.system}\n${options.system}`)
-  for (const message of hostContext) sections.push(`${WEB_MARKERS.context}\n${replayText(message)}`)
+  for (const message of hostContext) sections.push(`${WEB_MARKERS.context}】\n${replayText(message)}`)
   return sections.join('\n\n')
 }
 
@@ -736,7 +750,7 @@ export function renderNewWebMessages(
     if (isUserTask(message)) {
       if (!isCompactionDirective(text)) parts.push(`${WEB_MARKERS.user}\n${text}`)
     } else {
-      parts.push(`${WEB_MARKERS.context} ${sourceKind(message) ?? message.role}\n${text}`)
+      parts.push(`${WEB_MARKERS.context}：${sourceKind(message) ?? message.role}】\n${text}`)
     }
   }
 
