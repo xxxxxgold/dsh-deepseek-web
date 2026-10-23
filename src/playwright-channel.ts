@@ -73,6 +73,21 @@ import {
  */
 const PROGRESS_POLL_MS = 250
 /**
+ * 「镜像流已结束」的静默确认窗口。
+ *
+ * 页面镜像靠克隆 fetch 响应流累积；一轮生成可能连着开几条对话流，
+ * 所以判完成不能只看“当前已知的流都 done 了”，还要看最后一条流开始后
+ * 有没有新流再冒出来。800ms 足够覆盖连续请求之间的间隔，又远小于一轮生成。
+ */
+const MIRROR_SETTLE_MS = 800
+/**
+ * 「网页正文已生成 N 字」进度提示的最小间隔。
+ *
+ * 正文块要等整轮结束才统一产出，中途界面若不推点什么就完全静默；
+ * 5 秒一次的提示足以证明“还在动”，又不会把提示区刷成流水账。
+ */
+const BODY_NOTICE_MS = 5_000
+/**
  * 频控 toast 检测间隔。
  *
  * 它要遍历大量 DOM 元素并逐个读 computed style，开销比增量轮询高一个量级，
@@ -619,9 +634,12 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     }
 
     const pages = this.context.pages()
-    this.page = pages.find(p => p.url().startsWith(new URL(this.options.config.url).origin))
-      ?? pages[0]
-      ?? await this.context.newPage()
+    const origin = new URL(this.options.config.url).origin
+    // 不能盲目取 pages[0]：managed 启动时它可能是 Edge 的默认启动页或崩溃恢复页
+    // （ntp.msn.cn），在它上面导航会被页面自身的重定向打断，报
+    // "interrupted by another navigation"。优先目标站；没有就新开一个标签——
+    // 新标签不会被启动/恢复流程接管，旧启动页交给下面的清理逻辑关掉。
+    this.page = pages.find(p => p.url().startsWith(origin)) ?? await this.context.newPage()
     // managed profile 只由本插件使用：保留一个工作标签，关闭启动器或旧版本
     // 残留的空白/重复标签，避免首次请求同时出现两个网页。attach 模式不碰
     // 用户自己打开的其他标签；已分配给 dsh 会话的标签页一律保留。
@@ -1224,6 +1242,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
           ...parsed.contextLengthExceeded === true ? { contextLengthExceeded: true } : {},
           ...outcome.completion.interrupted ? { finishReason: 'interrupted' as const }
             : parsed.finishReason ? { finishReason: parsed.finishReason } : {},
+          ...outcome.uploadedImageIds.length > 0 ? { uploadedImageIds: outcome.uploadedImageIds } : {},
         }
         this.emitNotice(
           request,
@@ -1439,7 +1458,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
    * 失败处理遵循 `uploadOnError`：`abort` 抛 `WEB_IMAGE_UPLOAD_FAILED`；
    * `fallback-text` 只告警并继续，正文里的 `[附图: …]` 标记不因此变成"已上传"。
    */
-  private async attachAttachments(page: Page, request: BrowserTurnRequest): Promise<void> {
+  private async attachAttachments(page: Page, request: BrowserTurnRequest): Promise<string[]> {
     const files = request.attachments ?? []
     const { config } = this.options
 
@@ -1447,13 +1466,13 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       if (files.length === 0) {
         // 纯文本轮：清掉可能残留的旧附件，避免上一轮取消后留在输入框里的图串到本轮。
         await this.clearAttachments(page)
-        return
+        return []
       }
 
       const input = page.locator('input[type="file"]').first()
       if (await input.count().catch(() => 0) === 0) {
         this.handleUploadFailure(request, new Error('页面上没有找到 input[type="file"]'))
-        return
+        return []
       }
 
       // 幂等：频控重发会再次走到这里，已挂上的同名预览不再传一遍。
@@ -1463,7 +1482,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         .catch(() => [] as string[])
       if (files.every(file => attached.includes(file.name))) {
         console.info('[deepseek-web] 本轮图片已在输入框里，跳过重复上传。')
-        return
+        return files.map(file => file.attachmentId)
       }
 
       // 只留本轮的图：先清掉残留（上一次取消/失败留下的），再挂新的。
@@ -1498,17 +1517,19 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       ).then(() => true, () => false)
       if (!previewed) {
         this.handleUploadFailure(request, new Error('上传后 15 秒内没有出现附件预览'))
-        return
+        return []
       }
 
       if (!(await parsed)) {
         this.handleUploadFailure(request, new Error(`等待图片解析超时（${config.uploadTimeoutMs}ms）`))
-        return
+        return []
       }
       console.info(`[deepseek-web] 已上传 ${files.length} 张图片，网页端解析完成。`)
+      return files.map(file => file.attachmentId)
     } catch (error) {
       if (error instanceof LlmError) throw error
       this.handleUploadFailure(request, error instanceof Error ? error : new Error(String(error)))
+      return []
     }
   }
 
@@ -1560,7 +1581,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     page: Page,
     request: BrowserTurnRequest,
   ): Promise<
-    | { kind: 'completed'; completion: ChatCompletionResponse }
+    | { kind: 'completed'; completion: ChatCompletionResponse; uploadedImageIds: string[] }
     | { kind: 'rate-limited' }
     | { kind: 'server-busy' }
   > {
@@ -1580,6 +1601,8 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       : SEND_ACK_TIMEOUT_MS
     let waiterActive = true
     let sawResponse = false
+    /** 本轮已确认挂到输入框的图片附件 id（频控重发时取并集）。 */
+    let uploadedImageIds: string[] = []
     // 监听必须在填字之前挂上（否则用户/脚本提前发送会漏掉响应），但监听本身**不能带超时**：
     // 超长文本的填写可能持续几分钟，原来从填字之前开始计 180 秒，会在消息还没发出去时
     // 就把这一轮判死，而后续代码仍会按下回车——网页确实收到并回答了，dsh 却报“未收到响应”。
@@ -1598,9 +1621,24 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       )
       // finished() 与 body() 并行：body() 内部本来就要等流结束，
       // 串行 await 等于把“等流结束”做两遍，白多一次往返。
+      //
+      // 两步都必须有上限：网页侧连接可能“半开”（TCP 不断开、也不再送帧），
+      // 这时 finished() 与 body() 会永久挂起，整轮就静默卡在「生成中」——
+      // kimi / glm 通道早已用 withTimeout 兜过这个洞，deepseek 这里补齐。
+      const stallMs = this.options.config.streamIdleTimeoutMs
       const [interrupted, body] = await Promise.all([
-        response.finished().then(error => error !== null, () => true),
-        response.body().catch(() => Buffer.alloc(0)),
+        withTimeout(
+          response.finished().then(error => error !== null, () => true),
+          stallMs,
+          'WEB_STREAM_STALLED',
+          `deepseek-web: 网页回复流在 ${formatDuration(stallMs)} 内没有结束（连接可能已半开）。请重试本轮任务。`,
+        ),
+        withTimeout(
+          response.body().catch(() => Buffer.alloc(0)),
+          stallMs,
+          'WEB_STREAM_STALLED',
+          `deepseek-web: 读取网页回复体超时（${formatDuration(stallMs)}）。请重试本轮任务。`,
+        ),
       ])
       if (!waiterActive) return undefined
       return {
@@ -1650,6 +1688,11 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     }
     let progressTimer: ReturnType<typeof setInterval> | undefined
     let toastTimer: ReturnType<typeof setInterval> | undefined
+    /**
+     * 本轮消息真正发出的时刻（0 表示还没发出）。
+     * 镜像完成信号只在它非零之后才作数：发送前页面上残留的旧流不属于本轮。
+     */
+    let sentAt = 0
 
     try {
       request.signal?.throwIfAborted()
@@ -1688,10 +1731,21 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         }
       }
 
-      // 实时思考流：确保页面里的网络镜像已就位（幂等），发送后轮询增量
-      progressTimer = request.onProgress
-        ? await this.startProgressPolling(page, request)
-        : undefined
+      // 「镜像流已结束」信号：网页侧把流读干净就立刻通知，不必再等 HTTP 层
+      // finished() 收尾（半开连接时那一步可能永远不落定）。
+      let mirrorDoneNow: ((payload: { at: number; body: string }) => void) | undefined
+      const mirrorDone = new Promise<{ at: number; body: string }>(resolve => { mirrorDoneNow = resolve })
+      // 实时进度轮询：无条件启动——正文心跳与上面的完成信号都靠它。
+      // 思考增量是否落地，由 onProgress 侧按 liveThinking 过滤。
+      progressTimer = await this.startProgressPolling(page, request, (payload) => {
+        // 消息还没真正发出去时，页面上残留的旧流不算本轮结果。
+        if (sentAt === 0) return false
+        // 发送确认与请求发出之间可能差几百毫秒（回车/点按钮的判定窗口），留 2 秒宽限；
+        // 再早的流一定是上一轮的，不能被当成本轮答完。
+        if (payload.at < sentAt - 2_000) return false
+        mirrorDoneNow?.(payload)
+        return true
+      })
       // 先把「此刻页面上已经存在的」频控文案节点认领掉：只有这一轮发送之后
       // 新冒出来的提示才算新频控。少了这一步，上一轮残留的 toast（视觉上消失、
       // 节点仍在 DOM 里）会让每一轮都在第一拍被判死——网页上明明没有提示，却一直失败。
@@ -1724,7 +1778,11 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
       await page.keyboard.press('Backspace')
       // 先清掉可能残留的旧附件，避免上一轮取消后留在输入框里的图串到本轮。
-      await this.attachAttachments(page, request)
+      // 返回值是「真正挂上去的附件 id」：适配层据此维护跨轮去重集合。
+      uploadedImageIds = [...new Set([
+        ...uploadedImageIds,
+        ...await this.attachAttachments(page, request),
+      ])]
       request.signal?.throwIfAborted()
       const textLength = request.text.length
       if (textLength >= LONG_TEXT_WARN_CHARS) {
@@ -1801,25 +1859,53 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
 
       // 发送动作到这里才算完成（自动模式已确认发出、半自动已填好等人工点）：
       // 从现在开始计“等网页响应”的时间，填字耗时（超长文本可达数分钟）不参与。
+      sentAt = Date.now()
       startAckClock()
-      const winner = await Promise.race([waiter, rateLimited, serverBusySignal, aborted, ackDeadline!])
-      // 作废 waiter 的 undefined 不会先于 race 落定；防御性兜底按频控处理
+      const winner = await Promise.race([
+        waiter.then(response => ({ kind: 'http' as const, response })),
+        mirrorDone.then(mirror => ({ kind: 'mirror' as const, mirror })),
+        rateLimited,
+        serverBusySignal,
+        aborted,
+        ackDeadline!])
       if (winner === undefined) return { kind: 'rate-limited' }
-      if ('kind' in winner) return winner
+      if (winner.kind === 'rate-limited' || winner.kind === 'server-busy') return winner
+      // 页面镜像先读到流尾：直接进解析。
+      // 走这条通路时 HTTP 层的 finished() 可能还挂着（半开连接），
+      // 正是它让整轮静默卡在「生成中」——这里绕开它。
+      if (winner.kind === 'mirror') {
+        waiterActive = false
+        void waiter.catch(() => {})
+        console.info('[deepseek-web] 页面镜像已读到流尾（早于 HTTP 层收尾），直接解析。')
+        return {
+          kind: 'completed',
+          uploadedImageIds,
+          completion: {
+            url: page.url(),
+            request: { postData: undefined },
+            status: 200,
+            body: winner.mirror.body,
+            interrupted: false,
+          },
+        }
+      }
+      const response = winner.response
+      // 作废 waiter 的 undefined 不会先于 race 落定；防御性兜底按频控处理
+      if (response === undefined) return { kind: 'rate-limited' }
       // 服务端故障必须先于频控判定：两者文案可能重叠（都带「请稍后重试」），
       // 但处置相反——判成频控会把账号锁进 10 分钟冷却，而它其实只是后端抖了一下。
-      if (isServerBusyResponse(winner.status, winner.body)) {
-        console.warn(`[deepseek-web] 响应判定为服务端暂时不可用（HTTP ${winner.status}）。`)
+      if (isServerBusyResponse(response.status, response.body)) {
+        console.warn(`[deepseek-web] 响应判定为服务端暂时不可用（HTTP ${response.status}）。`)
         return { kind: 'server-busy' }
       }
       // 只认明确的错误体（429 / 非流式短错误文本 / 流里的独立 error 帧）。
       // 早期版本扫正文前 2000 字，一句“失败的话可以稍后再试”就会把整轮判成频控。
-      if (isRateLimitResponse(winner.status, winner.body)) {
-        console.warn(`[deepseek-web] 响应判定为频控（HTTP ${winner.status}）。`)
+      if (isRateLimitResponse(response.status, response.body)) {
+        console.warn(`[deepseek-web] 响应判定为频控（HTTP ${response.status}）。`)
         return { kind: 'rate-limited' }
       }
       console.info('[deepseek-web] 已收到网页完整回复，正在解析…')
-      return { kind: 'completed', completion: winner }
+      return { kind: 'completed', completion: response, uploadedImageIds }
     } catch (error) {
       if (request.signal?.aborted) throw new LlmError('网页回合已取消。', 'WEB_TURN_ABORTED')
       if (error instanceof LlmError) throw error
@@ -1983,8 +2069,13 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   private async startProgressPolling(
     page: Page,
     request: BrowserTurnRequest,
+    onSettled?: (payload: { at: number; body: string }) => boolean | void,
   ): Promise<ReturnType<typeof setInterval> | undefined> {
-    if (this.options.config.liveThinking !== true) return undefined
+    // 早期这里只在 liveThinking 开启时才轮询。现在它同时承担两件事：
+    //   1) 正文进度心跳（让界面在整轮生成期间一直有可见进展）；
+    //   2) 「镜像流已结束」信号（不必等 HTTP 层 finished() 收尾，网页答完就能进解析）。
+    // 两件事都跟“要不要展示思考内容”无关，所以轮询本身无条件启动；
+    // 思考增量是否落地，由调用处按 liveThinking 过滤。
     await this.ensureCapture(page)
     const startedAt = Date.now() - 1_000
     const onProgress = request.onProgress
@@ -1994,6 +2085,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     const settled = new Map<number, { text: string; reasoning: string; reliable: boolean }>()
     let failureStreak = 0
     let failureWarned = false
+    let settledFired = false
+    /** 上一条「正文已生成 N 字」提示的时刻，用于限流。 */
+    let lastBodyNoticeAt = 0
 
     return setInterval(() => {
       void page.evaluate((since) => {
@@ -2007,9 +2101,28 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         // 丢掉前面的那条，思考就会停在半截（而正文片段还在继续长）。
         return candidates.map(entry => ({ at: entry.at, body: entry.body, done: entry.done }))
       }, startedAt).then((captured) => {
+        const now = Date.now()
         failureStreak = 0
         failureWarned = false
         if (!captured || captured.length === 0) return
+        // 「镜像流已结束」信号：一轮生成可能产生多条对话流，因此要求全部 done，
+        // 且最后一条流开始后还要静默 MIRROR_SETTLE_MS——否则第一条刚结束、
+        // 第二条请求还没建立的那一拍就会被误判成“整轮答完了”。
+        if (onSettled !== undefined && !settledFired && captured.every(entry => entry.done)) {
+          const lastAt = Math.max(...captured.map(entry => entry.at))
+          if (Date.now() - lastAt >= MIRROR_SETTLE_MS) {
+            const best = [...captured]
+              .sort((a, b) => a.at - b.at)
+              .map(entry => ({ entry, parsed: parseCompletionBody(entry.body) }))
+              .filter(item => item.parsed.reliable === true && (item.parsed.text !== '' || (item.parsed.reasoning ?? '') !== ''))
+              .pop()
+            if (best !== undefined) {
+              // 回调返回 false 表示“这一拍还不作数”（比如消息还没真正发出去），
+              // 保持 settledFired 为假，下一拍继续等。
+              if (onSettled({ at: best.entry.at, body: best.entry.body }) !== false) settledFired = true
+            }
+          }
+        }
         const texts: string[] = []
         const reasonings: string[] = []
         for (const entry of [...captured].sort((a, b) => a.at - b.at)) {
@@ -2037,6 +2150,13 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         const reasoningDelta = takeDelta(reasoning, emittedReasoning, 'reasoning')
         emittedText = text
         emittedReasoning = reasoning
+        // 正文进度提示：正文块要等整轮结束才由 replyChunks 统一产出，
+        // 中途界面只能靠这条提示看到进展。5 秒一次足以让人确信没卡死，
+        // 又不会把提示区刷满（emitNotice 自身还有 500ms 节流兜底）。
+        if (text.length > 0 && now - lastBodyNoticeAt >= BODY_NOTICE_MS) {
+          lastBodyNoticeAt = now
+          this.emitNotice(request, 'receive', `网页正文已生成 ${text.length} 字…`)
+        }
         if (textDelta === '' && reasoningDelta === '') return
         // 门禁 2：增量里出现 SSE 原始帧特征一律丢弃（防御性，正常解析不会出现）
         if (POLLUTION_PATTERN.test(textDelta) || POLLUTION_PATTERN.test(reasoningDelta)) {
@@ -2049,7 +2169,12 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
           return
         }
         try {
-          onProgress?.({ text: textDelta, reasoning: reasoningDelta })
+          // 轮询现在无条件跑（正文心跳与完成信号都要它），
+          // 但「思考内容」仍然只在该开关打开时才推给宿主。
+          onProgress?.({
+            text: textDelta,
+            reasoning: this.options.config.liveThinking === true ? reasoningDelta : '',
+          })
         } catch (error) {
           console.warn('[deepseek-web] 实时思考流回调异常（已忽略）：', error instanceof Error ? error.message : error)
         }

@@ -19,16 +19,26 @@ export interface BrowserTurnProgress {
 }
 
 /**
- * 一张待上传的图片。字节已由适配层从 AttachmentStore 读出并解密/解引用，
- * 通道只负责把它塞进网页输入框，不关心来源与路由。
+ * 一个待上传的附件。字节已由适配层准备好，通道只负责把它塞进网页输入框，
+ * 不关心来源与路由。
+ *
+ * `kind` 区分两类附件：`image` 是宿主图片（按 attachmentId 跨轮去重）；
+ * `file` 是本轮临时生成的长文本文件（不跨轮复用，失败时回退为直接填正文）。
  */
 export interface BrowserImageAttachment {
+  /** 宿主附件 id；用于跨轮去重（网页端拒绝重复的 ref_file_ids）。 */
+  attachmentId: string
   /** 原文件名；网页端预览 alt 与提示词里的 `[附图 N: 文件名]` 都用它。 */
   name: string
-  /** MIME 类型（image/png|jpeg|webp|gif）。 */
+  /** MIME 类型（image/png|jpeg|webp|gif；长文本文件为 text/markdown）。 */
   mimeType: string
   /** 原始字节；通道不做缩放或转码，按网页端限额自行判断走哪条上传路径。 */
   data: Uint8Array
+  /**
+   * 附件类别，缺省 `image`（兼容旧调用方）。
+   * `file` 表示长文本转成的文件：上传失败时不能只留摘要，必须回退填完整正文。
+   */
+  kind?: 'image' | 'file'
 }
 
 export interface BrowserTurnRequest {
@@ -42,6 +52,14 @@ export interface BrowserTurnRequest {
    * 通道必须零开销短路（内部辅助请求 `turnIsolated` 也走同一条发送方法）。
    */
   attachments?: readonly BrowserImageAttachment[]
+  /**
+   * 附件上传失败时的正文回退。
+   *
+   * 只在「正文被压缩成摘要 + 长文本文件附件」时出现：此时 `text` 只是摘要，
+   * 文件没挂上去就不能把摘要发出去（模型会丢掉几十万字的任务数据）。通道发现
+   * 文件附件没上传成功时，改用这段完整正文填输入框——慢，但内容不丢。
+   */
+  fallbackText?: string
   /** 全自动发送：填入后模拟回车，不等待人工点击。缺省回退通道的会话级设置。 */
   autoSend?: boolean
   signal?: AbortSignal
@@ -90,6 +108,11 @@ export interface BrowserTurnResult {
   finishReason?: 'stop' | 'max-tokens' | 'interrupted'
   /** 页面/网络层诊断信息。 */
   meta?: Record<string, unknown>
+  /**
+   * 本轮确认已挂到网页输入框的图片附件 id。
+   * 适配层用它维护跨轮去重集合，避免同一张图重复上传触发网页端整轮拒绝。
+   */
+  uploadedImageIds?: string[]
 }
 
 export interface BrowserChannel {

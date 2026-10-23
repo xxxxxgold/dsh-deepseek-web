@@ -188,8 +188,17 @@ if (failureClass !== 'other') fail(`WEB_SERVER_BUSY 应归为 other（不进冷�
 const sourceDir = fileURLToPath(new URL('../src/', import.meta.url))
 const channelSource = readFileSync(path.join(sourceDir, 'playwright-channel.ts'), 'utf8')
 
-const busyJudgeAt = channelSource.indexOf('isServerBusyResponse(winner.status')
-const rateJudgeAt = channelSource.indexOf('isRateLimitResponse(winner.status')
+// race 的胜者现在可能是 HTTP 响应，也可能是页面镜像（见 sendAndWait 的 mirrorDone 分支），
+// 因此判定入参从 winner.status 变成了 response.status。两种写法都接受，
+// 断言的目的只是「判定存在且服务端故障排在频控之前」，不锁死局部变量名。
+const busyJudgeAt = Math.max(
+  channelSource.indexOf('isServerBusyResponse(winner.status'),
+  channelSource.indexOf('isServerBusyResponse(response.status'),
+)
+const rateJudgeAt = Math.max(
+  channelSource.indexOf('isRateLimitResponse(winner.status'),
+  channelSource.indexOf('isRateLimitResponse(response.status'),
+)
 if (busyJudgeAt < 0) fail('找不到 sendAndWait 里的服务端故障判定，源码断言已失效')
 if (rateJudgeAt < 0) fail('找不到 sendAndWait 里的频控判定，源码断言已失效')
 if (busyJudgeAt > rateJudgeAt) {

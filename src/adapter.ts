@@ -425,9 +425,11 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     ].filter(Boolean).join('\n\n')
 
     await this.channel.startNewConversation?.(request.sessionId)
-    // 新网页对话从零累计：token 基线清零；协议已随重发注入
+    // 新网页对话从零累计：token 基线清零；协议已随重发注入。
+    // 图片去重集合同样清零——新对话里还没有任何图，重试轮的附件必须重新上传。
     state.usageBaseline = 0
     state.roundsSinceProtocol = 0
+    state.uploadedImageIds = undefined
 
     const retry = yield* this.driveTurn({ ...request, text: retryText, initialize: true }, blocks)
     if (retry.contextLengthExceeded === true) {
@@ -678,7 +680,9 @@ export class DeepSeekWebAdapter extends LlmAdapter {
           continue
         }
         seen.add(digest)
-        loaded.push(image)
+        // 带上宿主附件 id：通道回传「本轮真正挂上去的 id」，适配层据此维护
+        // 跨轮去重集合，避免同一张图重复上传触发网页端整轮拒绝。
+        loaded.push({ ...image, attachmentId: ref.attachmentId })
       } catch (error) {
         if (this.config.uploadOnError === 'abort') {
           throw new LlmError(
@@ -817,6 +821,13 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       state.lastMessageId = lastIdentified?.id
       state.roundsSinceProtocol = rendered.prompt.includeProtocol ? 0 : state.roundsSinceProtocol + 1
       state.lastReply = reply.text
+      // 图片去重集合：网页对话重建（initialize）时只保留本轮实际重传成功的图；
+      // 增量轮把本轮新上传的图并入集合。网页端对重复的 ref_file_ids 会整轮拒绝，
+      // 且该会话此后每轮都失败，所以这里必须精确记录「对话里到底有哪些图」。
+      const uploadedNow = reply.uploadedImageIds ?? []
+      state.uploadedImageIds = rendered.prompt.initialize
+        ? [...new Set(uploadedNow)]
+        : [...new Set([...(state.uploadedImageIds ?? []), ...uploadedNow])]
       Object.assign(savedState, state)
       await this.sessions.save()
     }

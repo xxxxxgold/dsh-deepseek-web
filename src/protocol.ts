@@ -703,8 +703,11 @@ export function renderNewWebMessages(
 
   // 收集本轮增量消息里的图片：user 的拖入附件与工具产出的截图都要能上网页。
   // 只收 image 块本身（引用），字节留给适配层读取——渲染层不碰附件存储。
+  // 增量轮跳过「当前网页对话里已经上传过」的图：网页端对重复的 ref_file_ids 会
+  // 整轮拒绝，且该会话此后每轮都失败。replay 会重建对话，不能跳过（要全量重传）。
   const collectedImages: ImageAttachmentRef[] = []
   const seenImageIds = new Set<string>()
+  const alreadyUploaded = replay ? new Set<string>() : new Set(state.uploadedImageIds ?? [])
   const maxImages = Math.max(0, config.maxImagesPerTurn)
   const collectImages = (content: readonly ContentBlock[]): void => {
     if (!imageUpload || maxImages === 0) return
@@ -713,6 +716,7 @@ export function renderNewWebMessages(
       const ref = block.attachment
       if (seenImageIds.has(ref.attachmentId)) continue
       seenImageIds.add(ref.attachmentId)
+      if (alreadyUploaded.has(ref.attachmentId)) continue
       collectedImages.push(ref)
     }
   }

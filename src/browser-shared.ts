@@ -308,13 +308,39 @@ export async function markServerBusyToastsSeen(page: Page): Promise<number> {
   }).catch(() => 0)
 }
 
+/** 同一 frame 上另一次导航接管时的报错文案；浏览器启动页/崩溃恢复期很常见。 */
+const NAVIGATION_INTERRUPTED = /interrupted by another navigation|net::ERR_ABORTED/i
+
 export async function ensureChatPage(page: Page, url: string): Promise<void> {
   const current = page.url()
-  if (!current.startsWith(new URL(url).origin)) {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 })
-  } else {
+  if (current.startsWith(new URL(url).origin)) {
     await page.bringToFront()
+    return
   }
+  // 浏览器启动器或崩溃恢复会在这个标签上继续自己的导航（典型是 Edge 的
+  // ntp.msn.cn 启动页重定向），把我们的 goto 顶掉。启动期竞争通常在几秒内结束，
+  // 所以短退避重试；仍失败才抛带错误码的 LlmError——Playwright 的原始文案没有
+  // code，宿主按 retryability() 只会得到 'unknown'，不会重试，用户就直接看到
+  // 「本轮运行失败」。给出 BROWSER_NAVIGATION_INTERRUPTED 才能让宿主再兜一轮。
+  const delays = [500, 1_500]
+  let detail = ''
+  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 })
+      return
+    } catch (error) {
+      const message = String((error as Error)?.message ?? error)
+      if (!NAVIGATION_INTERRUPTED.test(message)) throw error
+      detail = message
+      const delay = delays[attempt]
+      if (delay === undefined) break
+      await page.waitForTimeout(delay)
+    }
+  }
+  throw new LlmError(
+    `打开 ${url} 时页面被另一条导航接管（浏览器启动页或崩溃恢复），已重试 ${delays.length} 次仍未稳定：${detail}`,
+    'BROWSER_NAVIGATION_INTERRUPTED',
+  )
 }
 
 export async function looksLoggedOut(page: Page, markers: readonly string[] = ['sign_in', 'sign-in', 'login', 'auth']): Promise<boolean> {
@@ -791,6 +817,12 @@ export async function launchManagedBrowser(options: {
     '--remote-debugging-address=127.0.0.1',
     `--remote-debugging-port=${port}`,
     ...(options.channel === 'msedge' ? ['--disable-features=msEdgeSidebarV2'] : []),
+    // 必须把目标地址作为启动标签一起传进去。只带 --no-first-run 时 Edge 仍会打开
+    // 默认启动页（ntp.msn.cn/edge/ntp），该页加载中还会再做一次重定向，和随后的
+    // page.goto 抢同一个 frame，Playwright 就会抛
+    // "Navigation ... is interrupted by another navigation to https://ntp.msn.cn/..."。
+    // attach 模式的 tools/browser-keeper.mjs 一直是这么传的，managed 模式此前漏了。
+    options.url,
   ]
   const child = spawn(executable, args, {
     detached: false,

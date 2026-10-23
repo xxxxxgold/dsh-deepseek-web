@@ -37,6 +37,15 @@ export interface WebChatState {
   checkpointSignature?: string
   /** 已发送的宿主系统指令指纹。 */
   systemSignature?: string
+  /**
+   * 当前网页对话里已经上传成功的图片附件 id。
+   *
+   * 网页端对重复的 `ref_file_ids` 会整轮拒绝，且该会话此后每轮都失败；
+   * 而宿主可能把同一张图以不同轮次反复交过来（历史回放、压缩后重现）。
+   * 记下成功上传的 id，增量轮就能跳过已在对话里的图，不重传。
+   * 网页对话重建（initialize）时由适配层重置为本次实际重传成功的集合。
+   */
+  uploadedImageIds?: string[]
 }
 
 /** 通道级 token 用量总计（跨 dsh 会话持久，随 session-state.json 保存）。 */
@@ -114,6 +123,13 @@ export class SessionRegistry {
             ...rawState.contextVersion === undefined ? {} : { contextVersion: rawState.contextVersion },
             ...rawState.checkpointSignature === undefined ? {} : { checkpointSignature: rawState.checkpointSignature },
             ...rawState.systemSignature === undefined ? {} : { systemSignature: rawState.systemSignature },
+            ...Array.isArray(rawState.uploadedImageIds)
+              ? {
+                uploadedImageIds: [...new Set(
+                  rawState.uploadedImageIds.filter((id): id is string => typeof id === 'string' && id.length > 0),
+                )],
+              }
+              : {},
           })
         }
       }
