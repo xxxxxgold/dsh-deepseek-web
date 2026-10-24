@@ -61,6 +61,7 @@ import {
   setBrowserWindowTopmost,
   launchManagedBrowser,
   sendEditorMessage,
+  withTimeout,
   type ManagedBrowserConnection,
 } from './browser-shared.ts'
 
@@ -2016,8 +2017,15 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   /**
    * 注入页面网络镜像（fetch + XHR）：把匹配 chat/completion 的 POST 响应体
    * 累积到 window.__dshWebCapture，供实时思考流轮询。幂等，页面导航后重装。
+   *
+   * 前置垫片：打包器（rolldown/tsdown，`keepNames` 默认开启）会把闭包里的
+   * 函数表达式改写成 `__name(fn, "…")`，而闭包是 `toString()` 序列化后送进页面
+   * 执行的，页面上下文里没有 `__name`，整段注入会抛
+   * `ReferenceError: __name is not defined`，实时思考流随之失效。
+   * 用字符串形式（不经序列化改写）补一个同语义垫片，注入即恢复正常。
    */
   private async ensureCapture(page: Page): Promise<void> {
+    await page.evaluate('window.__name = window.__name || ((fn) => fn)').catch(() => {})
     await page.evaluate(() => {
       const w = window as typeof window & {
         __dshWebCapture?: { entries: Array<{ at: number; body: string; done: boolean }> }

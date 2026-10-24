@@ -283,7 +283,7 @@ function xmlPayloadToActions(payload: unknown): WebToolAction[] | undefined {
       ? obj.name.trim()
       : typeof obj.tool === 'string' && obj.tool.trim() ? obj.tool.trim() : undefined
     if (!name) return undefined
-    let rawParams = obj.arguments ?? obj.params ?? obj.parameters ?? {}
+    let rawParams: unknown = obj.arguments ?? obj.params ?? obj.parameters ?? {}
     // OpenAI 的 arguments 常是「JSON 字符串」而不是对象。
     if (typeof rawParams === 'string') {
       try {

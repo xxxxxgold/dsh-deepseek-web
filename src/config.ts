@@ -164,6 +164,18 @@ export interface Config {
     /** dsh 窗口标题正则（可选，与进程名任一命中即可）。 */
     dshTitlePattern: string
   }
+  /**
+   * 登录态主动探活：只读检查（不发送、不消耗额度），默认启动后 20 秒探一次，
+   * 之后每 30 分钟一次。浏览器没启动时只报 unknown，绝不为了探活把浏览器拉起来。
+   */
+  loginProbe: {
+    /** 总开关。 */
+    enabled: boolean
+    /** 启动后首次探活的延迟（毫秒）。 */
+    initialDelayMs: number
+    /** 之后每次探活的间隔（毫秒）；0 = 只在启动后探一次。 */
+    intervalMs: number
+  }
   /** 网页版模型在页面上应处于哪个开关状态（供驱动校准）。 */
   model: WebModelId
   /** 页面元素/开关的 CSS 选择器覆盖；为空时使用内置默认并允许运行期“校准”。 */
@@ -304,6 +316,13 @@ export interface Config {
   sendPauseMinMs: number
   sendPauseMaxMs: number
   /**
+   * 回合间隔：上一轮网页回合**结束**到下一轮真正发请求之间的随机等待区间（毫秒）。
+   * 与 sendPause 的区别是计时起点——sendPause 只夹在「填字完成 → 回车」之间，
+   * 上一轮结束到下一轮开始原本是 0 间隔。0 = 关闭。
+   */
+  turnGapMinMs: number
+  turnGapMaxMs: number
+  /**
    * 连续发满多少轮后强制长休（0 表示关闭）。真人不会连着几十轮零休息地发消息，
    * 长任务中途插一段静默能明显降低"机器密度"判定。区间见 longRunPauseMinMs/MaxMs。
    * "连续" 按 10 分钟内仍有请求活动判定：超过 10 分钟没有请求即视为断开并重新计数。
@@ -341,6 +360,14 @@ export interface Config {
    * 全量回放就会稳定超时，所以这里给回放文本设上限，超出时丢弃最早的历史并留下省略说明。
    */
   maxReplayChars: number
+  /**
+   * 长文本转文件附件：单条消息超过 `longTextFileThreshold` 时，把正文写成 .md
+   * 文件挂进网页输入框，正文只留摘要与「请读取附件」的说明，规避长文本填字接近
+   * 二次方增长的耗时。上传失败时回退为直接填完整正文。
+   */
+  longTextAsFile: boolean
+  /** 触发长文本转文件的字符数（默认 120000，下限 10000）。 */
+  longTextFileThreshold: number
   /** 可选审核通道（Kimi / GLM 独立审核，或 DeepSeek 同对话自审）。 */
   review: ReviewConfig
   /** 模型疑似想调工具但输出无法解析时，自动注入纠错并请求重试一次。 */
@@ -370,10 +397,14 @@ export interface Config {
  * dsh 0.2 的设置服务用 `volatileForm()` 只保留 `schema.meta.volatile` 的叶子字段，
  * 因此“表单可见的字段必须经本助手标记”这一约定与原生 `.volatile()` 一致。
  */
-function markVolatile<T extends { volatile?: () => unknown; extra?: (key: 'volatile', value: boolean) => unknown; meta?: Record<string, unknown> }>(schema: T): T {
+function markVolatile<T extends { volatile?: () => unknown; extra?: (key: 'volatile', value: boolean) => unknown }>(schema: T): T {
   if (typeof schema.volatile === 'function') return schema.volatile() as T
   if (typeof schema.extra === 'function') return schema.extra('volatile', true) as T
-  schema.meta = { ...schema.meta, volatile: true }
+  // schemastery 的 `meta` 是 `Meta<T>`（带泛型参数的接口），不是 `Record<string, unknown>`；
+  // 把它写进泛型约束会让所有 `Schema<...>` 入参都不满足约束（71 处 TS2345）。
+  // 这里只在赋值点做一次断言，语义不变。
+  const target = schema as { meta?: Record<string, unknown> }
+  target.meta = { ...target.meta, volatile: true }
   return schema
 }
 

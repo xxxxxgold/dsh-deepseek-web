@@ -5,13 +5,13 @@
  * `conversation.view` 槽位（由 ui-chat 注册）尚未就绪，激活被静默跳过；
  * 于是冷打开（恢复上次会话）时对话窗格可能永久空白，而会话数据其实已完整加载。
  *
- * v3 依赖 `ctx.sessions.list.getSnapshot().current` 判断“当前会话”。dsh 0.2
+ * v3 依赖 `host.sessions.list.getSnapshot().current` 判断“当前会话”。dsh 0.2
  * 移除了该字段——`SessionListState` 现在只有 ids / byId / phase / projectionsBySession，
  * 注释明确写着 “view selection remains outside the Controller”。因此本版改为：
  *
  * - 对**已持有 Session binding 的会话**订阅事件源；历史回填落地时会触发自检，
  *   这本来就是 v3 里最可靠的判定点，也是冷打开时的实际触发路径；
- * - 自检对每个会话幂等：`ctx.uiConversation.binding()` 对非活动会话会抛错，
+ * - 自检对每个会话幂等：`host.uiConversation.binding()` 对非活动会话会抛错，
  *   而 `conversationOf()` 已吞掉该异常并返回 undefined，因此非活动会话自动空转，
  *   不会误激活别的会话；
  * - 会话列表变化时重新对齐订阅集合，并补一次首检，覆盖“绑定晚于事件到达”的时序。
@@ -23,7 +23,7 @@
  * @module dsh-deepseek-web/client/conversation-recovery
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
-// 类型-only：拉起 ctx.sessions / ctx.uiConversation 的声明合并。
+// 类型-only：拉起 host.sessions / host.uiConversation 的声明合并。
 // client bundle 纯度门禁禁止值导入，服务一律通过 inject 注入。
 import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
@@ -55,13 +55,15 @@ interface ConversationBindingLike {
 }
 
 export function monitorConversationBlank(ctx: ClientContext): void {
+  // 同 index.ts：`sessions` / `uiConversation` 的类型面来自本地 host-client.d.ts。
+  const host = ctx as ClientContext & HostClient.Context
   const timers = new Set<ReturnType<typeof setTimeout>>()
   /** sessionId → 事件源退订函数；只为当前持有 binding 的会话建立。 */
   const watched = new Map<SessionIdLike, () => void>()
 
   const conversationOf = (sessionId: SessionIdLike): ConversationBindingLike | undefined => {
     try {
-      return ctx.uiConversation.binding(sessionId) as unknown as ConversationBindingLike
+      return host.uiConversation.binding(sessionId) as unknown as ConversationBindingLike
     } catch {
       // 非活动会话会抛错：这里正是“只对当前显示的会话生效”的判定点
       return undefined
@@ -99,7 +101,7 @@ export function monitorConversationBlank(ctx: ClientContext): void {
    */
   const ensureRendered = (sessionId: SessionIdLike): void => {
     try {
-      const binding = ctx.sessions.binding(sessionId)
+      const binding = host.sessions.binding(sessionId)
       if (binding === undefined) return
       if (binding.eventSource.getSnapshot().entries.length === 0) return // 无内容，谈不上渲染问题
       if (binding.session.getSnapshot().blank === true) return // 从未使用的空会话本来就空
@@ -136,7 +138,7 @@ export function monitorConversationBlank(ctx: ClientContext): void {
    * 新增订阅，消失的退订。没有当前会话信号，就用“有 binding”近似“可能正在显示”。
    */
   const syncWatches = (): void => {
-    const ids = new Set<SessionIdLike>(ctx.sessions.list.getSnapshot().ids)
+    const ids = new Set<SessionIdLike>(host.sessions.list.getSnapshot().ids)
     for (const [sessionId, unsubscribe] of [...watched]) {
       if (ids.has(sessionId)) continue
       unsubscribe()
@@ -144,7 +146,7 @@ export function monitorConversationBlank(ctx: ClientContext): void {
     }
     for (const sessionId of ids) {
       if (watched.has(sessionId)) continue
-      const binding = ctx.sessions.binding(sessionId)
+      const binding = host.sessions.binding(sessionId)
       if (binding === undefined) continue
       watched.set(sessionId, binding.eventSource.subscribe(() => {
         // 历史回填落地是最可靠的判定点
@@ -154,7 +156,7 @@ export function monitorConversationBlank(ctx: ClientContext): void {
   }
 
   ctx.effect(() => {
-    const listUnsubscribe = ctx.sessions.list.subscribe(() => {
+    const listUnsubscribe = host.sessions.list.subscribe(() => {
       syncWatches()
       // 绑定可能晚于事件到达：对齐后对每个已订阅会话补一次首检
       for (const sessionId of [...watched.keys()]) {

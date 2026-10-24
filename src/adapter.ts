@@ -632,7 +632,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     startedAt: number,
     completed: boolean,
     failureCode: string | undefined,
-  ): void {
+  ): Promise<void> {
     const purpose: LedgerPurpose = options.purpose === undefined
       ? 'chat'
       : options.purpose === 'compaction' || options.purpose === 'session-title'

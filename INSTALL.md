@@ -1,6 +1,6 @@
 # 中文安装速查
 
-本项目发行包：`dsh-deepseek-web-xxxxxgold@0.7.0`，适用于 dsh 桌面版 0.2+。
+本项目发行包：`dsh-deepseek-web-xxxxxgold@0.7.1`，适用于 dsh 桌面版 0.2+。
 
 ## 新用户：在桌面版粘贴发行包链接安装
 
@@ -10,10 +10,10 @@
 4. 选择 `deepseek-web`，在插件自动打开的 Edge 窗口登录 DeepSeek。
 
 ```text
-https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.0/dsh-deepseek-web-xxxxxgold-0.7.0.tgz
+https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.1/dsh-deepseek-web-xxxxxgold-0.7.1.tgz
 ```
 
-这条链接装的是本仓库 0.7.0 的发行包，不依赖 npm 是否已发布。
+这条链接装的是本仓库 0.7.1 的发行包，不依赖 npm 是否已发布。
 
 无需安装 Node.js、克隆源码或手改配置文件。安装包内已带 host/client 编译产物。
 默认模式需要在网页手动点发送；自动模式选择 `deepseek-web-auto`。
@@ -28,10 +28,10 @@ https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.0/dsh-deeps
 
 ## 其他安装入口与常见问题
 
-- **GitHub 链接（推荐，当前可用）**：在「添加插件」粘贴 `https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.0/dsh-deepseek-web-xxxxxgold-0.7.0.tgz`。
+- **GitHub 链接（推荐，当前可用）**：在「添加插件」粘贴 `https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.1/dsh-deepseek-web-xxxxxgold-0.7.1.tgz`。
 - **本地安装包**：从 [Release](https://github.com/xxxxxgold/dsh-deepseek-web/releases/latest) 下载 `.tgz`，
-  在「添加插件」输入框粘贴完整绝对路径，例如 `C:\Users\你的用户名\Downloads\dsh-deepseek-web-xxxxxgold-0.7.0.tgz`。
-- **npm 包名**（需等 `0.7.0` 发布到 npm 后才可用）：在「添加插件」填 `dsh-deepseek-web-xxxxxgold@0.7.0`，
+  在「添加插件」输入框粘贴完整绝对路径，例如 `C:\Users\你的用户名\Downloads\dsh-deepseek-web-xxxxxgold-0.7.1.tgz`。
+- **npm 包名**（需等 `0.7.1` 发布到 npm 后才可用）：在「添加插件」填 `dsh-deepseek-web-xxxxxgold@0.7.1`，
   安装源选 npm 官方源；中国大陆镜像源可能尚未同步。若提示找不到该包，说明 npm 版还没发布，请改用上面的 GitHub 链接。
 - **不能安装 `dsh-deepseek-web`**：npm 上这个名字属于另一位作者，不是本项目；务必使用完整新名字或本项目 Release 链接。
 - **下载失败**：安装界面展开「查看安装详情」查看原因。npm 镜像可帮助下载依赖，不能代替访问 GitHub。

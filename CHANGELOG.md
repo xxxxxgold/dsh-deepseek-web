@@ -1,5 +1,12 @@
 # 更新记录
 
+## 0.7.1
+
+- **修复 0.7.0 发布产物缺少 `withTimeout` 定义导致的整轮崩溃**。0.7.0 给 deepseek 网页回合补流式超时兜底时，`src/playwright-channel.ts` 调用了 `withTimeout(...)`，但 import 块里只引入了 `setBrowserWindowTopmost` / `launchManagedBrowser` / `sendEditorMessage`，漏了 `withTimeout`。tsdown/rolldown 打包不做类型检查，产物里只剩 `function withTimeout$1(...)` 的定义、调用点仍写 `withTimeout(...)`，于是**任何 deepseek-web 回合一收到响应就抛 `ReferenceError: withTimeout is not defined`**，用户侧表现为「已收到网页完整回复，正在解析…」之后立即失败。发布包 `dsh-deepseek-web-xxxxxgold-0.7.0.tgz` 与 npm 上的 0.7.0 都带着这个缺陷，已确认（解包后 `lib/index.js:5110` 引用 `withTimeout`，定义只有 `withTimeout$1`）。本版补上 import 并重新打包，产物中调用点与定义同名一致。同时把 `Config` 接口补齐 `longTextAsFile` / `longTextFileThreshold` 两个字段（schema 早就有，接口漏声明，配置页与类型检查都对不上），修掉 `recordLedger` 的 `TS1064`（`async` 方法返回类型写成 `void`），并补 `tsconfig.json` + `@types/node` 让 `npx tsc --noEmit` 能跑起来——这类「产物能打包但类型对不上」的洞，靠 esbuild 是拦不住的。
+
+- **实时思考流不再因打包器注入的 `__name` 整段失效**。0.7.0 的页面网络镜像（`ensureCapture`）是把闭包 `toString()` 序列化后送进页面执行的，而 rolldown/tsdown 默认开 `keepNames`，会把闭包里的函数表达式改写成 `__name(fn, "…")`——页面上下文里没有 `__name`，注入整段抛 `ReferenceError: __name is not defined`，表现为最终回复正常但 `reasoning` 全程空白（真机 `tools/manual/probe-send.ts` 复现）。现在注入前先用**字符串形式**（不经序列化改写）补一个同语义垫片 `window.__name = window.__name || ((fn) => fn)`，思考流恢复逐字回传。新增 `tools/capture-shim-check.ts` 并入 `npm run test:parsers`：断言垫片存在于 `ensureCapture` 且在镜像闭包之前、必须是字符串形式、且构建产物 `lib/index.js` 里逐字保留。
+
+
 ## 0.7.0
 
 - **长正文不再硬塞进输入框：超过 12 万字改走文件附件**。网页输入框填字代价随文本长度接近二次方增长（实测 30 万字符约 13 秒、60 万约 77 秒、110 万字符能把主线程拖死数分钟），一轮二十几万字的任务光填字就要十几秒，还容易把首响应等待窗口吃掉。现在 `longTextAsFile`（默认开）在正文达到 `longTextFileThreshold`（默认 120 000 字）时，把完整正文写成 `dsh-turn-<时间戳>.md`，走同一个 `input[type=file]` 上传，输入框只填一段摘要：首行写明字数与附件名、保留开头 3000 字、中间省略、结尾要求模型先读附件再执行。网页端 `accept` 实测支持 `.txt/.md/.csv/.json/.log` 等文本格式。文件没挂上时（找不到输入框、解析失败）通道回退为直接填完整正文，不会把这一轮变成空发：`BrowserTurnRequest.fallbackText` 承载这份兜底正文，`BrowserImageAttachment.kind` 区分图片与文件附件，幂等判断对文件卡片改看容器文本而不是 `img[alt]`。新增 `tools/long-text-check.ts`：摘要形状、140k 字触发文件、3k 字不触发、关闭开关不触发四组断言。

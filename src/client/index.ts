@@ -36,6 +36,10 @@ export const inject = ['slots', 'sessions', 'uiConversation']
  * @param ctx - the client context.
  */
 export function apply(ctx: ClientContext): void {
+  // `slots` 由宿主 Client UI 注入，但上游 client 包不发布 .d.ts，
+  // 只能借 host-client.d.ts 的本地声明取回类型面（见该文件顶部说明）。
+  const host = ctx as ClientContext & HostClient.Context
+
   // 设置面板样式（运行时注入，幂等）
   ensureSettingsStyles()
 
@@ -47,7 +51,7 @@ export function apply(ctx: ClientContext): void {
   })
 
   // 配置页：侧栏「插件」页 → 组合包 dsh-deepseek-web-xxxxxgold → 行 llm-deepseek-web 上多出「配置」入口
-  ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+  host.slots.inject('plugins.row.config', () => host.slots.register({
     name: 'plugins.row.config',
     key: ROW_CONFIG_KEY,
   }, DeepSeekWebConfigPage))

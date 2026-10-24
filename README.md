@@ -26,10 +26,10 @@
 4. 选择 `deepseek-web`，在自动打开的浏览器窗口登录 DeepSeek；网页填入消息后，点击发送。
 
 ```text
-https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.0/dsh-deepseek-web-xxxxxgold-0.7.0.tgz
+https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.1/dsh-deepseek-web-xxxxxgold-0.7.1.tgz
 ```
 
-当前正式版为 **0.7.0**。
+当前正式版为 **0.7.1**。
 希望消息填入后自动发送，可改选 `deepseek-web-auto`。
 
 > [!IMPORTANT]
@@ -41,10 +41,10 @@ https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.0/dsh-deeps
 <details>
 <summary><b>其他安装方式：npm 包名 / 本地安装包</b></summary>
 
-**npm 包名**（`0.7.0` 已推送到 npm 后可用）：
+**npm 包名**（`0.7.1` 已推送到 npm 后可用）：
 
 ```text
-dsh-deepseek-web-xxxxxgold@0.7.0
+dsh-deepseek-web-xxxxxgold@0.7.1
 ```
 
 填包名时安装源选 **npm 官方源**；中国大陆镜像源可能尚未同步。
@@ -53,7 +53,7 @@ dsh-deepseek-web-xxxxxgold@0.7.0
 或从 [Release](https://github.com/xxxxxgold/dsh-deepseek-web/releases/latest) 下载 `.tgz`，粘贴文件的完整绝对路径，例如：
 
 ```text
-C:\Users\你的用户名\Downloads\dsh-deepseek-web-xxxxxgold-0.7.0.tgz
+C:\Users\你的用户名\Downloads\dsh-deepseek-web-xxxxxgold-0.7.1.tgz
 ```
 
 发行包已包含 host/client 编译产物。安装依赖仍需要网络；镜像尚未同步时选择 npm 官方源。
@@ -239,7 +239,7 @@ chat.deepseek.com 一致。插件不自己拼上传接口，只触发网页端�
 先确认装的是本项目：包名是 `dsh-deepseek-web-xxxxxgold`，或粘贴上面那条 GitHub 发行包链接。
 安装后点击「立即启用」并重启；在插件页检查 `llm-deepseek-web` 是否启用、有没有错误。
 
-如果 GitHub 链接下载失败，可以等 `0.7.0` 发布到 npm 后改用包名安装（安装源选 npm 官方源）。
+如果 GitHub 链接下载失败，可以等 `0.7.1` 发布到 npm 后改用包名安装（安装源选 npm 官方源）。
 [更多安装排查](INSTALL.md#其他安装入口与常见问题)。
 
 </details>

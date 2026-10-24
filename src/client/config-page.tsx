@@ -46,8 +46,10 @@ function isFieldVisible(
   current: unknown,
 ): boolean {
   if (rule === undefined) return true
-  if (Array.isArray(rule)) return rule.every(item => readPath(current, item.path) === item.equals)
-  return readPath(current, rule.path) === rule.equals
+  // `Array.isArray` 的守卫签名是 `arg is any[]`，对 `readonly T[]` 不窄化；
+  // 用 `in` 判断单条件，才能把联合类型正确拆成「一条」与「一组」。
+  const rules = 'path' in rule ? [rule] : rule
+  return rules.every(item => readPath(current, item.path) === item.equals)
 }
 
 /**
