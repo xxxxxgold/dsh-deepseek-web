@@ -1,5 +1,9 @@
 # 更新记录
 
+## 未发布
+
+- **控制协议改为默认每轮注入**（`protocolEveryRequest` 默认 `false` → `true`）。网页会话在长任务里会丢上下文：模型退化成普通聊天、忘记 `{"actions":[…]}` 的动作格式，靠 `protocolRefreshEvery`（默认 8 轮）补一次补不回来。现在每轮都重发协议与工具清单，代价是每条消息多约 1 千字符（精简工具目录）。嫌提示词长的仍可在设置页关掉，退回按间隔刷新；`protocolRefreshEvery` 只在关闭时生效。新增离线契约 `tools/protocol-default-check.ts`（默认值、开启时任意轮数都注入、关闭后按间隔刷新）并并入 `npm run test:parsers`。
+
 ## 0.7.1
 
 - **修复 0.7.0 发布产物缺少 `withTimeout` 定义导致的整轮崩溃**。0.7.0 给 deepseek 网页回合补流式超时兜底时，`src/playwright-channel.ts` 调用了 `withTimeout(...)`，但 import 块里只引入了 `setBrowserWindowTopmost` / `launchManagedBrowser` / `sendEditorMessage`，漏了 `withTimeout`。tsdown/rolldown 打包不做类型检查，产物里只剩 `function withTimeout$1(...)` 的定义、调用点仍写 `withTimeout(...)`，于是**任何 deepseek-web 回合一收到响应就抛 `ReferenceError: withTimeout is not defined`**，用户侧表现为「已收到网页完整回复，正在解析…」之后立即失败。发布包 `dsh-deepseek-web-xxxxxgold-0.7.0.tgz` 与 npm 上的 0.7.0 都带着这个缺陷，已确认（解包后 `lib/index.js:5110` 引用 `withTimeout`，定义只有 `withTimeout$1`）。本版补上 import 并重新打包，产物中调用点与定义同名一致。同时把 `Config` 接口补齐 `longTextAsFile` / `longTextFileThreshold` 两个字段（schema 早就有，接口漏声明，配置页与类型检查都对不上），修掉 `recordLedger` 的 `TS1064`（`async` 方法返回类型写成 `void`），并补 `tsconfig.json` + `@types/node` 让 `npx tsc --noEmit` 能跑起来——这类「产物能打包但类型对不上」的洞，靠 esbuild 是拦不住的。

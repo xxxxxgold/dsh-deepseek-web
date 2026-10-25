@@ -268,8 +268,8 @@ export const FIELDS: readonly FieldSpec[] = [
     kind: 'boolean',
     label: { zh: '每轮都注入控制协议', en: 'Inject control protocol every turn' },
     hint: {
-      zh: '提示词更长，但网页端行为更稳。',
-      en: 'Longer prompts, steadier page-side behavior.',
+      zh: '默认开启。每轮都重发协议与工具清单，网页端不容易在长任务里忘记动作格式；代价是每轮多带约 1 千字符（精简目录）。关掉后按下面的间隔刷新。',
+      en: 'On by default. Re-sends the protocol and tool list every turn so the page does not forget the action format on long tasks; costs about 1k extra characters per turn (compact catalog). Turn it off to fall back to the refresh interval below.',
     },
   },
   {

@@ -528,7 +528,10 @@ const schema = z.object({
   longRunPauseMinMs: markVolatile(z.number().step(1).min(0).max(3_600_000).default(30_000)),
   longRunPauseMaxMs: markVolatile(z.number().step(1).min(0).max(3_600_000).default(60_000)),
   protocolRefreshEvery: markVolatile(z.number().step(1).min(1).default(8)),
-  protocolEveryRequest: markVolatile(z.boolean().default(false)),
+  // 默认开：网页会话在长时间任务里会丢上下文（模型退化成普通聊天、忘记 JSON 动作格式），
+  // 靠“每 N 轮刷新一次”补不回来。每轮多带协议 + 工具目录（默认精简目录约 1k 字符），
+  // 换网页端行为稳定；嫌提示词长的可以在设置页关掉，退回按 protocolRefreshEvery 刷新。
+  protocolEveryRequest: markVolatile(z.boolean().default(true)),
   toolAllowlist: markVolatile(z.array(z.string()).default([
     'read',
     'write',
