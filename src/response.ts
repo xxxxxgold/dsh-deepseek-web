@@ -184,6 +184,33 @@ export function validateActions(
 /** 病态输入下最多尝试的候选起点数（前 N + 后 N），防止退化成 O(n²)。 */
 const MAX_JSON_STARTS = 32
 
+/**
+ * 字符串感知的括号配对：从 `start` 的开括号扫到配对的闭括号，返回闭括号下标。
+ * 只统计目标括号对，字符串里的括号一律跳过；截断或不配对返回 -1。
+ */
+function matchBalanced(text: string, start: number, open: '{' | '[', close: '}' | ']'): number {
+  if (text[start] !== open) return -1
+  let depth = 0
+  let inString = false
+  let escape = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]!
+    if (inString) {
+      if (escape) escape = false
+      else if (ch === '\\') escape = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === open) depth++
+    else if (ch === close) {
+      depth--
+      if (depth === 0) return i
+    }
+  }
+  return -1
+}
+
 /** 剥掉 ```json ... ``` 以及模型可能带上的前后缀，找到最靠前的可解析 JSON 对象。 */
 export function extractJsonObject(text: string): unknown | undefined {
   let candidate = text.trim()
@@ -204,29 +231,12 @@ export function extractJsonObject(text: string): unknown | undefined {
 
   // 每个起点都从括号/字符串的干净状态起算，保证与旧实现同语义（孤立引号不会污染后续候选）。
   for (const start of ordered) {
-    let depth = 0
-    let inString = false
-    let escape = false
-    for (let i = start; i < candidate.length; i++) {
-      const ch = candidate[i]!
-      if (inString) {
-        if (escape) escape = false
-        else if (ch === '\\') escape = true
-        else if (ch === '"') inString = false
-        continue
-      }
-      if (ch === '"') inString = true
-      else if (ch === '{') depth++
-      else if (ch === '}') {
-        depth--
-        if (depth === 0) {
-          try {
-            return JSON.parse(candidate.slice(start, i + 1))
-          } catch {
-            break
-          }
-        }
-      }
+    const end = matchBalanced(candidate, start, '{', '}')
+    if (end < 0) continue
+    try {
+      return JSON.parse(candidate.slice(start, end + 1))
+    } catch {
+      continue
     }
   }
   return undefined
@@ -316,8 +326,217 @@ function parseXmlToolCall(text: string): WebToolAction[] | undefined {
   return undefined
 }
 
-export function parseWebReply(text: string): ParsedWebReply {
+/** 围栏块；`atTail` 表示这段围栏后面已经没有正文，可用于区分“末尾工具信封”与文档示例。 */
+interface FencedBlock {
+  content: string
+  atTail: boolean
+}
+
+/**
+ * 按行切围栏块。
+ *
+ * 不能用「``` 到 ```」的非贪婪正则：正文里常出现行内反引号（例如「末尾多带了
+ * 围栏符号 ```，去掉后…」），正则会把它当成开栏，后面的真围栏整体错位
+ * （2026-10-25 会话 session-a8a05f7a 的真实样本，动作信封因此漏判）。
+ *
+ * `atTail` 表示这段围栏之后再没有正文，用来区分「末尾工具信封」与文档示例。
+ * 未闭合的围栏按“延伸到结尾”处理，坏信封才可能被判成“想调工具”。
+ */
+function fencedBlocks(text: string): FencedBlock[] {
+  const lines = text.split(/\r?\n/)
+  const blocks: FencedBlock[] = []
+  let openAt: number | undefined
+  let contentFrom = 0
+  for (let index = 0; index < lines.length; index++) {
+    if (!/^\s*```/.test(lines[index]!)) continue
+    if (openAt === undefined) {
+      openAt = index
+      contentFrom = index + 1
+      continue
+    }
+    const atTail = lines.slice(index + 1).join('\n').trim() === ''
+    blocks.push({ content: lines.slice(contentFrom, index).join('\n'), atTail })
+    openAt = undefined
+  }
+  if (openAt !== undefined) {
+    blocks.push({ content: lines.slice(contentFrom).join('\n'), atTail: true })
+  }
+  return blocks
+}
+
+/** 回复（或围栏内容）开头是否直接就是动作信封。 */
+function startsWithActionEnvelope(text: string): boolean {
+  return /^\{\s*["']?(?:actions|action|tool)["']?\s*:/i.test(text.trim())
+}
+
+/** 文本里出现的动作工具名，用来判断信封指向的是不是本轮真实工具。 */
+function actionNamesIn(text: string): string[] {
+  const names: string[] = []
+  const re = /["'](?:tool|action)["']\s*:\s*["']([^"'\\]+)["']/g
+  for (let match = re.exec(text); match; match = re.exec(text)) {
+    const name = match[1]!.trim()
+    if (name) names.push(name)
+  }
+  return names
+}
+
+const ACTIONS_KEY = /["']actions["']\s*:\s*\[/i
+const NEXT_ACTION = /{\s*["'](?:tool|action)["']\s*:\s*["']/g
+const ARGUMENTS_KEY = /["'](?:arguments|params)["']\s*:\s*\{/g
+
+/** JSON 合法转义字符；其余转义（典型是 Windows 路径里的 `\d`）视为模型漏写反斜杠。 */
+const VALID_JSON_ESCAPES = new Set(['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'])
+
+/**
+ * 保守修复模型写坏的 JSON 字面量：只动字符串内部，不改结构、不改值。
+ * - 字符串里的裸换行 / 回车 / 制表符 → 转义；
+ * - 非法转义（`\d`、`\P`…）→ 补一个反斜杠。
+ *
+ * 修不好时由调用方按“坏信封”处理（纠错或报错），绝不把半截动作拿去执行。
+ */
+export function repairJsonEscapes(text: string): string {
+  let out = ''
+  let inString = false
+  let escape = false
+  for (const ch of text) {
+    if (inString) {
+      if (escape) {
+        if (VALID_JSON_ESCAPES.has(ch)) {
+          out += ch
+        } else {
+          out += `\\${ch}`
+        }
+        escape = false
+        continue
+      }
+      if (ch === '\\') {
+        out += ch
+        escape = true
+        continue
+      }
+      if (ch === '"') {
+        out += ch
+        inString = false
+        continue
+      }
+      if (ch === '\n') {
+        out += '\\n'
+        continue
+      }
+      if (ch === '\r') {
+        out += '\\r'
+        continue
+      }
+      if (ch === '\t') {
+        out += '\\t'
+        continue
+      }
+      out += ch
+      continue
+    }
+    if (ch === '"') {
+      out += ch
+      inString = true
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+/**
+ * 按结构逐条还原 `{"actions":[ ... ]}` 里的动作，不要求外层信封是合法 JSON。
+ *
+ * 模型偶尔少写一个右花括号（2026-10-25 真实样本），严格解析会失败；但每个动作的
+ * `arguments` 对象本身是完整的，可以单独取出并 `JSON.parse`。这里只认**末尾信封**，
+ * 且要求每个工具名都在本轮清单内、每个参数都能解析；任一动作不可信就整体放弃——
+ * 半个计划执行比不执行更危险。
+ */
+export function salvageToolEnvelope(
+  text: string,
+  allowedToolNames: ReadonlySet<string>,
+): WebToolAction[] | undefined {
   const trimmed = text.trim()
+  const blocks = [
+    ...fencedBlocks(text).filter(block => block.atTail).map(block => block.content),
+    ...(trimmed.startsWith('{') ? [trimmed] : []),
+  ]
+  for (const block of blocks) {
+    const actions = scanActionArray(block, allowedToolNames)
+    if (actions) return actions
+  }
+  return undefined
+}
+
+function scanActionArray(block: string, allowedToolNames: ReadonlySet<string>): WebToolAction[] | undefined {
+  const head = ACTIONS_KEY.exec(block)
+  if (!head) return undefined
+  const arrayStart = head.index + head[0].length - 1
+  const arrayEnd = matchBalanced(block, arrayStart, '[', ']')
+  // 数组没闭合说明回复被截断，剩余动作数量未知：不抢救，交给纠错。
+  if (arrayEnd < 0) return undefined
+  const limit = arrayEnd
+
+  const actions: WebToolAction[] = []
+  let cursor = arrayStart + 1
+  while (cursor < limit) {
+    NEXT_ACTION.lastIndex = cursor
+    const next = NEXT_ACTION.exec(block)
+    if (!next || next.index >= limit) break
+    const actionStart = next.index
+    const name = /^{\s*["'](?:tool|action)["']\s*:\s*["']([^"'\\]+)["']/
+      .exec(block.slice(actionStart, actionStart + 200))?.[1]?.trim()
+    if (!name || !allowedToolNames.has(name)) return undefined
+
+    ARGUMENTS_KEY.lastIndex = actionStart
+    const argsMatch = ARGUMENTS_KEY.exec(block)
+    if (!argsMatch || argsMatch.index >= limit) return undefined
+    // arguments 必须属于当前动作，不能抢下一个动作的参数。
+    NEXT_ACTION.lastIndex = actionStart + 1
+    const following = NEXT_ACTION.exec(block)
+    if (following && following.index < argsMatch.index) return undefined
+
+    const argsStart = argsMatch.index + argsMatch[0].length - 1
+    const argsEnd = matchBalanced(block, argsStart, '{', '}')
+    if (argsEnd < 0 || argsEnd > limit) return undefined
+    let params: unknown
+    const rawArgs = block.slice(argsStart, argsEnd + 1)
+    try {
+      params = JSON.parse(rawArgs)
+    } catch {
+      // 模型偶尔把 Windows 路径写成 `D:\dsh`（`\d` 不是合法转义）或塞入裸换行：
+      // 只修转义再试一次，仍失败就整体放弃，交给纠错。
+      try {
+        params = JSON.parse(repairJsonEscapes(rawArgs))
+      } catch {
+        return undefined
+      }
+    }
+    if (typeof params !== 'object' || params === null || Array.isArray(params)) return undefined
+    actions.push({ tool: name, params: params as Record<string, unknown> })
+    cursor = argsEnd + 1
+  }
+  return actions.length > 0 ? actions : undefined
+}
+
+export function parseWebReply(
+  text: string,
+  options: { allowedToolNames?: ReadonlySet<string> } = {},
+): ParsedWebReply {
+  const trimmed = text.trim()
+  // 严格解析失败后的统一出口：能结构抢救就抢救，否则按“无动作”返回。
+  const unresolved = (): ParsedWebReply => {
+    const allowed = options.allowedToolNames
+    const salvaged = allowed ? salvageToolEnvelope(trimmed, allowed) : undefined
+    if (salvaged) {
+      return {
+        hasActions: true,
+        actions: salvaged.map(action => ({ ...action, params: normalizeParams(action) })),
+        text: trimmed,
+      }
+    }
+    return { hasActions: false, actions: [], text: trimmed }
+  }
   if (/<\/?[｜|]{2}DSML[｜|]{2}/.test(trimmed)) {
     const actions = parseDsml(trimmed)
     // DSML 中的 JSON 参数不能被误解析成另一个顶层动作。
@@ -339,7 +558,7 @@ export function parseWebReply(text: string): ParsedWebReply {
     if (Array.isArray(rawActions)) {
       for (const item of rawActions) {
         if (typeof item !== 'object' || item === null || Array.isArray(item)) {
-          return { hasActions: false, actions: [], text: trimmed }
+          return unresolved()
         }
         actions.push(item as WebToolAction)
       }
@@ -357,6 +576,8 @@ export function parseWebReply(text: string): ParsedWebReply {
         text: trimmed,
       }
     }
+    // 文本明确是动作信封但外层没解析出来时，内层对象不能冒充单动作执行。
+    if (/["']actions["']\s*:/.test(trimmed)) return unresolved()
     // 兼容 {"action": "read_file", "params": {...}} 的单动作形态
     if (typeof obj.action === 'string' || typeof obj.tool === 'string') {
       const single = obj as unknown as WebToolAction
@@ -367,23 +588,36 @@ export function parseWebReply(text: string): ParsedWebReply {
       }
     }
   }
-  return { hasActions: false, actions: [], text: trimmed }
+  return unresolved()
 }
 
 /**
  * 判断一段“没有解析出动作”的回复是否明显是想调用工具但格式坏了：
- * 空回复、完整回复中的动作信封或原生 DSML 标签。
+ * 空回复、动作信封（含散文前缀 + 围栏）、原生 DSML 标签。
+ *
+ * 传入本轮工具清单时，围栏信封里至少要有一个工具名在清单内才算“想调工具”，
+ * 避免把文档里的动作示例误判成工具调用。
  */
-export function looksLikeIntendedToolReply(text: string): boolean {
+export function looksLikeIntendedToolReply(
+  text: string,
+  allowedToolNames?: ReadonlySet<string>,
+): boolean {
   const trimmed = text.trim()
   if (trimmed.length === 0) return true
   if (/<\/?[｜|]{2}DSML[｜|]{2}/.test(trimmed)) return true
   // 标签形态能解析时 parseWebReply 已经接手；走到这里说明标签内 JSON 坏了，
   // 此时必须纠错——否则一坨 <tool_call> 会被当成最终回答交给用户。
   if (/<\s*\/?\s*(?:tool_calls?|function_calls?|invoke)\b/i.test(trimmed)) return true
-  // 最终报告可以包含 JSON 代码示例；仅拦截整条回复的动作信封。
-  const candidate = trimmed.replace(/^```(?:json)?\s*([\s\S]*?)(?:```)?$/i, '$1').trim()
-  if (/^\{\s*["']?(?:actions|tool|action)["']?\s*:/i.test(candidate)) return true
+  // 整条回复就是动作信封。
+  if (startsWithActionEnvelope(trimmed)) return true
+  // 散文 + ```json 围栏 + 信封：网页模型最常见的补刀形态。
+  // 空 actions / 只有示例字段的围栏不算调用（文档示例），必须至少出现一个工具名。
+  for (const block of fencedBlocks(trimmed)) {
+    if (!startsWithActionEnvelope(block.content)) continue
+    const names = actionNamesIn(block.content)
+    if (names.length === 0) continue
+    if (!allowedToolNames || names.some(name => allowedToolNames.has(name))) return true
+  }
   return false
 }
 
@@ -403,14 +637,23 @@ export function looksLikeTaskRequest(text: string): boolean {
  *
  * `startIndex` 是本条助手消息内第一个空闲内容块序号：同一消息里若已经
  * 流式输出过 reasoning（实时思考流）块，正文块要从更高的序号开始，
- * 避免与已有块冲突。`nextCallId` 控制工具调用 id 的起始编号。
+ * 避免与已有块冲突。
+ *
+ * `callIdPrefix` 决定工具调用 id 的前缀。DSH 的会话节点键是
+ * `conversationContextKey('tool-call', id)`（只含 kind + id，见
+ * dsh-client-ui-conversation/lib/client.js:1745/2871），所以 id 必须
+ * **跨消息唯一**：每条消息都从 `web-1` 重新计数，会让后发生的调用复用前面
+ * 那张卡——表现为乱序、或前面的卡片被覆盖消失（2026-10-25 实测：本机 8 天
+ * 3203 次网页工具调用里有 2518 次 id 重复）。默认生成一次性前缀，测试可固定。
  */
 export function* replyChunks(
   reply: ParsedWebReply,
-  options: { startIndex?: number; nextCallId?: number } = {},
+  options: { startIndex?: number; nextCallId?: number; callIdPrefix?: string } = {},
 ): Generator<StreamChunk> {
   const startIndex = options.startIndex ?? 0
   let nextCallId = options.nextCallId ?? 1
+  const callIdPrefix = options.callIdPrefix
+    ?? `web-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
   const blocks: ContentBlock[] = []
   let textBlock: ContentBlock | undefined
   if (!reply.hasActions && reply.text.length > 0) {
@@ -430,7 +673,7 @@ export function* replyChunks(
   for (const action of reply.actions) {
     if (!action.tool) continue
     // ToolCallId is a branded string at type level; no runtime wrapper is needed.
-    const id = `web-${nextCallId++}` as ToolCallId
+    const id = `${callIdPrefix}-${nextCallId++}` as ToolCallId
     const argumentsJson = JSON.stringify(action.params ?? {})
     const block: ContentBlock = { type: 'tool-call', id, name: action.tool, arguments: argumentsJson }
     toolCalls.push(block)

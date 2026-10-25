@@ -866,10 +866,10 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     }
 
     this.checkReplyEnd(reply)
-    let parsed = parseWebReply(reply.text)
     const visibleTools = visibleToolsOf(options, this.config)
     const allowedToolNames = new Set(visibleTools.map(tool => tool.name))
     const toolSchemas = new Map(visibleTools.map(tool => [tool.name, tool]))
+    let parsed = parseWebReply(reply.text, { allowedToolNames })
     // 委托工具（如 web_search/web_fetch）不进入本地校验与执行：
     // 拆分后在下一轮把查询转交网页端自带能力，结果并入正文。
     const delegatedNames = new Set(this.config.delegatedTools)
@@ -922,7 +922,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         || (
           !parsed.hasActions
           && (
-            looksLikeIntendedToolReply(reply.text)
+            looksLikeIntendedToolReply(reply.text, allowedToolNames)
             || looksLikeUnfinishedHandoff(reply.text, state.goalText ?? '')
             || looksLikeTaskRequest(reply.text)
             || ((options.tools?.length ?? 0) > 0 && looksLikeToolDenial(reply.text))
@@ -957,7 +957,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       usageObserved = usageObserved || correctedReply.accumulatedUsage !== undefined
       reply = correctedReply
       this.checkReplyEnd(reply)
-      parsed = parseWebReply(correctedReply.text)
+      parsed = parseWebReply(correctedReply.text, { allowedToolNames })
       revalidate()
       correctedChars += correctedReply.text.length + reviewNote.length
     }
@@ -972,7 +972,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       }`, 'WEB_ACTION_REJECTED')
     }
 
-    if (!parsed.hasActions && delegatedActions.length === 0 && looksLikeIntendedToolReply(reply.text)) {
+    if (!parsed.hasActions && delegatedActions.length === 0 && looksLikeIntendedToolReply(reply.text, allowedToolNames)) {
       throw new LlmError('网页工具调用格式仍无法完整解析，未作为最终交付提交；请重试当前任务。', 'MALFORMED_TOOL_CALL')
     }
 
@@ -1114,7 +1114,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         usageObserved = usageObserved || revised.accumulatedUsage !== undefined
         reply = revised
         this.checkReplyEnd(reply)
-        parsed = parseWebReply(revised.text)
+        parsed = parseWebReply(revised.text, { allowedToolNames })
         revalidate()
         correctedChars += revised.text.length + feedback.length
         if (problems.length > 0) break
@@ -1130,7 +1130,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       throw new LlmError('网页仍返回未完成的任务交接摘要，未作为最终交付提交；请重试当前任务。', 'WEB_UNFINISHED_HANDOFF')
     }
     if (problems.length > 0) throw new LlmError('审核修正后的工具调用未通过本地校验。', 'WEB_ACTION_REJECTED')
-    if (!parsed.hasActions && looksLikeIntendedToolReply(parsed.text)) {
+    if (!parsed.hasActions && looksLikeIntendedToolReply(parsed.text, allowedToolNames)) {
       throw new LlmError('网页仍返回无法解析的工具调用，未作为最终交付提交。', 'MALFORMED_TOOL_CALL')
     }
 
