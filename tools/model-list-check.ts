@@ -11,7 +11,12 @@
  * 用法：tsx tools/model-list-check.ts
  */
 import { Config } from '../src/config.ts'
-import { WEB_MODEL_IDS, WEB_MODEL_CAPABILITIES } from '../src/web-models.ts'
+import {
+  WEB_MODEL_CAPABILITIES,
+  WEB_MODEL_DEFAULT_REASONING_EFFORT,
+  WEB_MODEL_IDS,
+  WEB_MODEL_REASONING_EFFORTS,
+} from '../src/web-models.ts'
 
 /** schemastery 的枚举节点是 const 对象数组，取其 value。 */
 function enumValuesOf(schema: unknown): string[] {
@@ -47,5 +52,27 @@ check(
 )
 check(fromIds.length >= 1, '至少有一个模型 id', `当前 ${fromIds.length} 个`)
 
-if (failed === 0) console.log('OK（模型清单：事实表 / 能力表 / 配置枚举三处一致）')
+const effortIds = WEB_MODEL_REASONING_EFFORTS.map(effort => effort.id)
+check(
+  effortIds.length === 3 && new Set(effortIds).size === 3,
+  '审核档位恰好三档且 id 不重复',
+  `ids=${JSON.stringify(effortIds)}`,
+)
+check(
+  effortIds[0] === 'review-off' && effortIds[1] === 'review-default' && effortIds[2] === 'review-on',
+  '审核档位顺序固定为 review-off / review-default / review-on',
+  `ids=${JSON.stringify(effortIds)}`,
+)
+check(
+  WEB_MODEL_REASONING_EFFORTS.every(effort => effort.name.trim().length > 0),
+  '每个审核档位都有展示名',
+  `efforts=${JSON.stringify(WEB_MODEL_REASONING_EFFORTS)}`,
+)
+check(
+  effortIds.includes(WEB_MODEL_DEFAULT_REASONING_EFFORT),
+  '默认审核档位在档位表内',
+  `default=${WEB_MODEL_DEFAULT_REASONING_EFFORT} ids=${JSON.stringify(effortIds)}`,
+)
+
+if (failed === 0) console.log('OK（模型清单：事实表 / 能力表 / 配置枚举 / 审核档位一致）')
 process.exit(failed === 0 ? 0 : 1)

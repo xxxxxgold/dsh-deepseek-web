@@ -26,10 +26,10 @@
 4. 选择 `deepseek-web`，在自动打开的浏览器窗口登录 DeepSeek；网页填入消息后，点击发送。
 
 ```text
-https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.1/dsh-deepseek-web-xxxxxgold-0.7.1.tgz
+https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.2/dsh-deepseek-web-xxxxxgold-0.7.2.tgz
 ```
 
-当前正式版为 **0.7.1**。
+当前正式版为 **0.7.2**。
 希望消息填入后自动发送，可改选 `deepseek-web-auto`。
 
 > [!IMPORTANT]
@@ -41,10 +41,10 @@ https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.1/dsh-deeps
 <details>
 <summary><b>其他安装方式：npm 包名 / 本地安装包</b></summary>
 
-**npm 包名**（`0.7.1` 已推送到 npm 后可用）：
+**npm 包名**（`0.7.2` 已推送到 npm 后可用）：
 
 ```text
-dsh-deepseek-web-xxxxxgold@0.7.1
+dsh-deepseek-web-xxxxxgold@0.7.2
 ```
 
 填包名时安装源选 **npm 官方源**；中国大陆镜像源可能尚未同步。
@@ -53,7 +53,7 @@ dsh-deepseek-web-xxxxxgold@0.7.1
 或从 [Release](https://github.com/xxxxxgold/dsh-deepseek-web/releases/latest) 下载 `.tgz`，粘贴文件的完整绝对路径，例如：
 
 ```text
-C:\Users\你的用户名\Downloads\dsh-deepseek-web-xxxxxgold-0.7.1.tgz
+C:\Users\你的用户名\Downloads\dsh-deepseek-web-xxxxxgold-0.7.2.tgz
 ```
 
 发行包已包含 host/client 编译产物。安装依赖仍需要网络；镜像尚未同步时选择 npm 官方源。
@@ -85,11 +85,39 @@ C:\Users\你的用户名\Downloads\dsh-deepseek-web-xxxxxgold-0.7.1.tgz
 这是**发送方式的区别**，不是两个不同的大模型。思考与联网开关由网页自身管理。
 模式不会改变 dsh 对本地工具的权限与审批设置。
 
+### GLM 网页版（第二个主模型）
+
+模型菜单里还有一组「GLM 网页版」，模型与思考强度都在那里选：
+
+| 模型 | 说明 |
+| --- | --- |
+| `GLM-5.3` | 旗舰模型，适合复杂任务。 |
+| `GLM-5.3-Flash` | 更快，适合轻任务。 |
+
+选中后在「推理等级」里选 **快速 / 深度 / 极致**（默认深度）。插件会在每轮发送前把 GLM 页面切到对应模型与强度并校验，不依赖页面记忆。
+
+支持 `chatglm.cn` 与 `chat.z.ai`（含中国站 `zchat.z.ai`），在「设置 → GLM 网页」里改入口地址；首次需在弹出的 GLM 窗口登录一次。主通道只支持纯文本回合：图片会降级为文本标记，长正文直接填入输入框（不转文件附件）。
+
+GLM 是**可选**的第二组模型：默认仍用 `deepseek-web` / `deepseek-web-auto`，不选 GLM 就不会启动 GLM 浏览器，DeepSeek 通道的模型、发送与审核行为都不变。
+
+### 豆包网页版（第三个主模型，可选）
+
+模型菜单里还有一组「豆包网页版」，与 DeepSeek / GLM **并存**，不是替换：
+
+| 模型入口 | 发送方式 |
+| --- | --- |
+| `doubao-web` | 填入后由你点击网页发送（半自动） |
+| `doubao-web-auto` | 填入后自动回车发送（全自动） |
+
+快速/专家模式请在豆包网页端自行设置，插件不切换、不校验。首次使用需在插件专用豆包窗口（默认 `%LOCALAPPDATA%\DshDeepSeekWeb\doubao-profile`）登录一次；入口地址、profile、CDP 端口与响应超时在「设置 → 豆包网页」里改。设置页另有「豆包登录态」卡片，可只读检测状态、打开豆包浏览器去登录；豆包一期不支持登录态导入/导出。
+
+豆包通道一期只支持纯文本与工具调用：图片降级为文本标记，长正文直接填入输入框（不转文件附件）。默认关闭（`doubao.enabled=false`），不启用时不会注册模型、也不会启动豆包浏览器。
+
 ### 在哪里调整设置？
 
 两个入口读写同一份配置：
 
-- **设置 → DeepSeek 网页**（推荐）：按「网页连接 / 网页模型与发送 / 风控模式 / 图片直传 / 审核通道 / 频控自动重发 / 过程提示 / 浏览器自愈 / 登录探活 / 工具与委托 / 窗口聚焦 / 压缩摘要」十二组排布，常用参数一页改完（回合超时、锁租约等进阶字段仍走 profile patch，见[进阶文档](docs/ADVANCED.md#配置)）。
+- **设置 → DeepSeek 网页**（推荐）：按「网页连接 / GLM 网页 / 豆包网页 / 网页模型与发送 / 风控模式 / 图片直传 / 审核通道 / 频控自动重发 / 过程提示 / 浏览器自愈 / 登录探活 / 工具与委托 / 窗口聚焦 / 压缩摘要」十余组排布，常用参数一页改完（回合超时、锁租约等进阶字段仍走 profile patch，见[进阶文档](docs/ADVANCED.md#配置)）。
 - **插件 → `dsh-deepseek-web-xxxxxgold` → `llm-deepseek-web` → 配置**：插件管理器里的同一份表单。
 
 页面上的行为：
@@ -102,8 +130,9 @@ C:\Users\你的用户名\Downloads\dsh-deepseek-web-xxxxxgold-0.7.1.tgz
 - **只看结果**：关闭「显示网页思考过程」，即 `liveThinking: false`，这也是默认值。
 - **选择浏览器**：`browser` 选 `managed` 由插件托管独立窗口（`channel` 选 `msedge` 或 `chrome`），选 `attach` 则连接已开启 CDP 的浏览器。
 - **开启审核**：打开 `review.enabled`，选择 `deepseek-web`、`kimi` 或 `glm`。
+- **会话内切换审核**：选中 `deepseek-web` / `deepseek-web-auto` 后，模型菜单的「推理等级」会变成「审核关 / 跟随设置 / 审核开」三档；「跟随设置」读取 `review.enabled`，两个显式档位只覆盖当前会话。原生模型不显示这三档。
 
-审核默认关闭。DeepSeek 自审不需要额外浏览器；Kimi / GLM 需要先在对应独立窗口登录。
+审核默认关闭（`review.enabled` 只决定「跟随设置」档位）；网页模型会话仍可在模型菜单里显式选「审核开」。DeepSeek 自审不需要额外浏览器；Kimi / GLM 需要先在对应独立窗口登录。选 `glm` 审核时，还可在「审核通道」里指定审核模型（`GLM-5.3` / `GLM-5.3-Flash`）与思考强度（快速/深度/极致），每次审核前自动切换并校验。
 [查看完整配置与审核准备](docs/ADVANCED.md#审核通道)。
 
 <a id="how-it-works"></a>
@@ -125,6 +154,20 @@ flowchart LR
 
 正常任务使用工作标签；dsh 的内部摘要与标题请求使用独立临时标签，完成、失败或取消后关闭。
 半自动模式下，内部请求也需要点击发送；全自动模式会自动发送。
+
+<a id="login-state"></a>
+## 登录态
+
+设置页底部有「登录态」卡片，显示当前插件浏览器的登录状态，并提供手动管理入口：
+
+- **立即检测**：只读探活，不发送、不消耗额度；浏览器没启动时只报「无法判断」，**不会为了检测拉起浏览器**。
+- **打开浏览器去登录**：拉起/复用插件浏览器并打开 chat.deepseek.com；未登录时窗口会置前，登录完成后卡片通过限时轮询自动复检。
+- **导入登录态**：换机或 profile 丢失时，把另一台机器导出的 `userToken`（或完整 JSON，可带 cookies）粘贴进来，写入当前浏览器 profile 并刷新页面。
+- **复制登录态**：导出当前 `{userToken, cookies}` JSON，便于搬到另一台机器。**导出的 token 等同账号凭证，不要分享**。
+
+GLM 主通道有独立的「GLM 登录态」卡片：只读检测 GLM 窗口，点「打开浏览器去登录」会在独立 GLM 窗口打开 `chatglm.cn` / `chat.z.ai` 并在登录后自动复检。GLM 卡片首版不提供导入/导出登录态。
+
+登录态仍然只存在于插件专用浏览器 profile 中；导入不会写进插件配置或设置文件，日志里也不会出现完整 token。
 
 <a id="self-check"></a>
 ## 自检与调用台账
@@ -239,7 +282,7 @@ chat.deepseek.com 一致。插件不自己拼上传接口，只触发网页端�
 先确认装的是本项目：包名是 `dsh-deepseek-web-xxxxxgold`，或粘贴上面那条 GitHub 发行包链接。
 安装后点击「立即启用」并重启；在插件页检查 `llm-deepseek-web` 是否启用、有没有错误。
 
-如果 GitHub 链接下载失败，可以等 `0.7.1` 发布到 npm 后改用包名安装（安装源选 npm 官方源）。
+如果 GitHub 链接下载失败，可以等 `0.7.2` 发布到 npm 后改用包名安装（安装源选 npm 官方源）。
 [更多安装排查](INSTALL.md#其他安装入口与常见问题)。
 
 </details>
@@ -248,6 +291,7 @@ chat.deepseek.com 一致。插件不自己拼上传接口，只触发网页端�
 <summary><b>登录态在哪里？卸载会清掉吗？</b></summary>
 
 Windows 默认数据目录是 `%LOCALAPPDATA%\DshDeepSeekWeb\`，可在配置中指定浏览器 profile。
+设置页的「登录态」卡片可以查看当前状态、立即检测、打开登录窗口，也可以导入/导出登录态（换机时用）。
 正常卸载保留这些数据。需要彻底清除时，在停用插件并关闭对应浏览器后，手动删除不再需要的数据。
 
 </details>

@@ -38,13 +38,21 @@ import {
 import type {
   GenerateOptions,
   LlmModelInfo,
+  LlmModelReasoningInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
+  ReasoningEffortId,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { BrowserChannel, BrowserImageAttachment, BrowserTurnRequest, BrowserTurnProgress, BrowserTurnResult } from './browser-channel.ts'
-import type { Config, WebModelId } from './config.ts'
-import { normalizeWebModel, WEB_MODEL_CAPABILITIES, WEB_MODEL_IDS } from './config.ts'
+import type { Config, WebModelId, WebModelReasoningEffortId } from './config.ts'
+import {
+  normalizeWebModel,
+  WEB_MODEL_CAPABILITIES,
+  WEB_MODEL_DEFAULT_REASONING_EFFORT,
+  WEB_MODEL_IDS,
+  WEB_MODEL_REASONING_EFFORTS,
+} from './config.ts'
 import type { ActionProblem, WebToolAction } from './response.ts'
 import {
   looksLikeIntendedToolReply,
@@ -85,6 +93,41 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { AsyncLock } from './async-lock.ts'
 
+/** 把纯常量表里的档位 id 品牌化成 DSH 的 ReasoningEffortId（仅类型层，无运行时依赖）。 */
+function reasoningEffortId(id: WebModelReasoningEffortId): ReasoningEffortId {
+  return id as ReasoningEffortId
+}
+
+/**
+ * 网页模型在 DSH 模型菜单里公布的三档审核开关。
+ *
+ * 行标题由 DSH 固定为「推理等级」，这里只负责选项名；`review-default` 让适配器
+ * 回落全局 `review.enabled`，因此它是「跟随设置」而不是第三级审核强度。
+ */
+function webModelReasoning(): LlmModelReasoningInfo {
+  return {
+    efforts: WEB_MODEL_REASONING_EFFORTS.map(effort => ({
+      id: reasoningEffortId(effort.id),
+      name: effort.name,
+    })),
+    defaultEffort: reasoningEffortId(WEB_MODEL_DEFAULT_REASONING_EFFORT),
+  }
+}
+
+/**
+ * 把会话档位解释成审核开关。
+ *
+ * - `review-off` / `review-on` 是用户在当前会话里的显式覆盖；
+ * - `review-default`（以及未提供）回落全局 `review.enabled`，所以「跟随设置」
+ *   会实时跟随插件配置，而不是把某一刻的值固定进会话。
+ * - 不认识的非空档位也按「跟随设置」兜底；DSH 会先用模型元数据校验，正常不会出现。
+ */
+export function reviewEnabledByEffort(effort: string | undefined, fallback: boolean): boolean {
+  if (effort === 'review-off') return false
+  if (effort === 'review-on') return true
+  return fallback
+}
+
 /** 拆出委托动作（如 web_search/web_fetch）：本地校验与执行都不含它们。 */
 function splitDelegatedActions(
   actions: readonly WebToolAction[],
@@ -97,8 +140,17 @@ function splitDelegatedActions(
   })
 }
 
-const CONTEXT_WINDOW = 128_000
-const MAX_TOKENS = 16_000
+/**
+ * 宿主默认压缩预留（dsh 0.2.0-rc.2 的 `headroomTokens`）。容量配置告警按它计算。
+ */
+const COMPACTION_HEADROOM_TOKENS = 65_536
+
+/**
+ * 网页模型容量改由设置页配置（`contextWindow` / `maxTokens`），不再写死常量。
+ * 默认值依据实测：附件通道下中文约 154 万字符、英文约 400 万字符可被完整读入
+ * （折算约 100 万 token，超限时网页静默丢尾部）；直填输入框通道 30 万字符仍正常。
+ * 输出侧网页会自然收尾，输出上限只作宿主预算声明。见 src/config.ts。
+ */
 
 /** 产出签名：同一任务下内容未变就不重复送审。 */
 function reviewSignature(goal: string, artifact: string): string {
@@ -162,6 +214,68 @@ export type ReadImageAttachment = (
   ref: ImageAttachmentRef,
 ) => Promise<{ name: string; mimeType: string; data: Uint8Array } | undefined>
 
+/**
+ * 读图函数的延迟解析。
+ *
+ * 插件入口先建 adapter，等 cordis 的 `attachments` 服务就绪后（`ctx.inject`）才把真正的
+ * reader 挂上；服务卸载时再清空。所以不能在构造时把 reader 固定成值——否则「服务晚到」
+ * 就退化成永久不可用（旧实现正是这么丢掉整条图片直传链路的）。
+ * 返回 undefined 表示当前不可用：宿主没提供附件服务，或服务已卸载。
+ */
+export type ImageReaderSource = () => ReadImageAttachment | undefined
+
+/** 一个 provider 的模型入口（仅用于展示与发送方式判定）。 */
+export interface AdapterModel {
+  id: string
+  label: string
+  /** 该入口是否自动发送（true）还是填字后等用户点发送（false）。 */
+  autoSend: boolean
+}
+
+/**
+ * provider 身份。默认值保持 DeepSeek 原样；豆包通道传入自己的清单即可复用
+ * 同一套协议、工具、压缩、频控与会话逻辑，避免复制第二份适配器。
+ */
+export interface AdapterProfile {
+  providerId: string
+  providerName: string
+  models: readonly AdapterModel[]
+  /** 把历史/别名模型 id 归一到当前入口；不认识返回 undefined。 */
+  normalizeModel: (model: string) => string | undefined
+  /** 独立状态文件；缺省用 config.stateFile。 */
+  stateFile?: string
+  /** 独立调用台账文件；缺省与状态文件同目录的 call-ledger.json。 */
+  ledgerFile?: string
+  /** 日志前缀，默认 `deepseek-web`。 */
+  logPrefix?: string
+  /** 图片能力：`config` 跟随 enableImageUpload，`none` 永远只声明文本。 */
+  imageSupport?: 'config' | 'none'
+  /** 是否在模型菜单里公布审核三档；豆包一期不支持审核，设为 false。 */
+  reviewTiers?: boolean
+  /** 自定义推理/思考档位；提供时优先于 DeepSeek 的审核三档。 */
+  reasoning?: { efforts: readonly { id: string; name: string }[]; defaultEffort: string }
+  /** 是否支持长文本转文件附件；缺省 true（保持 DeepSeek 行为）。 */
+  supportsLongTextFile?: boolean
+  modelDescription: string
+}
+
+/** 默认 DeepSeek provider（保持现有行为与模型 id）。 */
+export function defaultDeepSeekProfile(): AdapterProfile {
+  return {
+    providerId: 'deepseek-web',
+    providerName: 'DeepSeek Web（免费网页版）',
+    models: WEB_MODEL_IDS.map(id => ({
+      id,
+      label: WEB_MODEL_CAPABILITIES[id]!.label,
+      autoSend: id === 'deepseek-web-auto',
+    })),
+    normalizeModel: normalizeWebModel,
+    logPrefix: 'deepseek-web',
+    imageSupport: 'config',
+    modelDescription: '通过你的 DeepSeek 网页账号对话；模式（极速/专家/识图、深度思考、联网）由网页端自行选择。',
+  }
+}
+
 export class DeepSeekWebAdapter extends LlmAdapter {
   /**
    * 会话级锁（不是全局锁）。
@@ -185,32 +299,71 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   private readonly reviewer?: ReviewerLike
   /** 每轮记账后的总量回调（宿主用于把总计推送到前端展示）。 */
   private readonly onUsage?: (totals: ChannelTokenTotals) => void
-  /** 图片附件读取器；缺省表示宿主没提供附件服务，图片退回文本标记。 */
-  private readonly readImage?: ReadImageAttachment
+  /**
+   * 读图函数的延迟解析；返回 undefined 表示当前不可用（宿主没提供附件服务）。
+   * 必须是 getter 而不是构造期快照，才能跟上「服务晚到 / 服务卸载」。
+   */
+  private readonly resolveReadImage?: ImageReaderSource
   /** 调用台账：按天记请求密度的元信息（不记正文、不记凭证）。 */
   private readonly ledger: Ledger
+  /** provider 身份与模型清单；默认 DeepSeek，豆包通道传入自己的。 */
+  private readonly profile: AdapterProfile
+
+  /** 当前可用的读图函数；宿主附件服务没就绪时是 undefined。 */
+  private get readImage(): ReadImageAttachment | undefined {
+    return this.resolveReadImage?.()
+  }
+
+  /** 本 provider 是否允许图片直传（豆包一期固定关闭）。 */
+  private get imageUploadEnabled(): boolean {
+    return this.profile.imageSupport !== 'none' && this.config.enableImageUpload
+  }
+
+  /** 该模型入口是否自动发送。 */
+  private isAutoModel(model: string): boolean {
+    const normalized = this.profile.normalizeModel(model)
+    return this.profile.models.find(item => item.id === normalized)?.autoSend === true
+  }
+
+  /**
+   * 当前是否具备图片直传能力（宿主附件服务已就绪）。
+   * 给自检/离线回归用：这条链路一旦在启动期静默降级，用户在界面上完全看不出来。
+   */
+  get imageUploadReady(): boolean {
+    return this.readImage !== undefined
+  }
+
+  /** 会话注册表（供归档清理读取网页对话绑定与记账）。 */
+  get sessionRegistry(): SessionRegistry {
+    return this.sessions
+  }
 
   constructor(
     config: Config,
     channel: BrowserChannel,
     reviewer?: ReviewerLike,
     onUsage?: (totals: ChannelTokenTotals) => void,
-    readImage?: ReadImageAttachment,
+    resolveReadImage?: ImageReaderSource,
+    profile?: AdapterProfile,
   ) {
     super()
     this.config = config
     this.channel = channel
     this.reviewer = reviewer
     this.onUsage = onUsage
-    this.readImage = readImage
+    this.resolveReadImage = resolveReadImage
+    this.profile = profile ?? defaultDeepSeekProfile()
     const appDataRoot = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local')
-    const defaultStateFile = config.stateFile
+    const defaultStateFile = this.profile.stateFile
+      ?? config.stateFile
       ?? path.join(appDataRoot, 'DshDeepSeekWeb', 'session-state.json')
     this.sessions = new SessionRegistry({ file: defaultStateFile })
     // 台账跟状态文件放同一目录：生产环境仍是 %LOCALAPPDATA%\DshDeepSeekWeb\call-ledger.json，
     // 但离线回归把 stateFile 指到临时目录时，测试数据不会写进用户的真实台账
     // （否则自检卡片会把测试跑出来的 0ms 间隔当成真实使用统计）。
-    this.ledger = new Ledger({ file: path.join(path.dirname(defaultStateFile), 'call-ledger.json') })
+    this.ledger = new Ledger({
+      file: this.profile.ledgerFile ?? path.join(path.dirname(defaultStateFile), 'call-ledger.json'),
+    })
     this.gate = new ConcurrencyGate(() => this.config.maxConcurrentTurns)
     this.warnAboutTimeoutConfig()
   }
@@ -260,6 +413,17 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         + '并发名额比可用的会话标签页还多，多出来的请求会先等页面回收，建议让两者一致或把 maxSessionPages 调大。',
       )
     }
+    // 容量声明配反的后果不是"阈值为负"，而是宿主压缩配置校验直接拒绝（见 dsh-compaction-basic
+    // 的 resolveCompactSpec：messageBudget 或 pressureBudget ≤ 0 抛 TargetPressureConfigError），
+    // step 压缩只 warn 一次后跳过——自动压缩从此静默失效，长会话会一直膨胀到网页侧截断。
+    const { contextWindow, maxTokens } = this.config
+    if (maxTokens + COMPACTION_HEADROOM_TOKENS >= contextWindow) {
+      console.warn(
+        `[deepseek-web] maxTokens(${maxTokens}) + 压缩预留 ${COMPACTION_HEADROOM_TOKENS} 已达到或超过 `
+        + `contextWindow(${contextWindow})：宿主的自动压缩会因预算不足拒绝执行（只告警一次后跳过），`
+        + '长会话将不再被压缩。请调大 contextWindow 或调小 maxTokens。',
+      )
+    }
   }
 
   /** 按会话取锁：首次使用时创建，释放后由 releaseLock() 回收（锁本身无状态，只有排队链）。 */
@@ -292,37 +456,44 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   }
 
   providerInfo(provider: string): LlmProviderInfo {
-    return { id: provider, name: 'DeepSeek Web（免费网页版）' }
+    return { id: provider, name: this.profile.providerName }
   }
 
   listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     return Promise.resolve(
-      WEB_MODEL_IDS.map((id: WebModelId) => {
-        const cap = WEB_MODEL_CAPABILITIES[id]!
-        return {
-          provider: 'deepseek-web',
-          id,
-          name: cap.label,
-          description: '通过你的 DeepSeek 网页账号对话；模式（极速/专家/识图、深度思考、联网）由网页端自行选择。',
-          // 只在上传可用时声明 image：否则宿主会按"未知能力"照发 ImageBlock，
-          // 我们却只能把它降级成文本标记，模型会误以为看到了图。
-          inputModalities: this.config.enableImageUpload ? ['text', 'image'] : ['text'],
-        }
-      }),
+      this.profile.models.map(model => ({
+        provider: this.profile.providerId,
+        id: model.id,
+        name: model.label,
+        description: this.profile.modelDescription,
+        // 只在上传可用时声明 image：否则宿主会按"未知能力"照发 ImageBlock，
+        // 我们却只能把它降级成文本标记，模型会误以为看到了图。
+        inputModalities: this.imageUploadEnabled ? ['text', 'image'] : ['text'],
+      })),
     )
   }
 
   async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
-    const normalized = normalizeWebModel(model)
+    const normalized = this.profile.normalizeModel(model)
     if (!normalized) {
-      throw new LlmError(`deepseek-web: 未知网页模型 ${model}`, 'UNKNOWN_MODEL')
+      throw new LlmError(`${this.profile.logPrefix ?? 'deepseek-web'}: 未知网页模型 ${model}`, 'UNKNOWN_MODEL')
     }
+    const reasoning = this.profile.reasoning
+      ? {
+        efforts: this.profile.reasoning.efforts.map(effort => ({
+          id: effort.id as ReasoningEffortId,
+          name: effort.name,
+        })),
+        defaultEffort: this.profile.reasoning.defaultEffort as ReasoningEffortId,
+      }
+      : this.profile.reviewTiers === false ? undefined : webModelReasoning()
     return {
       provider,
       id: model,
-      name: WEB_MODEL_CAPABILITIES[normalized]!.label,
-      context: { contextWindow: CONTEXT_WINDOW },
-      defaultMaxTokens: MAX_TOKENS,
+      name: this.profile.models.find(item => item.id === normalized)?.label ?? model,
+      context: { contextWindow: this.config.contextWindow },
+      defaultMaxTokens: this.config.maxTokens,
+      ...reasoning === undefined ? {} : { reasoning },
     }
   }
 
@@ -407,10 +578,21 @@ export class DeepSeekWebAdapter extends LlmAdapter {
           reasoningText = finalReasoning
           yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' }
           yield { type: 'reasoning-delta', index: reasoningIndex, text: finalReasoning }
-        } else if (finalReasoning.length > reasoningText.length && finalReasoning.startsWith(reasoningText)) {
-          const tail = finalReasoning.slice(reasoningText.length)
-          reasoningText = finalReasoning
-          yield { type: 'reasoning-delta', index: reasoningIndex, text: tail }
+        } else if (finalReasoning.length > 0 && opened && !reasoningText.includes(finalReasoning)) {
+          // 过程提示会先把 reasoning 块打开；GLM 不流式思考，最终思考要补进同一个块。
+          // 去掉 [DSH] 提示行后再判断：块里只有提示就整段补；已有流式思考则只补尾巴。
+          const withoutNotices = reasoningText.replace(/\[DSH[^\n]*\n?/g, '').trim()
+          if (withoutNotices === '') {
+            const tail = `\n${finalReasoning}`
+            reasoningText += tail
+            yield { type: 'reasoning-delta', index: reasoningIndex, text: tail }
+          } else if (finalReasoning.startsWith(withoutNotices)) {
+            const tail = finalReasoning.slice(withoutNotices.length)
+            if (tail !== '') {
+              reasoningText += tail
+              yield { type: 'reasoning-delta', index: reasoningIndex, text: tail }
+            }
+          }
         }
       }
       if (opened) {
@@ -439,7 +621,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const bodyText = stripProtocolPrefix(request.text)
     const catalog = buildToolCatalog(visibleToolsOf(options, this.config), this.config.compactToolCatalog, this.config.maxToolCatalogChars)
     const retryText = [
-      systemProtocolFor(this.config.enableImageUpload),
+      systemProtocolFor(this.imageUploadEnabled),
       catalog && `当前任务上下文可用的工具：\n${catalog}`,
       brief,
       bodyText,
@@ -453,7 +635,8 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     state.uploadedImageIds = undefined
 
     // 重试正文可能仍然超长：重新生成附件，并丢掉上一版长文本文件（图片附件保留）。
-    const retryAttachment = this.config.longTextAsFile
+    const retryAttachment = this.profile.supportsLongTextFile !== false
+      && this.config.longTextAsFile
       && retryText.length >= this.config.longTextFileThreshold
       ? this.buildLongTextAttachment(retryText)
       : undefined
@@ -655,7 +838,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
 
   /** 摘要和标题是独立的一次性请求；不能解析成动作或进入普通会话状态机。 */
   private async *streamAuxiliary(options: GenerateOptions): AsyncGenerator<StreamChunk> {
-    if (!normalizeWebModel(options.model)) throw new LlmError('未知网页模型', 'UNKNOWN_MODEL')
+    if (!this.profile.normalizeModel(options.model)) throw new LlmError('未知网页模型', 'UNKNOWN_MODEL')
     if (!this.channel.turnIsolated) {
       throw new LlmError('当前浏览器通道不支持隔离辅助请求，请升级通道实现。', 'WEB_AUXILIARY_UNSUPPORTED')
     }
@@ -666,7 +849,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       model: options.model,
       text: buildAuxiliaryPrompt(options, this.config.compactionLanguage),
       initialize: true,
-      autoSend: options.model === 'deepseek-web-auto',
+      autoSend: this.isAutoModel(options.model),
       purpose: options.purpose,
       signal: options.signal,
     })
@@ -705,10 +888,13 @@ export class DeepSeekWebAdapter extends LlmAdapter {
   private async loadAttachments(
     refs: readonly ImageAttachmentRef[],
     signal?: AbortSignal,
-  ): Promise<BrowserImageAttachment[] | undefined> {
-    if (!this.readImage) return undefined
+  ): Promise<{ loaded?: BrowserImageAttachment[]; duplicates: number }> {
+    if (!this.readImage) return { duplicates: 0 }
     const loaded: BrowserImageAttachment[] = []
     const seen = new Set<string>()
+    // 同字节不同 id 的去重次数：那张图其实已经上传了（换了个 id），不算"丢图"，
+    // 判定缺口时必须把它扣掉，否则会给用户弹一条假的"1 张图未上传"。
+    let duplicates = 0
     for (const ref of refs) {
       signal?.throwIfAborted()
       try {
@@ -716,12 +902,12 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         if (!image) continue
         const digest = createHash('sha256').update(image.data).digest('hex')
         if (seen.has(digest)) {
+          duplicates += 1
           console.info(`[deepseek-web] 同一张图本轮已上传过，跳过重复附件：${image.name}`)
           continue
         }
         seen.add(digest)
-        // 带上宿主附件 id：通道回传「本轮真正挂上去的 id」，适配层据此维护
-        // 跨轮去重集合，避免同一张图重复上传触发网页端整轮拒绝。
+        // 带上宿主附件 id：通道回传「本轮真正挂上去的 id」，适配层据此记账。
         loaded.push({ ...image, attachmentId: ref.attachmentId })
       } catch (error) {
         if (this.config.uploadOnError === 'abort') {
@@ -737,7 +923,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         )
       }
     }
-    return loaded.length > 0 ? loaded : undefined
+    return { loaded: loaded.length > 0 ? loaded : undefined, duplicates }
   }
 
   /**
@@ -766,12 +952,12 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const sessionId = options.sessionId ?? 'anonymous'
     await this.sessions.load()
     const model = options.model as WebModelId
-    if (!normalizeWebModel(model)) {
-      throw new LlmError(`deepseek-web: 未知网页模型 ${options.model}`, 'UNKNOWN_MODEL')
+    if (!this.profile.normalizeModel(model)) {
+      throw new LlmError(`${this.profile.logPrefix ?? 'deepseek-web'}: 未知网页模型 ${options.model}`, 'UNKNOWN_MODEL')
     }
     // 全自动模型（deepseek-web-auto）：填入后模拟回车发送，焦点全程留在 dsh；
     // 半自动（deepseek-web）：填入后网页置顶聚焦，等人工回车/点击。
-    const autoSend = model === 'deepseek-web-auto'
+    const autoSend = this.isAutoModel(model)
     this.channel.setSessionAutoSend?.(sessionId, autoSend)
     this.channel.setSessionAutoSend?.('deepseek-self-review', autoSend)
     // 记录"当前 agent 会话"：同对话自审（preserveConversation）要落回这个会话的网页页，
@@ -787,7 +973,13 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     const goalBefore = state.goalText
     const forceReplay = this.replaySessions.has(sessionId)
       || this.channel.isConversationActive?.(sessionId) === false
-    const rendered = renderNewWebMessages(options, state, this.config, forceReplay, this.readImage !== undefined)
+    const rendered = renderNewWebMessages(
+      options,
+      state,
+      this.config,
+      forceReplay,
+      this.imageUploadEnabled && this.readImage !== undefined,
+    )
     if (state.goalText !== goalBefore) {
       // 新的用户任务：重置审核计数
       state.reviewRoundsUsed = 0
@@ -802,14 +994,16 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     // 图片直传：把本轮引用读成字节，随请求交给通道上传。
     // 读不出时按 uploadOnError 决定抛错还是跳过（跳过则文本里仍有 [附图] 标记，
     // 模型不会假装看过——那个标记在开关开启时不代表"已上传成功"）。
-    const imageAttachments = rendered.prompt.attachments?.length
+    const loadedImages = rendered.prompt.attachments?.length
       ? await this.loadAttachments(rendered.prompt.attachments, options.signal)
-      : undefined
+      : { duplicates: 0 }
+    const imageAttachments = loadedImages.loaded
 
     // 长文本转文件：网页输入框填字接近二次方级耗时（实测 30 万字符约 13 秒、
     // 60 万约 77 秒），超过阈值就把正文写成 .md 附件，输入框只填摘要。
     // 附件没挂上时通道会用 fallbackText 回退填完整正文——慢，但内容不丢。
-    const longTextAttachment = this.config.longTextAsFile
+    const longTextAttachment = this.profile.supportsLongTextFile !== false
+      && this.config.longTextAsFile
       && rendered.prompt.text.length >= this.config.longTextFileThreshold
       ? this.buildLongTextAttachment(rendered.prompt.text)
       : undefined
@@ -826,6 +1020,28 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       ...(imageAttachments ?? []),
       ...(longTextAttachment ? [longTextAttachment] : []),
     ]
+
+    /*
+     * 图片没上传成功必须让用户当场看见。
+     *
+     * 旧实现只在 console 里告警：用户看到的是一条"正常发出"的消息，模型却看不到图，
+     * 于是只能反推"是不是多轮之后才坏"。这里把缺口写成发送提示的一部分（reasoning
+     * 块里的 `[DSH] …` 行），谁丢了图、丢了几张、为什么丢，一眼可见。
+     */
+    const expectedImages = rendered.prompt.imageExpected ?? 0
+    const uploadedImages = imageAttachments?.length ?? 0
+    // 同内容不同 id 的重复图已经被"上传过一次"，不算丢图。
+    const deliveredImages = uploadedImages + loadedImages.duplicates
+    const missingImages = Math.max(0, expectedImages - deliveredImages)
+    const imageNotice = this.imageUploadEnabled && missingImages > 0
+      ? `${missingImages} 张图未上传（${this.readImage ? '读取附件失败' : '宿主附件服务不可用'}）`
+      : undefined
+    if (imageNotice) {
+      console.warn(
+        `[deepseek-web] ${imageNotice}：会话 ${sessionId}，本轮应当上传 ${expectedImages} 张、实际 ${uploadedImages} 张。`
+        + '正文里保留 [附图: …] 标记，模型知道有图但看不到内容。',
+      )
+    }
 
     // 初始化只更新本轮快照；完整结果被消费后再提交持久状态。
     if (rendered.prompt.initialize) {
@@ -847,9 +1063,11 @@ export class DeepSeekWebAdapter extends LlmAdapter {
         sessionId,
         model,
         text: promptText,
+        reasoningEffort: options.reasoningEffort,
         // 长正文已转附件：文件没挂上时通道回退填这段完整正文。
         fallbackText: longTextAttachment ? rendered.prompt.text : undefined,
         attachments: attachments.length > 0 ? attachments : undefined,
+        ...(imageNotice !== undefined ? { imageNotice } : {}),
         initialize: rendered.prompt.initialize,
         autoSend,
         signal: options.signal,
@@ -859,7 +1077,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     } catch (error) {
       if (error instanceof LlmError) throw error
       throw new LlmError(
-        `deepseek-web: 网页对话失败: ${error instanceof Error ? error.message : String(error)}`,
+        `${this.profile.logPrefix ?? 'deepseek-web'}: 网页对话失败: ${error instanceof Error ? error.message : String(error)}`,
         'WEB_TURN_FAILED',
         { cause: error },
       )
@@ -901,6 +1119,9 @@ export class DeepSeekWebAdapter extends LlmAdapter {
       state.lastMessageId = lastIdentified?.id
       state.roundsSinceProtocol = rendered.prompt.includeProtocol ? 0 : state.roundsSinceProtocol + 1
       state.lastReply = reply.text
+      // 记录本轮所在网页对话 id：一个 dsh 会话可能因轮换/重建产生多条对话，归档时逐个删除。
+      const chatId = this.channel.currentChatId?.(sessionId)
+      if (chatId !== undefined) this.sessions.recordWebChatKey(sessionId, chatId)
       // 图片去重集合：网页对话重建（initialize）时只保留本轮实际重传成功的图；
       // 增量轮把本轮新上传的图并入集合。网页端对重复的 ref_file_ids 会整轮拒绝，
       // 且该会话此后每轮都失败，所以这里必须精确记录「对话里到底有哪些图」。
@@ -941,6 +1162,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
           sessionId,
           model,
           text: `${buildRecoveryPrompt(options, state, this.config)}${reviewNote}`,
+          reasoningEffort: options.reasoningEffort,
           initialize: false,
           autoSend,
           signal: options.signal,
@@ -993,6 +1215,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
             sessionId,
             model,
             text: prompt,
+            reasoningEffort: options.reasoningEffort,
             initialize: false,
             autoSend,
             signal: options.signal,
@@ -1056,7 +1279,10 @@ export class DeepSeekWebAdapter extends LlmAdapter {
     if (
       !parsed.hasActions
       && this.reviewer
-      && this.config.review.enabled
+      && reviewEnabledByEffort(
+        this.profile.reviewTiers === false ? undefined : options.reasoningEffort,
+        this.config.review.enabled,
+      )
       && this.config.review.maxRounds > 0
       && state.reviewRoundsUsed < this.config.review.maxRounds
       && state.reviewedSignature !== reviewSignature(state.goalText ?? '', parsed.text)
@@ -1106,6 +1332,7 @@ export class DeepSeekWebAdapter extends LlmAdapter {
           sessionId,
           model,
           text: feedback,
+          reasoningEffort: options.reasoningEffort,
           initialize: false,
           autoSend,
           signal: options.signal,

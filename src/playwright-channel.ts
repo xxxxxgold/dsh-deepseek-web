@@ -38,6 +38,7 @@ import { AsyncLock } from './async-lock.ts'
 import { AccountCooldown, sharedCooldown } from './cooldown.ts'
 import { TurnRetryBudget, sharedRetryBudget } from './retry-policy.ts'
 import type { LoginProbeResult } from './login-probe.ts'
+import type { LoginBundle } from './login-state.ts'
 import { computeTurnGap, sharedPacer, type TurnPacer } from './pacing.ts'
 import {
   bestEffortNewChat,
@@ -59,11 +60,13 @@ import {
   ensureChatPage,
   isBrowserClosedMessage,
   setBrowserWindowTopmost,
+  restoreBrowserWindow,
   launchManagedBrowser,
   sendEditorMessage,
   withTimeout,
   type ManagedBrowserConnection,
 } from './browser-shared.ts'
+import { resolveWindowPolicy } from './window-policy.ts'
 
 /**
  * 实时增量轮询间隔。
@@ -225,6 +228,12 @@ export function isEntryUrl(current: string, entryUrl: string): boolean {
 function sanitizeFileName(name: string): string {
   const cleaned = name.replace(/[^\w.\-\u4e00-\u9fa5]/g, '_').slice(-80)
   return cleaned || 'image'
+}
+
+/** 从网页对话地址里取对话 id；不是对话页时返回 undefined。 */
+export function chatIdFromUrl(current: string): string | undefined {
+  const match = /\/a\/chat\/s\/([^/?#]+)/i.exec(current)
+  return match?.[1]
 }
 
 /** 从 SSE / JSON body 里抽取模型可见正文与思考内容。 */
@@ -555,6 +564,8 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   private readonly pendingPages = new Set<Page>()
   /** ensureReady 的单飞：并发请求不会重复拉起浏览器。 */
   private ensureReadyTask: Promise<void> | undefined
+  /** 浏览器启动的单飞：ensureReady / 导入登录态 / 打开登录窗口共用同一次启动。 */
+  private startTask: Promise<{ startedFresh: boolean }> | undefined
   /** 当前正在跑的主 agent 会话（由 adapter 每次 streamTask 开始时打点）。 */
   private focusSessionId: string | undefined
   /** 页面原始标题，用于状态标记前缀的清除/还原。 */
@@ -572,6 +583,10 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
   private lastSendAt = 0
   /** 提示节流：key 为「会话::分类::事件」，value 为上次发送时刻（毫秒）。 */
   private readonly lastNoticeAt = new Map<string, number>()
+  /** 登录墙置前的节流时间戳（毫秒），避免启动路径与首次探活重复抢焦点。 */
+  private lastLoginRevealAt = 0
+  /** 正在进行的登录置前任务；并发调用共享同一结果，避免重复抢焦点。 */
+  private loginRevealTask: Promise<boolean> | undefined
 
   constructor(options: PlaywrightChannelOptions) {
     this.options = options
@@ -585,6 +600,11 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       || defaultProfileDir('edge-profile')
   }
 
+  /** 聚焦开关 → 窗口动作：总开关关掉时最小化启动，页面操作也不再置前。 */
+  private get windowPolicy() {
+    return resolveWindowPolicy(this.options.config.focus)
+  }
+
   /** 打开/连接浏览器并确保已登录；并发进入时只执行一次（单飞）。 */
   async ensureReady(): Promise<void> {
     const running = this.ensureReadyTask
@@ -596,7 +616,34 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     return task
   }
 
-  private async ensureReadyCore(): Promise<void> {
+  /**
+   * 启动/复用浏览器并准备好锚点页——**不做登录检查**。
+   *
+   * 抽出来的原因：导入登录态、打开登录窗口恰恰发生在「还没登录」时，
+   * 而 `ensureReady()` 一旦发现未登录就会抛 `WEB_LOGIN_REQUIRED`。
+   * 发送路径仍走 `ensureReady()`，启动后检查登录的语义保持不变。
+   */
+  async ensureBrowserStarted(): Promise<void> {
+    await this.startBrowser()
+  }
+
+  /**
+   * 浏览器启动的单飞入口。
+   *
+   * 返回值 `startedFresh` 区分两种情形：本次新建了连接（需要登录检查），
+   * 还是浏览器原本就活着、只补齐了锚点页（沿用原来的直接返回语义）。
+   */
+  private async startBrowser(): Promise<{ startedFresh: boolean }> {
+    const running = this.startTask
+    if (running) return running
+    const task = this.startBrowserCore().finally(() => {
+      if (this.startTask === task) this.startTask = undefined
+    })
+    this.startTask = task
+    return task
+  }
+
+  private async startBrowserCore(): Promise<{ startedFresh: boolean }> {
     if (this.browser?.isConnected() && this.context) {
       // 浏览器还活着：只补齐锚点页，绝不重复拉起浏览器，也不动其它会话的标签页。
       this.pruneClosedStates()
@@ -604,9 +651,9 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         const pages = this.context.pages().filter(candidate => !candidate.isClosed())
         this.page = pages.find(candidate => candidate.url().startsWith(new URL(this.options.config.url).origin))
           ?? await this.context.newPage()
-        await ensureChatPage(this.page, this.options.config.url)
+        await ensureChatPage(this.page, this.options.config.url, { activate: this.windowPolicy.activatePage })
       }
-      return
+      return { startedFresh: false }
     }
 
     if (this.options.config.browser === 'attach') {
@@ -629,6 +676,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         preferredPort: this.options.config.debugPort,
         url: this.options.config.url,
         label: 'deepseek-web',
+        minimized: this.windowPolicy.minimizeOnLaunch,
       })
       this.browser = this.managedConnection.browser
       this.context = this.managedConnection.context
@@ -650,11 +698,26 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         .map(page => page.close().catch(() => {})))
     }
 
-    await ensureChatPage(this.page, this.options.config.url)
+    await ensureChatPage(this.page, this.options.config.url, { activate: this.windowPolicy.activatePage })
     // 等待前端登录态/编辑器出现
     await this.page.waitForTimeout(1_500)
+    return { startedFresh: true }
+  }
 
-    if (await looksLoggedOut(this.page)) {
+  private async ensureReadyCore(): Promise<void> {
+    const { startedFresh } = await this.startBrowser()
+    // 浏览器原本就活着时沿用旧行为：不再重复做登录检查（后续发送会自己暴露问题）。
+    if (!startedFresh) return
+    const page = this.page
+    if (page === undefined || page.isClosed()) {
+      throw new LlmError('deepseek-web: 浏览器已启动，但没有可用的工作标签页。', 'BROWSER_PAGE_MISSING')
+    }
+    if (await looksLoggedOut(page)) {
+      // 登录墙必须让人看到：无论是最小化启动，还是窗口只是被 DSH 挡在后面，
+      // 都要还原并抢前台；attach 模式的窗口是用户自己的，绝不能替它抢前台。
+      if (this.options.config.browser === 'managed') {
+        await this.revealLoginWindow(page)
+      }
       throw new LlmError(
         'deepseek-web: 浏览器窗口已打开，但 chat.deepseek.com 尚未登录。'
         + '请在窗口中完成登录后重试本轮任务（登录状态会保存在本地 profile）。',
@@ -681,6 +744,156 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       return false
     }
     return state.started
+  }
+
+  /** 该 dsh 会话当前页面所指的网页对话 id（页面已关或不在对话页时为 undefined）。 */
+  currentChatId(sessionId: string): string | undefined {
+    const state = this.sessionPages.get(sessionId)
+    if (!state || state.page.isClosed()) return undefined
+    return chatIdFromUrl(state.page.url())
+  }
+
+  /**
+   * 在网页端删除一条对话（DeepSeek 内部接口，失败只回报不抛）。
+   *
+   * 用临时页面执行，避免占用或干扰正在工作的会话页；删除不可逆，调用方负责确认范围。
+   */
+  async deleteWebChat(chatId: string): Promise<{ ok: boolean; error?: string }> {
+    await this.ensureReady()
+    const context = this.context
+    if (!context) return { ok: false, error: '浏览器上下文未就绪' }
+    const page = await context.newPage()
+    try {
+      const entry = new URL('/', this.options.config.url).href
+      await page.goto(entry, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {})
+      const result = await page.evaluate(async (id) => {
+        const raw = localStorage.getItem('userToken')
+        let token = ''
+        try {
+          token = (JSON.parse(raw ?? '{}') as { value?: string }).value ?? ''
+        } catch {
+          token = raw ?? ''
+        }
+        const response = await fetch('/api/v0/chat_session/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ chat_session_id: id }),
+        })
+        return { status: response.status, body: await response.text() }
+      }, chatId)
+      if (result.status !== 200) return { ok: false, error: `HTTP ${result.status}` }
+      try {
+        const parsed = JSON.parse(result.body) as { code?: number; msg?: string }
+        if (parsed.code !== 0) return { ok: false, error: parsed.msg || `code ${String(parsed.code)}` }
+      } catch {
+        return { ok: false, error: '响应不是 JSON' }
+      }
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    } finally {
+      await page.close().catch(() => {})
+    }
+  }
+
+  /** 拉取网页端全部对话 id（只读，分页）。 */
+  async listWebChatIds(): Promise<string[]> {
+    await this.ensureReady()
+    const context = this.context
+    if (!context) return []
+    const page = await context.newPage()
+    try {
+      await page.goto(new URL('/', this.options.config.url).href, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {})
+      return await page.evaluate(async () => {
+        const raw = localStorage.getItem('userToken')
+        let token = ''
+        try {
+          token = (JSON.parse(raw ?? '{}') as { value?: string }).value ?? ''
+        } catch {
+          token = raw ?? ''
+        }
+        const ids: string[] = []
+        for (let offset = 0; offset < 20_000; offset += 100) {
+          const response = await fetch(`/api/v0/chat_session/fetch_page?count=100&offset=${offset}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          })
+          const body = await response.json() as {
+            data?: { biz_data?: { chat_sessions?: Array<{ id?: string }> } }
+          }
+          const items = body?.data?.biz_data?.chat_sessions ?? []
+          for (const item of items) {
+            if (typeof item.id === 'string') ids.push(item.id)
+          }
+          if (items.length < 100) break
+        }
+        return ids
+      })
+    } catch {
+      return []
+    } finally {
+      await page.close().catch(() => {})
+    }
+  }
+
+  /** 清空网页端全部对话（先拉列表，再逐条删除）。 */
+  async purgeAllWebChats(): Promise<{ ok: boolean; deleted: number; failed: number; error?: string }> {
+    const ids = await this.listWebChatIds()
+    return this.purgeWebChats(ids)
+  }
+
+  /** 按给定 id 列表逐条删除（带小批量节流）；供二次确认后使用。 */
+  async purgeWebChats(ids: readonly string[]): Promise<{ ok: boolean; deleted: number; failed: number; error?: string }> {
+    if (ids.length === 0) return { ok: true, deleted: 0, failed: 0 }
+    const context = this.context
+    if (!context) return { ok: false, deleted: 0, failed: 0, error: '浏览器上下文未就绪' }
+    const page = await context.newPage()
+    let deleted = 0
+    let failed = 0
+    try {
+      await page.goto(new URL('/', this.options.config.url).href, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {})
+      for (let index = 0; index < ids.length; index += 20) {
+        const batch = ids.slice(index, index + 20)
+        const result = await page.evaluate(async (batchIds) => {
+          const raw = localStorage.getItem('userToken')
+          let token = ''
+          try {
+            token = (JSON.parse(raw ?? '{}') as { value?: string }).value ?? ''
+          } catch {
+            token = raw ?? ''
+          }
+          let ok = 0
+          let bad = 0
+          for (const id of batchIds) {
+            try {
+              const response = await fetch('/api/v0/chat_session/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ chat_session_id: id }),
+              })
+              const body = await response.json() as { code?: number }
+              if (response.status === 200 && body?.code === 0) ok += 1
+              else bad += 1
+            } catch {
+              bad += 1
+            }
+          }
+          return { ok, bad }
+        }, batch)
+        deleted += result.ok
+        failed += result.bad
+        await this.sleep(200).catch(() => {})
+      }
+      return { ok: true, deleted, failed }
+    } catch (error) {
+      return {
+        ok: false,
+        deleted,
+        failed,
+        error: error instanceof Error ? error.message : String(error),
+      }
+    } finally {
+      await page.close().catch(() => {})
+    }
   }
 
   /** 轮换到全新网页对话（上下文长度达到上限时由 adapter 调用）。 */
@@ -1372,7 +1585,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
       try {
         const entryUrl = new URL('/', this.options.config.url).href
         await page.goto(entryUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {})
-        await ensureChatPage(page, this.options.config.url).catch(() => {})
+        await ensureChatPage(page, this.options.config.url, { activate: this.windowPolicy.activatePage }).catch(() => {})
         await page.waitForTimeout(500)
       } finally {
         this.pendingPages.delete(page)
@@ -1737,6 +1950,7 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
         if (!appeared) {
           waiterActive = false
           if (await looksLoggedOut(page)) {
+            await this.revealLoginWindow(page)
             throw new LlmError(
               'deepseek-web: 浏览器窗口已打开，但 chat.deepseek.com 尚未登录。'
               + '请在窗口中完成登录后重试本轮任务（登录状态会保存在本地 profile）。',
@@ -1860,34 +2074,42 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
           isCancelled: () => request.signal?.aborted ?? false,
         })
         if (!outcome.sent) {
+          const stillGenerating = outcome.attempts.some(item => item.includes('仍在生成'))
           throw new LlmError(
             `deepseek-web: 消息已填入输入框，但没能确认发送出去。尝试记录：${outcome.attempts.join('；')}。`
-            + '页面可能改版导致回车与发送按钮都失效——请人工检查网页后重试。',
+            + (stillGenerating
+              ? '网页上一轮仍在生成，回车和发送按钮都被页面忽略——请先在网页点一次“停止生成”或刷新页面后重试。'
+              : '页面可能改版导致回车与发送按钮都失效——请人工检查网页后重试。'),
             'WEB_SEND_NOT_TRIGGERED',
           )
         }
         console.info(`[deepseek-web] 全自动：已确认发送（方式：${outcome.via}）。`)
       } else {
-        // 半自动：网页窗口置顶到屏幕最上方并聚焦输入框，用户直接回车或点击发送
-        await page.bringToFront()
-        const focus = this.options.config.focus
-        if (focus?.enabled !== false && focus?.webWindow !== false) {
+        // 半自动：受聚焦开关控制才把窗口提到最前；关掉时只填字，等用户自己切过去。
+        if (this.windowPolicy.activatePage) {
+          await page.bringToFront()
           await setBrowserWindowTopmost({ profileDir: this.profileDir, topmost: true }).catch(() => {})
         }
         await editor.focus()
         await this.markPageStatus(page, request.purpose ? `[dsh 内部辅助：${request.purpose} 等待点击发送]` : '[dsh 等待你在网页点击发送]')
-        console.info('[deepseek-web] 消息已填入 Edge 并置顶聚焦，请回车或点击“发送”…')
+        console.info(
+          this.windowPolicy.activatePage
+            ? '[deepseek-web] 消息已填入 Edge 并置顶聚焦，请回车或点击“发送”…'
+            : '[deepseek-web] 消息已填入网页（聚焦开关关闭，未置前），请自行切到浏览器发送…',
+        )
       }
 
       const attachText = request.attachments !== undefined && request.attachments.length > 0
         ? `，附图 ${request.attachments.length} 张`
         : ''
+      // 图片掉在地上时必须让用户当场看到，而不是等模型说"我看不到图"。
+      const missingText = request.imageNotice !== undefined ? `，${request.imageNotice}` : ''
       this.emitNotice(
         request,
         'send',
         autoSend
-          ? `已确认发送 ${request.text.length} 字${attachText}`
-          : `已填入输入框 ${request.text.length} 字${attachText}，等待你在网页点击发送`,
+          ? `已确认发送 ${request.text.length} 字${attachText}${missingText}`
+          : `已填入输入框 ${request.text.length} 字${attachText}${missingText}，等待你在网页点击发送`,
       )
 
       // 发送动作到这里才算完成（自动模式已确认发出、半自动已填好等人工点）：
@@ -2233,6 +2455,54 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
     }, PROGRESS_POLL_MS)
   }
 
+  /**
+   * 登录墙专用：把插件浏览器窗口还原并抢到前台。
+   *
+   * 与 `focusBrowser()` 的区别：
+   * - 不受 `focus` 开关影响——登录必须让人看到；
+   * - 先 `page.bringToFront()`，再由 Win32 兜底抢前台；
+   * - 仅 managed 模式；attach 是用户自己的窗口，不能替它抢前台。
+   */
+  async revealLoginWindow(page?: Page): Promise<boolean> {
+    if (this.options.config.browser !== 'managed') return false
+    const now = Date.now()
+    if (now - this.lastLoginRevealAt < 10_000) return true
+    const running = this.loginRevealTask
+    if (running !== undefined) return await running
+    const task = this.revealLoginWindowCore(page)
+    this.loginRevealTask = task
+    try {
+      return await task
+    } finally {
+      if (this.loginRevealTask === task) this.loginRevealTask = undefined
+    }
+  }
+
+  private async revealLoginWindowCore(page?: Page): Promise<boolean> {
+    // 优先用调用方发现登录墙的那一页：多会话并行时锚点页可能不是登录页。
+    const target = page !== undefined && !page.isClosed()
+      ? page
+      : this.page && !this.page.isClosed()
+        ? this.page
+        : this.mostRecentState()?.page
+    if (target !== undefined) {
+      // bringToFront 卡住时不能把整个登录墙路径挂死；超时后继续走 Win32 兜底。
+      await withTimeout(
+        target.bringToFront(),
+        3_000,
+        'WEB_LOGIN_REVEAL_TIMEOUT',
+        'deepseek-web: 激活登录页超时，继续尝试窗口置前。',
+      ).catch(() => {})
+    }
+    const ok = await restoreBrowserWindow({
+      profileDir: this.profileDir,
+      channel: this.options.config.channel,
+    }).catch(() => false)
+    // 只有真正抢到焦点才进入 10 秒节流；失败后下一次调用必须能重试。
+    if (ok) this.lastLoginRevealAt = Date.now()
+    return ok
+  }
+
   /** 填入消息 / 首次请求：把网页窗口提到最前（受 config.focus 开关控制）。 */
   async focusBrowser(): Promise<void> {
     const focus = this.options.config.focus
@@ -2298,6 +2568,126 @@ export class PlaywrightBrowserChannel implements BrowserChannel {
    * 就把浏览器拉起来（没有浏览器时返回 `unknown`）。有会话页时优先用它，否则用
    * 锚点页；页面已关就说明浏览器那边已经不在了。
    */
+  /** 浏览器当前是否已启动（探活不会主动拉起浏览器）。 */
+  isBrowserStarted(): boolean {
+    return this.browser?.isConnected() === true && this.context !== undefined
+  }
+
+  /**
+   * 打开登录窗口：启动/复用浏览器，未登录时把窗口抢到前台。
+   *
+   * 与 `ensureReady()` 的区别是**不抛登录错误**——这里的目标就是让用户去登录。
+   * attach 模式不替用户切换窗口，只返回提示。
+   */
+  async openLoginWindow(): Promise<{ opened: boolean; loggedIn: boolean; detail?: string }> {
+    await this.ensureBrowserStarted()
+    const page = this.page
+    if (page === undefined || page.isClosed()) {
+      throw new LlmError('deepseek-web: 浏览器已启动，但没有可用的工作标签页。', 'BROWSER_PAGE_MISSING')
+    }
+    const loggedOut = await looksLoggedOut(page).catch(() => false)
+    const loginWall = loggedOut ? true : await looksLoginWall(page).catch(() => false)
+    if (!loggedOut && !loginWall) return { opened: true, loggedIn: true }
+    if (this.options.config.browser !== 'managed') {
+      return {
+        opened: true,
+        loggedIn: false,
+        detail: 'attach 模式不会替你切换窗口，请手动切到浏览器窗口完成登录',
+      }
+    }
+    const revealed = await this.revealLoginWindow(page).catch(() => false)
+    return {
+      opened: true,
+      loggedIn: false,
+      ...revealed ? {} : { detail: '窗口已打开，但置前失败，请手动切换到浏览器窗口完成登录' },
+    }
+  }
+
+  /**
+   * 把设置页粘贴的登录态写入当前 profile。
+   *
+   * 只写浏览器（localStorage + cookies），不落插件配置/状态文件。
+   * 写入后刷新所有插件页并重置会话 gate：下一轮按宿主上下文重放。
+   */
+  async importLoginState(bundle: LoginBundle): Promise<{ token: boolean; cookies: number }> {
+    await this.ensureBrowserStarted()
+    const page = this.page
+    const context = this.context
+    if (page === undefined || page.isClosed() || context === undefined) {
+      throw new LlmError('deepseek-web: 浏览器尚未就绪，无法写入登录态。', 'BROWSER_NOT_READY')
+    }
+    const cookieCount = bundle.cookies?.length ?? 0
+    if (bundle.token === undefined && cookieCount === 0) {
+      throw new LlmError('deepseek-web: 登录态为空，未写入任何内容。', 'LOGIN_STATE_EMPTY')
+    }
+    // 写 localStorage 前确保页面在目标站：用户可能把插件窗口导航去过别的站点，
+    // 绝不能让 token 落进别人的 localStorage。
+    const origin = new URL(this.options.config.url).origin
+    if (!page.url().startsWith(origin)) {
+      await ensureChatPage(page, this.options.config.url, { activate: false })
+    }
+    // 先写 token 再写 cookies：token 是核心凭证；万一 cookies 写入失败，
+    // 至少不会出现「cookies 写了一半、token 还没写」的半套状态。
+    if (bundle.token !== undefined) {
+      await page.evaluate((value) => {
+        localStorage.setItem('userToken', JSON.stringify({ value }))
+      }, bundle.token)
+    }
+    if (cookieCount > 0 && bundle.cookies !== undefined) {
+      await context.addCookies(bundle.cookies)
+    }
+    const failedReloads = await this.reloadOwnedPages()
+    if (failedReloads > 0) {
+      console.warn(
+        `[deepseek-web] 导入登录态后有 ${failedReloads} 个页面刷新失败，请手动刷新对应标签。`,
+      )
+    }
+    // 刷新后给页面一点时间重建登录态与编辑器，避免紧接着的探活把「还在加载」误判成未登录。
+    const anchor = this.page
+    if (anchor !== undefined && !anchor.isClosed()) await anchor.waitForTimeout(1_500)
+    this.resetConversationGate()
+    return { token: bundle.token !== undefined, cookies: cookieCount }
+  }
+
+  /** 导出当前登录态（token + cookies）；只读，不落盘。 */
+  async exportLoginState(): Promise<{ token: string; cookies: unknown[] }> {
+    await this.ensureBrowserStarted()
+    const page = this.page
+    if (page === undefined || page.isClosed()) {
+      throw new LlmError('deepseek-web: 浏览器尚未就绪，无法读取登录态。', 'BROWSER_NOT_READY')
+    }
+    const token = await page.evaluate(() => {
+      const raw = localStorage.getItem('userToken')
+      try {
+        return (JSON.parse(raw ?? '{}') as { value?: string }).value ?? ''
+      } catch {
+        return raw ?? ''
+      }
+    })
+    const cookies = await this.context?.cookies() ?? []
+    // 只导出目标站相关 cookie：换机复制时不该把 profile 里其它站点的 cookie 一起带走。
+    const host = new URL(this.options.config.url).hostname
+    const relevant = cookies.filter((cookie) => {
+      const domain = cookie.domain.replace(/^\./, '')
+      return domain === host || host.endsWith(`.${domain}`) || domain.endsWith(`.${host}`)
+    })
+    return { token, cookies: relevant }
+  }
+
+  /** 刷新所有属于本插件的页面（锚点页 + 各会话页），返回失败数量，不抛。 */
+  private async reloadOwnedPages(): Promise<number> {
+    const pages = new Set<Page>()
+    if (this.page !== undefined && !this.page.isClosed()) pages.add(this.page)
+    for (const state of this.sessionPages.values()) {
+      if (!state.page.isClosed()) pages.add(state.page)
+    }
+    let failed = 0
+    await Promise.all([...pages].map(page => page
+      .reload({ waitUntil: 'domcontentloaded', timeout: 60_000 })
+      .catch(() => { failed += 1 })))
+    return failed
+  }
+
   async probeLogin(): Promise<LoginProbeResult> {
     const checkedAt = Date.now()
     if (!this.browser || !this.context) {

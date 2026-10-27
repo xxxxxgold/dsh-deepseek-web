@@ -46,6 +46,13 @@ export interface WebChatState {
    * 网页对话重建（initialize）时由适配层重置为本次实际重传成功的集合。
    */
   uploadedImageIds?: string[]
+  /**
+   * 该 dsh 会话在网页端产生过的对话 id（一对多）。
+   *
+   * 网页对话在三种情况下会换新：会话初次打开、上下文超限轮换、页面归属变化重建。
+   * 每轮回复结束后从页面 URL（/a/chat/s/<id>）解析并追加；归档时按此列表逐个删除。
+   */
+  webChatKeys?: string[]
 }
 
 /** 通道级 token 用量总计（跨 dsh 会话持久，随 session-state.json 保存）。 */
@@ -68,6 +75,10 @@ export class SessionRegistry {
   private loaded = false
   private writeQueue: Promise<void> = Promise.resolve()
   private channelTotals: ChannelTokenTotals = { totalTokens: 0, usageTurns: 0 }
+  /** 已完成网页端清理的 dsh 会话（归档联动删除成功后记账）。 */
+  private readonly cleanedSessions = new Set<string>()
+  /** 清理失败记录：会话 id → 时间与原因。 */
+  private readonly failedCleanups = new Map<string, { at: string; error: string }>()
 
   private readonly options: SessionRegistryOptions
 
@@ -97,6 +108,27 @@ export class SessionRegistry {
           totalTokens: Number.isSafeInteger(rawTotals.totalTokens) ? rawTotals.totalTokens! : 0,
           usageTurns: Number.isSafeInteger(rawTotals.usageTurns) ? rawTotals.usageTurns! : 0,
           ...rawTotals.updatedAt !== undefined ? { updatedAt: rawTotals.updatedAt } : {},
+        }
+      }
+      const rawCleanup = parsed.__archive_cleanup__ as {
+        cleaned?: unknown
+        failed?: unknown
+      } | undefined
+      if (rawCleanup && typeof rawCleanup === 'object') {
+        if (Array.isArray(rawCleanup.cleaned)) {
+          for (const id of rawCleanup.cleaned) {
+            if (typeof id === 'string' && id.length > 0) this.cleanedSessions.add(id)
+          }
+        }
+        if (rawCleanup.failed && typeof rawCleanup.failed === 'object') {
+          for (const [id, value] of Object.entries(rawCleanup.failed)) {
+            if (!value || typeof value !== 'object') continue
+            const record = value as { at?: unknown; error?: unknown }
+            this.failedCleanups.set(id, {
+              at: typeof record.at === 'string' ? record.at : '',
+              error: typeof record.error === 'string' ? record.error : '',
+            })
+          }
         }
       }
       for (const [sessionId, value] of Object.entries(parsed)) {
@@ -130,6 +162,13 @@ export class SessionRegistry {
                 )],
               }
               : {},
+            ...Array.isArray(rawState.webChatKeys)
+              ? {
+                webChatKeys: [...new Set(
+                  rawState.webChatKeys.filter((id): id is string => typeof id === 'string' && id.length > 0),
+                )],
+              }
+              : {},
           })
         }
       }
@@ -143,6 +182,10 @@ export class SessionRegistry {
     if (!this.options.file) return
     const snapshot = JSON.stringify({
       __channel_totals__: this.channelTotals,
+      __archive_cleanup__: {
+        cleaned: [...this.cleanedSessions],
+        failed: Object.fromEntries(this.failedCleanups),
+      },
       ...Object.fromEntries(this.chats),
     }, null, 2)
     this.writeQueue = this.writeQueue.catch(() => {}).then(async () => {
@@ -194,5 +237,50 @@ export class SessionRegistry {
   async dispose(sessionId: string): Promise<void> {
     this.chats.delete(sessionId)
     await this.save()
+  }
+
+  /**
+   * 记一条该会话的网页对话 id（去重）。
+   * @returns 是否新增（调用方据此决定要不要落盘）。
+   */
+  recordWebChatKey(sessionId: string, chatId: string): boolean {
+    if (chatId.length === 0) return false
+    const state = this.for(sessionId)
+    const list = state.webChatKeys ?? []
+    if (list.includes(chatId)) return false
+    state.webChatKeys = [...list, chatId]
+    return true
+  }
+
+  /** 该会话记录过的网页对话 id（只读快照）。 */
+  webChatKeysFor(sessionId: string): readonly string[] {
+    return this.chats.get(sessionId)?.webChatKeys ?? []
+  }
+
+  /** 标记某会话的网页端清理已完成。 */
+  markCleaned(sessionId: string): void {
+    this.cleanedSessions.add(sessionId)
+    this.failedCleanups.delete(sessionId)
+  }
+
+  /** 记录一次清理失败（保留最近一次原因）。 */
+  markCleanupFailed(sessionId: string, error: string): void {
+    this.failedCleanups.set(sessionId, { at: new Date().toISOString(), error })
+  }
+
+  /** 该会话是否已清理过。 */
+  isCleaned(sessionId: string): boolean {
+    return this.cleanedSessions.has(sessionId)
+  }
+
+  /** 清理记账快照（供统计与落盘）。 */
+  cleanupSnapshot(): {
+    cleaned: readonly string[]
+    failed: Readonly<Record<string, { at: string; error: string }>>
+  } {
+    return {
+      cleaned: [...this.cleanedSessions],
+      failed: Object.fromEntries(this.failedCleanups),
+    }
   }
 }

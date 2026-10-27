@@ -8,11 +8,15 @@
  * 卡片是**纯只读**的：不写配置、不触发保存、不影响草稿。取不到数据时只显示
  * 一行说明（老宿主没有 `webServer` 服务，或桌面壳没暴露该端口），绝不弹错。
  *
+ * 信息层级（从「要行动」到「做背景」）：最短间隔 → 调用量 / 失败 → 间隔分布 →
+ * 失败分布 → 按天明细（折叠）→ 安装自检（折叠）。
+ *
  * @module dsh-deepseek-web-xxxxxgold/client/ledger-card
  */
 
 import { useCallback, useEffect, useState } from 'react'
 import type { JSX } from 'react'
+import { Card, Fold, Stat } from './settings-ui.tsx'
 
 /** 台账摘要（与 `src/ledger.ts` 的 LedgerSummary 结构一致；client 侧只做展示，不 import 宿主代码）。 */
 interface IntervalStats {
@@ -98,6 +102,7 @@ export function LedgerCard({ t }: LedgerCardProps): JSX.Element {
   const [ledgerState, setLedgerState] = useState<'idle' | 'loading' | 'ready' | 'unavailable'>('idle')
   const [report, setReport] = useState<DoctorReport | null>(null)
   const [doctorState, setDoctorState] = useState<'idle' | 'loading' | 'ready' | 'unavailable'>('idle')
+  const [doctorOpen, setDoctorOpen] = useState(false)
 
   const loadLedger = useCallback((signal: AbortSignal) => {
     setLedgerState('loading')
@@ -123,6 +128,7 @@ export function LedgerCard({ t }: LedgerCardProps): JSX.Element {
   }, [loadLedger])
 
   const runDoctor = useCallback(() => {
+    setDoctorOpen(true)
     const controller = new AbortController()
     setDoctorState('loading')
     void getJson<{ report: DoctorReport }>(DOCTOR_ROUTE, controller.signal)
@@ -139,13 +145,14 @@ export function LedgerCard({ t }: LedgerCardProps): JSX.Element {
 
   const totals = summary?.totals
   const intervals = summary?.intervals
-  const failures = Object.entries(summary?.failures ?? {}).filter(([, count]) => count > 0)
+  const failures = Object.entries(summary?.failures ?? {})
+    .filter(([, count]) => count > 0)
+    .sort((left, right) => right[1] - left[1])
   const tight = (intervals?.minMs ?? 0) > 0 && (intervals?.minMs ?? 0) < 30_000
+  const language = t('ledger.lang') === 'en' ? 'en' : 'zh'
 
   return (
-    <section className="dsweb-group" aria-labelledby="dsweb-group-ledger">
-      <h3 className="dsweb-group-title" id="dsweb-group-ledger">{t('ledger.title')}</h3>
-      <p className="dsweb-group-hint">{t('ledger.hint')}</p>
+    <Card variant="aux" title={t('ledger.title')} hint={t('ledger.hint')} collapsible>
 
       {ledgerState === 'unavailable' && (
         <div className="dsweb-banner dsweb-banner-warn">{t('ledger.unavailable')}</div>
@@ -155,50 +162,73 @@ export function LedgerCard({ t }: LedgerCardProps): JSX.Element {
 
       {ledgerState === 'ready' && summary !== null && (
         <>
-          {totals !== undefined && totals.total === 0
+          {totals === undefined || totals.total === 0
             ? <div className="dsweb-banner">{t('ledger.empty')}</div>
             : (
               <div className="dsweb-stats">
-                <Stat label={t('ledger.total')} value={String(totals?.total ?? 0)} t={t} />
-                <Stat label={t('ledger.chat')} value={String(totals?.chat ?? 0)} t={t} />
-                <Stat label={t('ledger.failed')} value={String(totals?.failed ?? 0)} t={t} />
-                <Stat label={t('ledger.minGap')} value={formatDuration(intervals?.minMs ?? 0, t)} t={t} />
-                <Stat label={t('ledger.medianGap')} value={formatDuration(intervals?.medianMs ?? 0, t)} t={t} />
-                <Stat label={t('ledger.p90Gap')} value={formatDuration(intervals?.p90Ms ?? 0, t)} t={t} />
+                <Stat
+                  label={t('ledger.minGap')}
+                  value={formatDuration(intervals?.minMs ?? 0, t)}
+                  tone={tight ? 'warn' : 'accent'}
+                />
+                <Stat label={t('ledger.total')} value={String(totals.total)} />
+                <Stat
+                  label={t('ledger.failed')}
+                  value={String(totals.failed)}
+                  tone={totals.failed > 0 ? 'danger' : 'neutral'}
+                />
+                <Stat label={t('ledger.chat')} value={String(totals.chat)} />
+                <Stat label={t('ledger.medianGap')} value={formatDuration(intervals?.medianMs ?? 0, t)} />
+                <Stat label={t('ledger.p90Gap')} value={formatDuration(intervals?.p90Ms ?? 0, t)} />
               </div>
             )}
 
           {tight && <div className="dsweb-banner dsweb-banner-warn">{t('ledger.tight')}</div>}
 
           {failures.length > 0 && (
-            <div className="dsweb-chips">
-              <span className="dsweb-row-hint">{t('ledger.failures')}</span>
-              {failures.map(([kind, count]) => (
-                <span className="dsweb-badge dsweb-badge-warn" key={kind}>
-                  {(FAILURE_LABEL[kind]?.[t('ledger.lang') === 'en' ? 'en' : 'zh'] ?? kind)} × {count}
-                </span>
-              ))}
-            </div>
+            <Fold title={t('ledger.failuresTitle')} defaultOpen>
+              <div className="dsweb-chips">
+                {failures.map(([kind, count]) => (
+                  <span className="dsweb-badge dsweb-badge-warn" key={kind}>
+                    {(FAILURE_LABEL[kind]?.[language] ?? kind)} × {count}
+                  </span>
+                ))}
+              </div>
+            </Fold>
           )}
 
-          <div className="dsweb-row dsweb-row-wide">
-            <div className="dsweb-row-text">
-              <span className="dsweb-row-label">{t('ledger.days')}</span>
-              <p className="dsweb-row-hint">
-                {summary.days.length === 0 ? t('ledger.empty')
-                  : summary.days.map(day => `${day.date}：${day.total}${t('ledger.perDay')}`).join(' · ')}
-              </p>
-            </div>
-          </div>
+          <Fold
+            title={t('ledger.days')}
+            hint={t('ledger.daysHint')}
+            defaultOpen={false}
+          >
+            {summary.days.length === 0
+              ? <div className="dsweb-row-hint">{t('ledger.empty')}</div>
+              : (
+                  <div className="dsweb-days">
+                    {summary.days.map(day => (
+                      <div className="dsweb-day" key={day.date} title={day.date}>
+                        <span className="dsweb-day-date">{day.date.slice(5)}</span>
+                        <span className="dsweb-day-meta">
+                          <span>{day.total}{t('ledger.perDay')}</span>
+                          <span>{t('ledger.chat')} {day.chat}</span>
+                          {day.failed > 0 && <span className="dsweb-day-fail">{t('ledger.failed')} {day.failed}</span>}
+                        </span>
+                        <span className="dsweb-day-gap">{formatDuration(day.intervals.minMs, t)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+          </Fold>
         </>
       )}
 
-      <div className="dsweb-row dsweb-row-wide">
-        <div className="dsweb-row-text">
-          <span className="dsweb-row-label">{t('doctor.title')}</span>
-          <p className="dsweb-row-hint">{t('doctor.hint')}</p>
-        </div>
-        <div className="dsweb-row-control">
+      <Fold
+        title={t('doctor.title')}
+        hint={t('doctor.hint')}
+        open={doctorOpen}
+        onOpenChange={setDoctorOpen}
+        actions={(
           <button
             type="button"
             className="dsweb-button dsweb-button-secondary"
@@ -207,38 +237,31 @@ export function LedgerCard({ t }: LedgerCardProps): JSX.Element {
           >
             {doctorState === 'loading' ? t('doctor.running') : t('doctor.run')}
           </button>
-        </div>
-      </div>
+        )}
+      >
+        {doctorState === 'unavailable' && (
+          <div className="dsweb-banner dsweb-banner-warn">{t('doctor.unavailable')}</div>
+        )}
 
-      {doctorState === 'unavailable' && (
-        <div className="dsweb-banner dsweb-banner-warn">{t('doctor.unavailable')}</div>
-      )}
+        {doctorState === 'loading' && <div className="dsweb-skeleton" />}
 
-      {doctorState === 'ready' && report !== null && (
-        <div className="dsweb-checks">
-          {report.checks.map(check => (
-            <div className={`dsweb-check dsweb-check-${check.status}`} key={check.id}>
-              <span className="dsweb-check-icon">{STATUS_ICON[check.status]}</span>
-              <span>
-                <strong>{check.id}</strong>：{check.message}
-                {check.detail !== undefined && <span className="dsweb-check-detail">{check.detail}</span>}
-              </span>
+        {doctorState === 'ready' && report !== null && (
+          <div className="dsweb-checks">
+            {report.checks.map(check => (
+              <div className={`dsweb-check dsweb-check-${check.status}`} key={check.id}>
+                <span className="dsweb-check-icon">{STATUS_ICON[check.status]}</span>
+                <span>
+                  <strong>{check.id}</strong>：{check.message}
+                  {check.detail !== undefined && <span className="dsweb-check-detail">{check.detail}</span>}
+                </span>
+              </div>
+            ))}
+            <div className={report.ok ? 'dsweb-status dsweb-status-success' : 'dsweb-status dsweb-status-error'}>
+              {report.ok ? t('doctor.ready') : t('doctor.notReady')}
             </div>
-          ))}
-          <div className={report.ok ? 'dsweb-status dsweb-status-success' : 'dsweb-status dsweb-status-error'}>
-            {report.ok ? t('doctor.ready') : t('doctor.notReady')}
           </div>
-        </div>
-      )}
-    </section>
-  )
-}
-
-function Stat({ label, value, t }: { label: string; value: string; t: Translate }): JSX.Element {
-  return (
-    <div className="dsweb-stat" title={label}>
-      <span className="dsweb-stat-value">{value}</span>
-      <span className="dsweb-stat-label">{label}</span>
-    </div>
+        )}
+      </Fold>
+    </Card>
   )
 }

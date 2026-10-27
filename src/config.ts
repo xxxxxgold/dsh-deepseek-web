@@ -6,12 +6,26 @@
 
 import z from '@deepseek-ai/schemastery'
 import type { NotifyConfig } from './notify.ts'
-import { WEB_MODEL_CAPABILITIES, WEB_MODEL_IDS, type WebModelId } from './web-models.ts'
+import {
+  WEB_MODEL_CAPABILITIES,
+  WEB_MODEL_DEFAULT_REASONING_EFFORT,
+  WEB_MODEL_IDS,
+  WEB_MODEL_REASONING_EFFORTS,
+  type GlmWebModelId,
+  type GlmWebReasoningEffortId,
+  type WebModelId,
+  type WebModelReasoningEffortId,
+} from './web-models.ts'
 
 export const PROVIDER = 'deepseek-web'
 
-export { WEB_MODEL_CAPABILITIES, WEB_MODEL_IDS }
-export type { WebModelId }
+export {
+  WEB_MODEL_CAPABILITIES,
+  WEB_MODEL_DEFAULT_REASONING_EFFORT,
+  WEB_MODEL_IDS,
+  WEB_MODEL_REASONING_EFFORTS,
+}
+export type { WebModelId, WebModelReasoningEffortId }
 
 /** 历史模型 id：旧会话仍可能引用，解析时映射回单一入口。 */
 export const LEGACY_WEB_MODEL_IDS = [
@@ -125,9 +139,69 @@ export interface ReviewConfig {
   glmDebugPort: number
   /** GLM 审核独立 profile 目录；留空使用 %LOCALAPPDATA%\DshDeepSeekWeb\glm-profile。 */
   glmProfileDir?: string
+  /** GLM 审核使用的模型（GLM-5.3 / GLM-5.3-Flash）。 */
+  glmModel: GlmWebModelId
+  /** GLM 审核使用的思考强度（low / high / max）。 */
+  glmEffort: GlmWebReasoningEffortId
+}
+
+/** GLM 主通道（第二个主模型 provider）的配置。 */
+export interface GlmWebConfig {
+  /** GLM 对话页地址；支持 chatglm.cn 与 chat.z.ai（按域名识别选择器）。 */
+  url: string
+  /** 常驻 GLM 主通道浏览器的 CDP 端口。 */
+  debugPort: number
+  /** 独立 profile 目录；留空使用 %LOCALAPPDATA%\DshDeepSeekWeb\glm-web-profile。 */
+  profileDir?: string
+  /**
+   * 主通道是否自动发送。
+   *
+   * 默认 true：GLM 主通道是 agent 链路，每轮都要人工点发送会让工具循环不可用。
+   * 想沿用 DeepSeek 的半自动节奏时改 false。
+   */
+  autoSend: boolean
+  /**
+   * 主通道发送确认后等待网页响应头的上限（毫秒）。
+   * GLM 极致档位长任务可能十几分钟才开始吐流，默认 15 分钟。
+   */
+  ackTimeoutMs: number
+}
+
+/**
+ * 豆包网页通道配置。
+ *
+ * 与主配置分开是刻意的：豆包有自己的浏览器窗口、登录 profile 和 CDP 端口，
+ * 与 DeepSeek 通道互不污染；`enabled=false` 时整个通道不注册、不启动浏览器。
+ */
+export interface DoubaoConfig {
+  /** 是否启用豆包 provider。默认关闭，避免新增功能影响现有用户。 */
+  enabled: boolean
+  /** 豆包对话页地址。 */
+  url: string
+  /** 独立 profile 目录；留空使用 %LOCALAPPDATA%\DshDeepSeekWeb\doubao-profile。 */
+  profileDir?: string
+  /** 常驻豆包浏览器的 CDP 端口。 */
+  debugPort: number
+  /** 等响应头的上限（毫秒）。 */
+  ackTimeoutMs: number
+  /** 等完整响应体的上限（毫秒）。 */
+  replyTimeoutMs: number
+  /** 最多保留多少个会话标签页。 */
+  maxSessionPages: number
+  /** 浏览器未启动时是否自动拉起常驻进程。 */
+  autoStartKeeper: boolean
 }
 
 export interface Config {
+  /**
+   * 界面语言：
+   * - `auto`（默认）：跟随系统语言，中文系统显示中文，其余显示英文；
+   * - `zh`：强制中文；
+   * - `en`：强制英文。
+   *
+   * 只影响本插件的两处配置界面（设置页与插件管理器配置页），不影响宿主 DSH 自身语言。
+   */
+  uiLanguage: 'auto' | 'zh' | 'en'
   /** DeepSeek 网页地址。 */
   url: string
   /**
@@ -153,7 +227,7 @@ export interface Config {
    * 网页对话（含审核）结束、正文交给 Harness 时把 dsh 宿主窗口提到最前。
    */
   focus: {
-    /** 总开关。 */
+    /** 总开关。关掉后首次拉起浏览器以最小化启动，页面操作也不再置前。 */
     enabled: boolean
     /** 填入网页输入框 / 首次请求时聚焦网页窗口。 */
     webWindow: boolean
@@ -257,12 +331,40 @@ export interface Config {
     delayMs: number
   }
   /**
+   * 归档联动清理：DSH 会话归档后，删除它在 DeepSeek 网页端产生过的对话。
+   *
+   * 只处理本次运行期间新增的归档；历史存量没有网页对话 id，只在统计里显示为
+   * “无绑定”，不做猜测性删除。
+   */
+  archiveCleanup: {
+    /** 归档时是否自动删除网页端对话。 */
+    deleteOnArchive: boolean
+    /** 是否连上下文轮换产生的旧网页对话一起删；关掉只删最后一条。 */
+    includeRotatedChats: boolean
+  }
+  /**
    * 实时思考流：默认关闭；开启时仅把网页真实思考增量作为 reasoning 块
    * 流式展示在 Harness 对话里，不包含回答正文，也不控制网页思考开关。
    */
   liveThinking: boolean
   /** 最大回复字节数保护。 */
   maxReplyBytes: number
+  /**
+   * 上报给宿主的上下文窗口（token），设置页可改，默认 1000000。
+   *
+   * 默认值来自实测而非站点文档：附件通道下中文约 154 万字符、英文约 400 万字符
+   * 可被完整读入（折算约 100 万 token），超限时网页静默丢弃尾部且不报错。
+   * 它只影响宿主的预算与压缩判断，不改变网页端行为；调大后压缩更晚。
+   */
+  contextWindow: number
+  /**
+   * 上报给宿主的单次输出上限（token），设置页可改，默认 300000。
+   *
+   * 网页会自然收尾（实测约 8400 字符），所以该值主要影响宿主预算与压缩阈值：
+   * `min(contextWindow × 0.8, contextWindow − maxTokens − headroomTokens)`。
+   * 需满足 `maxTokens + headroomTokens < contextWindow`，否则宿主的自动压缩会被拒绝执行。
+   */
+  maxTokens: number
   /**
    * 图片直传：把 Harness 的 image 块真正上传到网页输入框，让网页端原生识图。
    * 关闭时退回旧行为（图片降级成 `[附图 N: 文件名]` 文本标记，模型看不到图）。
@@ -368,8 +470,22 @@ export interface Config {
   longTextAsFile: boolean
   /** 触发长文本转文件的字符数（默认 120000，下限 10000）。 */
   longTextFileThreshold: number
-  /** 可选审核通道（Kimi / GLM 独立审核，或 DeepSeek 同对话自审）。 */
+  /**
+   * 可选审核通道（Kimi / GLM 独立审核，或 DeepSeek 同对话自审）。
+   * 网页模型的模型菜单还会公布「审核关 / 跟随设置 / 审核开」三档；
+   * `review.enabled` 是「跟随设置」档位读取的默认值。
+   */
   review: ReviewConfig
+  /**
+   * GLM 网页通道（第二个主模型 provider）。
+   * 模型 GLM-5.3 / GLM-5.3-Flash，思考强度三档由 DSH 模型菜单控制。
+   */
+  glmWeb: GlmWebConfig
+  /**
+   * 豆包网页通道（第二个主模型 provider）。
+   * 默认关闭；开启后模型列表出现 `doubao-web` / `doubao-web-auto`。
+   */
+  doubao: DoubaoConfig
   /** 模型疑似想调工具但输出无法解析时，自动注入纠错并请求重试一次。 */
   autoCorrectMalformed: boolean
   /** 官方压缩模板的摘要语言；host 保留宿主原始要求。 */
@@ -436,6 +552,9 @@ function markVolatile<T extends { volatile?: () => unknown; extra?: (key: 'volat
  * 需要调整时改 profile 的 `cordis.patch.yml`。
  */
 const schema = z.object({
+  // 界面语言：只作用于本插件的两处配置界面。
+  // 必须标 volatile，否则不会进入宿主可写命名空间，设置页看不到这个下拉框。
+  uiLanguage: markVolatile(z.union(['auto', 'zh', 'en']).default('auto')),
   url: markVolatile(z.string().default('https://chat.deepseek.com')),
   // 默认由插件启动独立浏览器；attach 保留给需要复用外部 CDP 浏览器的高级用户。
   // browser/channel/profileDir 在通道构造时读取（见 playwright-channel.ts），
@@ -491,8 +610,20 @@ const schema = z.object({
     maxAttempts: markVolatile(z.number().step(1).min(0).max(5).default(2)),
     delayMs: markVolatile(z.number().step(1).min(0).max(60_000).default(2_000)),
   }).default({}),
+  archiveCleanup: z.object({
+    // 默认开：用户要的就是“归档即删网页端对话”；关掉后只归档，统计里会记为待清理。
+    deleteOnArchive: markVolatile(z.boolean().default(true)),
+    // 默认开：一个 dsh 会话可能因上下文轮换产生多条网页对话，归档时一起清掉。
+    includeRotatedChats: markVolatile(z.boolean().default(true)),
+  }).default({}),
   liveThinking: markVolatile(z.boolean().default(false)),
   maxReplyBytes: z.number().step(1).min(1024).default(4 * 1024 * 1024),
+  // 容量声明：默认 1M 上下文 / 300k 输出，依据附件通道实测（中文约 154 万字符、
+  // 英文约 400 万字符可完整读入，折算约 100 万 token）。设置页可改，影响宿主的
+  // 压缩阈值：min(contextWindow × 0.8, contextWindow − maxTokens − 65536)，
+  // 且需满足 maxTokens + 65536 < contextWindow，否则宿主拒绝执行自动压缩。
+  contextWindow: markVolatile(z.number().step(1).min(8_000).max(4_000_000).default(1_000_000)),
+  maxTokens: markVolatile(z.number().step(1).min(256).max(1_000_000).default(300_000)),
   // 图片直传：默认开（本机单人自用，装完即可像网页版一样直接发图）；关闭即退回纯文本标记。
   enableImageUpload: markVolatile(z.boolean().default(true)),
   maxImagesPerTurn: markVolatile(z.number().step(1).min(0).max(32).default(4)),
@@ -566,6 +697,28 @@ const schema = z.object({
     dshProcessNames: z.array(z.string()).default(['electron', 'dsh', 'DeepSeek Harness']),
     dshTitlePattern: z.string().default('DeepSeek Harness|dsh'),
   }).default({}),
+  glmWeb: z.object({
+    url: markVolatile(z.string().default('https://chatglm.cn/')),
+    // 9337：避开 GLM 审核的 9335 与豆包的 9336，三个通道可同时常驻。
+    debugPort: markVolatile(z.number().step(1).min(1024).max(65535).default(9337)),
+    // 空串 = 运行时默认目录（%LOCALAPPDATA%\DshDeepSeekWeb\glm-web-profile）。
+    profileDir: markVolatile(z.string().default('')),
+    autoSend: markVolatile(z.boolean().default(true)),
+    // 15 分钟：极致档位长任务（实测 41k 字 HTML 用了 9 分 16 秒）留足余量。
+    ackTimeoutMs: markVolatile(z.number().step(1000).min(10_000).max(1_800_000).default(900_000)),
+  }).default({}),
+  doubao: z.object({
+    // 默认关闭：新增通道不该改变现有 deepseek-web 用户看到的模型列表。
+    enabled: markVolatile(z.boolean().default(false)),
+    url: markVolatile(z.string().default('https://www.doubao.com/chat')),
+    // 空串 = 运行时默认目录（%LOCALAPPDATA%\DshDeepSeekWeb\doubao-profile）。
+    profileDir: markVolatile(z.string().default('')),
+    debugPort: markVolatile(z.number().step(1).min(1024).max(65535).default(9336)),
+    ackTimeoutMs: markVolatile(z.number().step(1).min(5_000).default(120_000)),
+    replyTimeoutMs: markVolatile(z.number().step(1).min(10_000).default(600_000)),
+    maxSessionPages: markVolatile(z.number().step(1).min(1).max(16).default(4)),
+    autoStartKeeper: z.boolean().default(true),
+  }).default({}),
   review: z.object({
     enabled: markVolatile(z.boolean().default(false)),
     provider: markVolatile(z.union(['kimi', 'deepseek-web', 'glm']).default('kimi')),
@@ -591,9 +744,12 @@ const schema = z.object({
     streamIdleTimeoutMs: z.number().step(1).min(1).default(600_000),
     maxEvidenceChars: z.number().step(1).min(1_000).default(60_000),
     maxRounds: markVolatile(z.number().step(1).min(0).default(1)),
-    glmUrl: z.string().default('https://chat.z.ai/'),
+    glmUrl: markVolatile(z.string().default('https://chat.z.ai/')),
     glmDebugPort: z.number().step(1).min(1024).max(65535).default(9335),
     glmProfileDir: z.string(),
+    // GLM 审核的模型与思考强度：默认用旗舰 + 深度，避免 Flash/低强度审得太浅。
+    glmModel: markVolatile(z.union(['glm-5.3', 'glm-5.3-flash']).default('glm-5.3')),
+    glmEffort: markVolatile(z.union(['low', 'high', 'max']).default('high')),
   }).default({}),
   autoCorrectMalformed: z.boolean().default(true),
   compactionLanguage: markVolatile(z.union(['task', 'host', 'zh', 'en']).default('task')),

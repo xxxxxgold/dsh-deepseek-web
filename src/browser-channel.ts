@@ -8,6 +8,7 @@
  */
 
 import type { Config } from './config.ts'
+import type { LoginBundle } from './login-state.ts'
 import type { NoticePayload } from './notify.ts'
 
 /** 一轮网页对话的实时增量：网页端已生成（累计解析出）的思考与正文。 */
@@ -43,8 +44,15 @@ export interface BrowserImageAttachment {
 
 export interface BrowserTurnRequest {
   sessionId: string
-  /** 站点侧的模型标识（DeepSeek 为 deepseek-web 系列，Kimi 为 kimi-web，GLM 为 glm-web）。 */
+  /** 站点侧的模型标识（DeepSeek 为 deepseek-web 系列，Kimi 为 kimi-web，GLM 为 glm-5.3 / glm-5.3-flash）。 */
   model: string
+  /**
+   * 本轮选择的推理/思考档位（DSH 的 `GenerateOptions.reasoningEffort` 原样透传）。
+   *
+   * DeepSeek 把它当审核开关；GLM 主通道把它翻译成站点的思考强度（low/high/max）。
+   * 通道不认识的值应忽略，不要因此拒绝整轮。
+   */
+  reasoningEffort?: string
   text: string
   initialize: boolean
   /**
@@ -52,6 +60,13 @@ export interface BrowserTurnRequest {
    * 通道必须零开销短路（内部辅助请求 `turnIsolated` 也走同一条发送方法）。
    */
   attachments?: readonly BrowserImageAttachment[]
+  /**
+   * 本轮有图没传上去时的说明（例：「1 张图未上传（宿主附件服务不可用）」）。
+   *
+   * 适配层算出的缺口，通道把它拼进「已发送 / 已填入输入框」那条提示里：图片丢失
+   * 不能让用户事后靠"模型说看不到"才发现。
+   */
+  imageNotice?: string
   /**
    * 附件上传失败时的正文回退。
    *
@@ -129,6 +144,8 @@ export interface BrowserChannel {
   turnIsolated?(request: BrowserTurnRequest): Promise<BrowserTurnResult>
   /** 正常会话是否仍占用当前工作页面；否则 adapter 必须回放宿主上下文。 */
   isConversationActive?(sessionId: string): boolean
+  /** 该 dsh 会话当前页面所指的网页对话 id（不支持时返回 undefined）。 */
+  currentChatId?(sessionId: string): string | undefined
   /** 轮换到全新网页对话（可选；仅主对话通道需要）。传 sessionId 时只轮换该会话的页面。 */
   startNewConversation?(sessionId?: string): Promise<void>
   /**
@@ -147,6 +164,16 @@ export interface BrowserChannel {
   status(): Promise<{ ready: boolean; url?: string; message?: string }>
   /** 把网页窗口提到最前（填入消息 / 首次请求时）。 */
   focusBrowser(): Promise<void>
+  /** 登录墙专用：还原并抢前台（仅 managed；不受 focus 开关影响）。 */
+  revealLoginWindow?(): Promise<boolean>
+  /** 启动/复用浏览器并打开登录页；未登录时不抛错，返回 opened/loggedIn。 */
+  openLoginWindow?(): Promise<{ opened: boolean; loggedIn: boolean; detail?: string }>
+  /** 把设置页粘贴的登录态写入浏览器 profile（localStorage + cookies）。 */
+  importLoginState?(bundle: LoginBundle): Promise<{ token: boolean; cookies: number }>
+  /** 导出当前登录态（token + cookies），只读。 */
+  exportLoginState?(): Promise<{ token: string; cookies: unknown[] }>
+  /** 浏览器当前是否已启动（探活只能判断已启动的浏览器）。 */
+  isBrowserStarted?(): boolean
   /** 网页对话（含审核）结束、正文交给 Harness 时，把 dsh 宿主窗口提到最前。 */
   focusHarness(): Promise<void>
   /** 记录会话的发送方式（全自动/半自动），供后续轮次与自审轮次回退使用。 */

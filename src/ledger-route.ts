@@ -26,12 +26,13 @@ export const LEDGER_ROUTE = '/api/dsh-deepseek-web/ledger'
 /** 安装自检路由（GET；`?live=1` 才跑需要浏览器的在线检查）。 */
 export const DOCTOR_ROUTE = '/api/dsh-deepseek-web/doctor'
 
-/** 请求对象的最小形状（只用到围栏与查询串）。 */
+/** 请求对象的最小形状（只用到围栏、查询串与 POST 请求体）。 */
 export interface BridgeRequest {
   method?: string | undefined
   url?: string | undefined
   headers: Record<string, string | string[] | undefined>
   socket?: { remoteAddress?: string | undefined; localAddress?: string | undefined } | undefined
+  on?(event: 'data' | 'end' | 'error', listener: (chunk?: unknown) => void): void
 }
 
 /** 响应对象的最小形状。 */
@@ -112,7 +113,7 @@ export function isBridgeRequestAllowed(request: BridgeRequest): boolean {
   return isLoopbackAddress(request.socket?.remoteAddress)
 }
 
-function sendJson(res: BridgeResponse, status: number, payload: unknown): void {
+export function sendJson(res: BridgeResponse, status: number, payload: unknown): void {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',

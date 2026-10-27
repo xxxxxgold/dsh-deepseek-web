@@ -165,7 +165,9 @@ export class GlmReviewer {
     if (fresh) this.channel.resetConversationGate?.(GLM_REVIEW_SESSION)
     const result = await this.channel.turn({
       sessionId: GLM_REVIEW_SESSION,
-      model: 'glm-web',
+      // 站点真实模型 id；通道会据此切换页面模型。
+      model: this.config.glmModel,
+      reasoningEffort: this.config.glmEffort,
       text: buildReviewPrompt(evidence, this.config.maxEvidenceChars),
       initialize: fresh,
       autoSend: this.config.autoSend !== false,

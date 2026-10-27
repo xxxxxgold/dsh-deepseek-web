@@ -22,6 +22,7 @@ import { Ledger } from './ledger.ts'
 import {
   EDITOR_CANDIDATES,
   SEND_BUTTON_CANDIDATES,
+  defaultProfileDir,
   launchManagedBrowser,
   looksLoggedOut,
   looksLoginWall,
@@ -203,6 +204,18 @@ export async function collectStaticChecks(options: {
     message: state.ok ? '状态文件目录可写' : '状态文件目录不可写，每次重启都会从头回放上下文',
     detail: stateFile,
   })
+
+  // 3.5 豆包通道：只查 profile 目录，不启动浏览器；关闭时不产生任何检查项。
+  if (config.doubao.enabled) {
+    const doubaoProfileDir = config.doubao.profileDir || defaultProfileDir('doubao-profile')
+    const doubaoProfile = await probeDirWritable(doubaoProfileDir)
+    checks.push({
+      id: 'doubao-profile',
+      status: doubaoProfile.ok ? 'ok' : 'warning',
+      message: doubaoProfile.ok ? '豆包 profile 目录可写' : '豆包 profile 目录不可写，登录态会存不下来',
+      detail: `${doubaoProfileDir}\n${doubaoProfile.detail}`,
+    })
+  }
 
   // 4. 构建标识：确认跑的是哪一份产物，而不是靠「我重启过了」猜。
   const stamp = await readStamp()

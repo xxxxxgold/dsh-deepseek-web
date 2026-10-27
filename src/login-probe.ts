@@ -111,16 +111,16 @@ export class LoginProbeScheduler {
     return this.result
   }
 
-  /** 立即探一次（自检/设置页用），不影响既有排期。 */
+  /** 立即探一次（自检/设置页用），不影响既有排期，也不触发后台副作用。 */
   async probeNow(): Promise<LoginProbeResult> {
-    return await this.run()
+    return await this.run(false)
   }
 
   private scheduleNext(delayMs: number): void {
     if (this.stopped) return
     this.handle = this.timers.schedule(() => {
       this.handle = undefined
-      void this.run().then(result => {
+      void this.run(true).then(result => {
         if (result === undefined) return
         if (this.intervalMs > 0) this.scheduleNext(this.intervalMs)
         else this.stopped = true
@@ -128,7 +128,13 @@ export class LoginProbeScheduler {
     }, delayMs)
   }
 
-  private async run(): Promise<LoginProbeResult> {
+  /**
+   * 执行一次探活。
+   *
+   * `notify=false` 用于设置页的「立即检测」：手动点击只想要一个结果，
+   * 不应该触发登录页置前/提示这类后台副作用。
+   */
+  private async run(notify = true): Promise<LoginProbeResult> {
     if (this.running) {
       return this.result ?? { status: 'unknown', detail: '上一次探活还没结束', checkedAt: this.now() }
     }
@@ -146,7 +152,7 @@ export class LoginProbeScheduler {
       this.running = false
     }
     this.result = result
-    this.onResult?.(result)
+    if (notify) this.onResult?.(result)
     return result
   }
 }

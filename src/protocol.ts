@@ -600,6 +600,14 @@ export interface RenderedUserPrompt {
    * 缺省表示纯文本回合；只有 `enableImageUpload` 开启时才可能非空。
    */
   attachments?: readonly ImageAttachmentRef[]
+  /**
+   * 本轮「按策略应当上传」的图片张数（去重后、受 `maxImagesPerTurn` 约束）。
+   *
+   * 用途是让适配层发现缺口：`imageExpected > attachments.length` 说明本轮有图没能
+   * 进输入框，必须提示用户，而不是让模型在缺图的情况下硬猜。关闭图片直传时为 0，
+   * 表示"本来就不打算上传"，不算缺口。
+   */
+  imageExpected?: number
 }
 
 const CONTEXT_VERSION = 1
@@ -703,20 +711,26 @@ export function renderNewWebMessages(
 
   // 收集本轮增量消息里的图片：user 的拖入附件与工具产出的截图都要能上网页。
   // 只收 image 块本身（引用），字节留给适配层读取——渲染层不碰附件存储。
-  // 增量轮跳过「当前网页对话里已经上传过」的图：网页端对重复的 ref_file_ids 会
-  // 整轮拒绝，且该会话此后每轮都失败。replay 会重建对话，不能跳过（要全量重传）。
+  //
+  // 去重只做「同一张图在本轮重复出现」这一层（同一 attachmentId 只上一次）。
+  // 旧实现还按 `state.uploadedImageIds` 做跨轮跳过，理由是同 id 已经在这条网页对话里；
+  // 但那只证明「历史消息里曾有这张图」，不证明「本轮这条消息带着图」。用户多轮之后
+  // 重新贴同一张图时，图会被静默吃掉，表现就是「我贴了图，模型却说看不到」。
   const collectedImages: ImageAttachmentRef[] = []
   const seenImageIds = new Set<string>()
-  const alreadyUploaded = replay ? new Set<string>() : new Set(state.uploadedImageIds ?? [])
   const maxImages = Math.max(0, config.maxImagesPerTurn)
   const collectImages = (content: readonly ContentBlock[]): void => {
-    if (!imageUpload || maxImages === 0) return
     for (const block of content) {
       if (block.type !== 'image') continue
       const ref = block.attachment
       if (seenImageIds.has(ref.attachmentId)) continue
       seenImageIds.add(ref.attachmentId)
-      if (alreadyUploaded.has(ref.attachmentId)) continue
+      if (!imageUpload || maxImages === 0) continue
+      if (state.uploadedImageIds?.includes(ref.attachmentId)) {
+        console.info(
+          `[deepseek-web] 本轮重新附上了网页对话里出现过的图，仍按本轮附件重传：${ref.name ?? ref.attachmentId.slice(-8)}`,
+        )
+      }
       collectedImages.push(ref)
     }
   }
@@ -833,6 +847,11 @@ export function renderNewWebMessages(
   const selectedImages = imageUpload && maxImages > 0
     ? (replay ? collectedImages.slice(-maxImages) : collectedImages.slice(0, maxImages))
     : []
+  // 本轮「按策略应当上传」的张数（不是实际传成功的张数）：适配层用它判断本轮有没有
+  // 图掉在地上——没掉就不用提示，掉了必须让用户当场看见。
+  const imageExpected = imageUpload && maxImages > 0
+    ? Math.min(seenImageIds.size, maxImages)
+    : 0
 
   return {
     prompt: {
@@ -844,6 +863,7 @@ export function renderNewWebMessages(
         : text,
       initialize: replay,
       attachments: selectedImages.length > 0 ? selectedImages : undefined,
+      imageExpected,
     },
   }
 }

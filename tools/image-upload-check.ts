@@ -101,6 +101,7 @@ assert.ok(first.prompt.text.includes('[附图: a.png]'), '占位标记应带文�
 // 5. 关闭开关：一个附件都不收集，协议走"看不到图"分支。
 const offPrompt = renderNewWebMessages(options(messages), freshState(), config({ enableImageUpload: false }))
 assert.equal(offPrompt?.prompt.attachments, undefined, '关闭时不得收集附件')
+assert.equal(offPrompt?.prompt.imageExpected, 0, '关闭图片直传时不算缺口（本来就不打算上传）')
 assert.ok(offPrompt?.prompt.text.includes('看不到图片内容'), '关闭时协议应声明看不到图')
 
 // 6. 张数上限：增量轮只留前 N 张，且去重同一附件。
@@ -133,6 +134,7 @@ assert.deepEqual(
   ['sha256:r3'],
   '增量轮只应收集游标之后新增的图',
 )
+assert.equal(second?.prompt.imageExpected, 1, '增量轮应当上传 1 张图（供适配层判断缺口）')
 const plain = renderNewWebMessages(
   options([...messages, userMessage('user-3', '纯文本问题')]),
   incrementalState,
@@ -140,8 +142,10 @@ const plain = renderNewWebMessages(
 )
 assert.equal(plain?.prompt.attachments, undefined, '纯文本轮不得带附件')
 
-// 8. 跨轮去重：第一轮传过 A/B，第二轮纯文字，第三轮新加 C——
-//    C 必须收集；若用户第三轮又把 A 拖进来（同 attachmentId），A 不重传。
+// 8. 跨轮重贴同一张图：用户在本轮显式附上的图必须上传。
+//    旧实现按 `uploadedImageIds` 跨轮跳过，理由是同 id 已在网页对话里；但那不等于
+//    「本轮这条消息带着图」——跳过的后果是用户贴了图、模型却看不到（本轮 bug 的
+//    第二条真实路径）。去重只在本轮内做（同 attachmentId 只上一次）。
 const crossState = freshState()
 renderNewWebMessages(options(messages), crossState, config())
 crossState.initialized = true
@@ -158,9 +162,10 @@ const third = renderNewWebMessages(
 )
 assert.deepEqual(
   third?.prompt.attachments?.map(item => item.attachmentId),
-  ['sha256:r9'],
-  '第三轮新图必须收集，已在网页对话里的旧图不重复上传',
+  ['sha256:r9', 'sha256:r1'],
+  '本轮新图与用户重新贴的旧图都必须收集，不得因跨轮去重被静默吃掉',
 )
+assert.equal(third?.prompt.imageExpected, 2, '本轮应有 2 张图可上传（供适配层判断缺口）')
 
 // 9. replay 时的历史图：只取最近若干张，避免重建对话时重传一大堆旧图。
 const historyState = freshState()

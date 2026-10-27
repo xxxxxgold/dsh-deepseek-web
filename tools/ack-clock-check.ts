@@ -63,7 +63,10 @@ for (const target of targets) {
   // 否则会命中文件顶部的 import 语句。
   const sendAt = source.indexOf(target.sendCall, anchorAt)
   const startAt = source.indexOf('startAckClock()', anchorAt)
-  const raceAt = source.indexOf('ackDeadline!])', anchorAt)
+  // 竞速成员因通道而异（deepseek 还等 mirror/限流/取消，Kimi 有 aborted），
+  // 只要求 ackDeadline 出现在同一个 Promise.race 数组里。
+  const raceMatch = /Promise\.race\(\[[\s\S]{0,800}?ackDeadline!/.exec(source.slice(anchorAt))
+  const raceAt = raceMatch ? anchorAt + raceMatch.index : -1
   check(`${label}：发送确认在启动计时之前`, sendAt >= 0 && startAt > sendAt,
     `sendEditorMessage@${sendAt} / startAckClock@${startAt}`)
   check(`${label}：等待计时在竞速之前启动`, startAt >= 0 && raceAt > startAt,

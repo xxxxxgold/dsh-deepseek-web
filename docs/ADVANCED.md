@@ -7,7 +7,7 @@
 已配置 dsh CLI 时，可以用官方插件管理命令安装同一个包：
 
 ```bash
-dsh plugin --profile desktop add https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.1/dsh-deepseek-web-xxxxxgold-0.7.1.tgz
+dsh plugin --profile desktop add https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.2/dsh-deepseek-web-xxxxxgold-0.7.2.tgz
 ```
 
 仅在需要手工管理 profile 时，把以下字段合并到现有清单，保留原有依赖和 bundles：
@@ -15,7 +15,7 @@ dsh plugin --profile desktop add https://github.com/xxxxxgold/dsh-deepseek-web/r
 ```json
 {
   "dependencies": {
-    "dsh-deepseek-web-xxxxxgold": "https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.1/dsh-deepseek-web-xxxxxgold-0.7.1.tgz"
+    "dsh-deepseek-web-xxxxxgold": "https://github.com/xxxxxgold/dsh-deepseek-web/releases/download/v0.7.2/dsh-deepseek-web-xxxxxgold-0.7.2.tgz"
   },
   "dsh": {
     "profile": {
@@ -121,8 +121,8 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `maxReplayChars` | `400000` | 全量回放历史时单条消息的字符上限。网页输入框填字代价接近二次方增长（30 万字符约 13 秒、60 万约 77 秒、110 万会拖死主线程），超预算按消息粒度丢弃最早的历史并留一行省略说明；系统指令与协议清单不计入预算；`0` 关闭 |
 | `loginProbe.enabled` | `true` | 是否在后台只读检查网页登录态（不发送、不消耗额度）。失效时只提醒，不拦发送 |
 | `loginProbe.initialDelayMs` | `20000` | 启动后多久做第一次探活（毫秒） |
-| `loginProbe.intervalMs` | `1800000` | 之后每隔多久探一次（毫秒，默认 30 分钟）；`0` 只探一次 |
-| `review.enabled` | `false` | 是否启用交付审核 |
+| `loginProbe.intervalMs` | `1800000` | 之后每隔多久探一次（毫秒，默认 30 分钟）；`0` 只探一次。设置页「登录态」卡片的手动检测/打开登录/导入导出不受此开关限制 |
+| `review.enabled` | `false` | 「跟随设置」档位使用的默认开关；是否启用交付审核 |
 | `review.provider` | 发行 patch 为 `deepseek-web`；schema 为 `kimi` | `deepseek-web`、`kimi` 或 `glm` |
 | `review.debugPort` | `9334` | Kimi 审核浏览器 CDP 端口 |
 | `review.glmDebugPort` | `9335` | GLM 审核浏览器 CDP 端口 |
@@ -131,9 +131,50 @@ User-Agent 或额外 HTTP 请求头。网页看到的 UA、Client Hints、Cookie
 | `review.url` | `https://www.kimi.com/?chat_enter_method=new_chat` | 正常模式下审核窗口打开的链接。缺 `chat_enter_method` 时自动补上，已有则原样使用；可填企业版域名或带自有查询参数的地址 |
 | `review.projectUrl` | 空 | 项目模式要用的 Kimi 项目，**只填项目 ID**（形如 `1a15bef4-b7a2-894f-8000-0e7143648841`）；插件拼成 `<正常模式链接的域名>/project/<ID>?chat_enter_method=new_chat`，填完整项目页链接也认。留空或填了非 ID 内容会明确报错，不会静默退回普通对话 |
 | `review.glmUrl` | `https://chat.z.ai/` | GLM 审核窗口打开的链接，规则同上 |
+| `review.glmModel` | `glm-5.3` | GLM 审核模型：`glm-5.3` 或 `glm-5.3-flash` |
+| `review.glmEffort` | `high` | GLM 审核思考强度：`low`（快速）/ `high`（深度）/ `max`（极致）；每次审核前自动切换并校验 |
+| `glmWeb.url` | `https://chatglm.cn/` | GLM 主通道入口，支持 `chatglm.cn` / `chat.z.ai` / `zchat.z.ai`，按域名识别站点 |
+| `glmWeb.debugPort` | `9337` | GLM 主通道浏览器 CDP 端口（审核 9335、豆包 9336） |
+| `glmWeb.profileDir` | 空 | GLM 主通道独立 profile；空 = `%LOCALAPPDATA%\DshDeepSeekWeb\glm-web-profile` |
+| `glmWeb.autoSend` | `true` | GLM 主通道是否自动发送；agent 链路建议保持开启 |
+| `glmWeb.ackTimeoutMs` | `900000` | 发送确认后等网页响应头的上限（毫秒），默认 15 分钟；实测 41k 字 HTML 用了 9 分 16 秒，故留足余量。审核通道仍为 120 秒 |
 | `review.sendVerifyMs` | `1500` | 自动发送后确认“已发出”的等待窗口（毫秒）；窗口内没等到信号才视为没发出去 |
 | `review.sendRetries` | `2` | 发送未被确认时的重试轮数（每轮 = 回车 + 点发送按钮兜底） |
 | `review.fetchRetries` | `1` | 获取回复失败后的自动重试次数（`0` 关闭）；每次重试前都会丢弃旧连接并重新连浏览器 |
+
+网页模型（`deepseek-web` / `deepseek-web-auto`）的模型菜单「推理等级」有三档：**审核关 / 跟随设置 / 审核开**。
+`review.enabled` 是「跟随设置」读取的默认值；「审核关」「审核开」只覆盖当前会话，不改全局配置。三档只在网页模型下出现，原生模型的 `Default / Low / High / Max` 不受影响。
+边界：`review.maxRounds = 0` 时即使选「审核开」也不会审；档位值（`review-*`）会随请求头进入会话日志/遥测，它不是真实的思考强度；三档名称固定中文（与网页模型名一致）。
+
+### GLM 主通道与思考强度
+
+除了 DeepSeek，插件还注册了一组「GLM 网页版」provider：
+
+| 模型 id | 菜单名称 | 站点模型 |
+| --- | --- | --- |
+| `glm-5.3` | `GLM-5.3` | `GLM-5.3` |
+| `glm-5.3-flash` | `GLM-5.3-Flash` | `GLM-5.3-Flash` |
+
+每个模型的「推理等级」三档是**真实思考强度**，不是审核开关：
+
+| effort id | 菜单名 | chatglm.cn | z.ai 滑杆 |
+| --- | --- | --- | --- |
+| `low` | 快速 | 「快速」子菜单 | `aria-valuenow=0` |
+| `high` | 深度 | 「深度」子菜单 | `1` |
+| `max` | 极致 | 「极致」子菜单 | `2` |
+
+每轮发送前插件都会读页面当前值，不一致就点菜单切换并复读校验；新开对话、页面重载后同样会纠正。选 GLM 模型时不会显示 DeepSeek 的「审核关 / 跟随设置 / 审核开」三档——GLM 目前不接审核门禁。
+
+两个站点的差异：
+
+- **chatglm.cn**：游客可发送，但长对话/历史建议登录；模型菜单是 `.think-mode-*`，选择后触发器显示「模型 + 档位」。
+- **chat.z.ai / zchat.z.ai**：发送按钮在未登录时禁用（回车也不发），必须先登录；中国区会弹「请切换至中国站点」，插件会自动关闭。强度是三档滑杆，插件按轨道比例点击并读 `aria-valuenow` 校验。
+
+首版限制：GLM 主通道只支持纯文本——图片降级为 `[附图: …]` 标记且会提示未上传；长文本不转文件附件，直接填输入框；不支持登录态导入导出与归档联动删除网页对话。
+
+设置页底部为 GLM 增加了独立的「GLM 登录态」卡片（路由前缀 `/api/dsh-deepseek-web/glm-login`）：只读探活不会拉起浏览器；点「打开浏览器去登录」会拉起/复用 GLM 主通道窗口，登录完成后限时轮询复检。chatglm.cn 游客态可发送，卡片会注明「游客态」；z.ai 未登录时发送按钮禁用，卡片报「登录态已失效」。导入/导出登录态只在 DeepSeek 卡片提供。
+
+GLM 回合与 DeepSeek 一样有 `[DSH]` 过程提示：发送确认（自动报回车/按钮，半自动报「等待点击发送」）、网页开始响应、回复完成、失败各一行；`notify` 分组里的开关与 500ms 节流同样生效。标签页复用：取消/失败不关页，只标记下次开新对话，重试不会新增标签；标题/压缩辅助页用完即关。主通道首响应等待由 `glmWeb.ackTimeoutMs` 控制（默认 15 分钟），失败/取消会先导航回入口中止网页里仍在跑的生成，避免「网页还在生成、重试却撞 429」。GLM 的思考在解析完成后写入 reasoning 块：需要在设置里开启「展示网页思考过程」（`liveThinking`）才能在对话里看到。
 
 完整字段和默认值见 [`src/config.ts`](https://github.com/xxxxxgold/dsh-deepseek-web/blob/main/src/config.ts)。配置文件中的 profile、状态和
 校准数据默认保存在 `%LOCALAPPDATA%\DshDeepSeekWeb\`，不会写入插件安装目录。
@@ -361,13 +402,16 @@ DeepSeek 网页偶发返回 DSML 标签形式的原生工具调用。旧版只�
 网页累计用量没有可靠的输入/输出分类，因此只保留通道累计统计，宿主用量面板可能不再显示
 这些数值；不能把累计总量当成输出 token。
 
-已核查的 dsh 0.2.0-rc.2 默认压缩预留 `headroomTokens: 65536`，在网页模型 128000 上下文、
-16000 输出预留下，实际阈值为 `min(128000 × 0.8, 128000 - 16000 - 65536) = 46464`。
+已核查的 dsh 0.2.0-rc.2 默认压缩预留 `headroomTokens: 65536`。网页模型的上下文窗口与输出
+上限现在可在设置页配置（`contextWindow` / `maxTokens`，默认 1000000 / 300000），默认阈值
+为 `min(1000000 × 0.8, 1000000 - 300000 - 65536) = 634464`。
+这两个默认值来自实测：附件通道下中文约 154 万字符、英文约 400 万字符可完整读入（折算约
+100 万 token），超限时网页静默丢弃尾部且不报错。
 工具 schema 也计入压力。顶部 compaction 插件开关不一定控制 standard 预设的隔离 compaction。
 
 可选配置工具会在实际 agent preset 内写入仅针对 `deepseek-web` 路由的策略：
-`thresholdRatio: 0.8`、`headroomTokens: 8192`、摘要 `maxTokens: 4096`。相同预算下阈值为
-102400。它保留其他模型策略和已有预设，并先备份 profile patch；不自动修改所有安装者的预设。
+`thresholdRatio: 0.8`、`headroomTokens: 8192`、摘要 `maxTokens: 4096`。在默认 `maxTokens=300000`
+下阈值为 691808。它保留其他模型策略和已有预设，并先备份 profile patch；不自动修改所有安装者的预设。
 源码版本和发行包均可运行：
 
 ```powershell
@@ -377,3 +421,26 @@ node tools/configure-web-compaction.mjs --profile "$env:USERPROFILE\.dsh\profile
 按实际安装路径调整 `--asar`；CLI 安装可用 `--runtime-root <dsh包目录>`，其他预设用
 `--preset <预设id>`。重启 dsh 后生效。宿主仍会在需要压缩时生成临时摘要对话，检查点变化后
 重建工作网页上下文；这不会新建 dsh 会话。网页是否严格遵循摘要输出预算由站点决定。
+
+## 豆包网页通道（可选）
+
+`doubao.enabled=true` 时模型菜单多出「豆包网页版」两个入口：`doubao-web`（半自动）与
+`doubao-web-auto`（全自动）。它与 `deepseek-web`、`glm-web` 并存，不替换任何一个；关闭开关
+就不注册、不启动豆包浏览器。
+
+配置（`cordis.patch.yml` 的插件配置或「设置 → 豆包网页」）：
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `doubao.enabled` | `false` | 是否注册豆包 provider。 |
+| `doubao.url` | `https://www.doubao.com/chat` | 豆包对话页地址。 |
+| `doubao.profileDir` | 空（`%LOCALAPPDATA%\DshDeepSeekWeb\doubao-profile`） | 独立登录 profile；重启后生效。 |
+| `doubao.debugPort` | `9336` | 豆包常驻浏览器的 CDP 端口；重启后生效。 |
+| `doubao.maxSessionPages` | `4` | 同时保留的豆包会话标签页上限。 |
+| `doubao.ackTimeoutMs` | `120000` | 等响应头的上限。 |
+| `doubao.replyTimeoutMs` | `600000` | 等完整响应体的上限。 |
+
+首次使用需在该独立 profile 的豆包窗口登录一次（手机号/扫码）。设置页的「豆包登录态」卡片可只读检测状态、打开豆包浏览器去登录（不自动拉起浏览器）；豆包一期不支持登录态导入/导出。快速/专家模式由用户在豆包
+网页端自行设置，插件不切换、不校验；服务端回执里的 `reply_mode` / `model_item_key` 只写入
+回合 `meta` 供诊断。一期只支持文本与工具调用：图片降级为 `[附图]` 标记，长正文直接填入
+输入框，不做归档联动删除与审核通道。

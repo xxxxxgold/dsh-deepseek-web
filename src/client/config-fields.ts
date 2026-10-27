@@ -24,7 +24,10 @@ export interface FieldText {
 
 /** 设置页的分组 id。 */
 export type FieldGroupId =
+  | 'ui'
   | 'connection'
+  | 'glmweb'
+  | 'doubao'
   | 'model'
   | 'risk'
   | 'image'
@@ -32,6 +35,7 @@ export type FieldGroupId =
   | 'ratelimit'
   | 'notify'
   | 'browserrecovery'
+  | 'archivecleanup'
   | 'probe'
   | 'tools'
   | 'focus'
@@ -63,6 +67,13 @@ export interface FieldSpec {
   readonly restart?: boolean
   /** `select` 的可选值（按原样展示配置枚举值）。 */
   readonly options?: readonly string[]
+  /**
+   * `select` 每个取值的展示文案；缺省时直接展示原始值。
+   *
+   * 枚举值是配置契约（如 `auto` / `zh` / `en`），不适合当界面文案。有了这张表，
+   * 界面可以显示「跟随系统 / Follow system」，而落盘的仍是 `auto`。
+   */
+  readonly optionLabels?: Readonly<Record<string, FieldText>>
   /** `number` 的上下界。 */
   readonly min?: number
   readonly max?: number
@@ -80,11 +91,35 @@ export interface FieldSpec {
 /** 设置页分组，顺序即渲染顺序。 */
 export const GROUPS: readonly FieldGroup[] = [
   {
+    id: 'ui',
+    label: { zh: '界面', en: 'Appearance' },
+    hint: {
+      zh: '界面语言对本插件的两个配置界面同时生效；「跟随系统」按浏览器/系统语言判定，中文显示中文，其余显示英文。',
+      en: 'The interface language applies to both configuration pages of this plugin. “Follow system” reads the browser/OS language: Chinese shows Chinese, everything else shows English.',
+    },
+  },
+  {
     id: 'connection',
     label: { zh: '网页连接', en: 'Web connection' },
     hint: {
       zh: '插件如何打开 DeepSeek 网页版。前两项与 profile 目录在重启 DSH 后生效。',
       en: 'How the plugin opens the DeepSeek web app. The first two and the profile directory apply after a DSH restart.',
+    },
+  },
+  {
+    id: 'glmweb',
+    label: { zh: 'GLM 网页', en: 'GLM web' },
+    hint: {
+      zh: '第二个主模型通道：支持 chatglm.cn 与 chat.z.ai。模型（GLM-5.3 / GLM-5.3-Flash）与思考强度（快速/深度/极致）在 DSH 模型菜单里选；这里只配浏览器入口。',
+      en: 'A second main-model channel for chatglm.cn and chat.z.ai. Pick the model (GLM-5.3 / GLM-5.3-Flash) and thinking effort (fast / deep / ultra) in the DSH model menu; this section only configures the browser entry.',
+    },
+  },
+  {
+    id: 'doubao',
+    label: { zh: '豆包网页', en: 'Doubao web' },
+    hint: {
+      zh: '第二个网页模型通道，与现有 DeepSeek 通道并存：使用独立浏览器 profile，登录豆包账号后可用。快速/专家模式请在豆包网页端自行设置，插件不干预。关闭时不影响 DeepSeek 通道。',
+      en: 'A second web-model channel coexisting with DeepSeek: its own browser profile, sign in to Doubao once. Set Fast/Expert in the Doubao web app yourself; the plugin does not change it. Turning it off leaves DeepSeek untouched.',
     },
   },
   {
@@ -115,8 +150,8 @@ export const GROUPS: readonly FieldGroup[] = [
     id: 'review',
     label: { zh: '审核通道', en: 'Review channel' },
     hint: {
-      zh: '交付前用第二个模型复核结果；关闭后行为与只用 DeepSeek 完全一致。',
-      en: 'A second model reviews the result before delivery; disabling it restores plain DeepSeek behavior.',
+      zh: '交付前用第二个模型复核结果。网页模型可在模型菜单的「推理等级」里选审核关 / 跟随设置 / 审核开；`review.enabled` 是「跟随设置」的默认值，显式选了「审核开」的会话仍会审核。',
+      en: 'A second model reviews the result before delivery. For web models, switch Review off / Follow settings / Review on under “Effort” in the model menu; `review.enabled` is the default for “Follow settings”, while sessions explicitly set to Review on still review.',
     },
   },
   {
@@ -152,6 +187,14 @@ export const GROUPS: readonly FieldGroup[] = [
     },
   },
   {
+    id: 'archivecleanup',
+    label: { zh: '归档清理', en: 'Archive cleanup' },
+    hint: {
+      zh: 'DSH 会话归档时，是否把它在 DeepSeek 网页端产生过的对话一起删掉。只影响归档动作之后新产生的绑定；历史会话没有网页对话 id，只能在下方统计里看到「无绑定」。',
+      en: 'Whether archiving a DSH session also deletes the DeepSeek web chats it produced. Only bindings recorded after this feature ships are affected; older sessions have no chat ids and only show up as “unbound” in the stats below.',
+    },
+  },
+  {
     id: 'tools',
     label: { zh: '工具与委托', en: 'Tools and delegation' },
     hint: {
@@ -181,6 +224,22 @@ export const GROUPS: readonly FieldGroup[] = [
  * 未在此列出的字段仍可通过 profile 的 `cordis.patch.yml` 覆盖。
  */
 export const FIELDS: readonly FieldSpec[] = [
+  {
+    path: ['uiLanguage'],
+    group: 'ui',
+    kind: 'select',
+    label: { zh: '界面语言', en: 'Interface language' },
+    options: ['auto', 'zh', 'en'],
+    optionLabels: {
+      auto: { zh: '跟随系统', en: 'Follow system' },
+      zh: { zh: '中文', en: 'Chinese' },
+      en: { zh: 'English', en: 'English' },
+    },
+    hint: {
+      zh: 'auto 跟随系统语言；手动选定后以设置为准，两个配置界面同时切换。',
+      en: 'auto follows the system language. Once you pick one, that choice wins and both configuration pages switch together.',
+    },
+  },
   {
     path: ['url'],
     group: 'connection',
@@ -314,6 +373,30 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: {
       zh: '新标签页或新会话重建上下文时，允许回放的历史正文字符上限，默认 400000。调大不是「越安全」：网页输入框填字代价接近二次方，30 万字符约 13 秒、60 万约 77 秒。0 = 不限制。',
       en: 'Character budget for replaying history when a tab or conversation is rebuilt; default 400000. Bigger is not safer: filling the page composer scales near-quadratically (300k chars ≈ 13s, 600k ≈ 77s). 0 = unlimited.',
+    },
+  },
+  {
+    path: ['contextWindow'],
+    group: 'model',
+    kind: 'number',
+    label: { zh: '上下文窗口（token）', en: 'Context window (tokens)' },
+    min: 8_000,
+    max: 4_000_000,
+    hint: {
+      zh: '上报给宿主的上下文窗口，默认 1000000。实测附件通道下中文约 154 万字符、英文约 400 万字符可完整读入（约 100 万 token），超限时网页静默丢弃尾部。调大后压缩更晚，长会话更容易踩到网页侧截断。保存后下一轮请求生效。',
+      en: 'Context window reported to the host; default 1000000. Measured: ~1.54M Chinese or ~4M English characters read in full (~1M tokens); beyond that the page silently drops the tail. Raising it delays compaction, so long sessions more easily hit page-side truncation.',
+    },
+  },
+  {
+    path: ['maxTokens'],
+    group: 'model',
+    kind: 'number',
+    label: { zh: '单次输出上限（token）', en: 'Max output tokens' },
+    min: 256,
+    max: 1_000_000,
+    hint: {
+      zh: '上报给宿主的单次输出上限，默认 300000。网页实际会自然收尾（实测约 8400 字符），该值主要影响宿主预算与压缩阈值：min(上下文 × 0.8, 上下文 − 本值 − 65536)。必须满足「本值 + 65536 < 上下文窗口」，否则宿主的自动压缩会被拒绝执行。保存后下一轮请求生效。',
+      en: 'Max output tokens reported to the host; default 300000. The page stops on its own (measured ~8.4k characters), so this mainly drives host budgeting and the compaction threshold: min(context × 0.8, context − this − 65536).',
     },
   },
   {
@@ -475,8 +558,11 @@ export const FIELDS: readonly FieldSpec[] = [
     path: ['review', 'enabled'],
     group: 'review',
     kind: 'boolean',
-    label: { zh: '启用审核', en: 'Enable review' },
-    hint: { zh: '中间工具轮次不审，只在交付前审最终正文。', en: 'Intermediate tool turns are not reviewed; only the final text before delivery.' },
+    label: { zh: '默认开启审核', en: 'Enable review by default' },
+    hint: {
+      zh: '「跟随设置」档位使用这个值；中间工具轮次不审，只在交付前审最终正文。',
+      en: 'Used by the “Follow settings” effort level; intermediate tool turns are not reviewed, only the final text before delivery.',
+    },
   },
   {
     path: ['review', 'provider'],
@@ -538,6 +624,39 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: {
       zh: 'GLM 审核新标签页要打开的链接，默认 https://chat.z.ai/。',
       en: 'The link opened for GLM review, default https://chat.z.ai/.',
+    },
+  },
+  {
+    path: ['review', 'glmModel'],
+    group: 'review',
+    kind: 'select',
+    label: { zh: 'GLM 审核模型', en: 'GLM review model' },
+    options: ['glm-5.3', 'glm-5.3-flash'],
+    optionLabels: {
+      'glm-5.3': { zh: 'GLM-5.3（旗舰）', en: 'GLM-5.3 (flagship)' },
+      'glm-5.3-flash': { zh: 'GLM-5.3-Flash（更快）', en: 'GLM-5.3-Flash (faster)' },
+    },
+    visibleWhen: { path: ['review', 'provider'], equals: 'glm' },
+    hint: {
+      zh: '审核用的 GLM 模型。默认旗舰 GLM-5.3；追求速度可选 Flash。',
+      en: 'GLM model used for review. Defaults to the flagship GLM-5.3; pick Flash for speed.',
+    },
+  },
+  {
+    path: ['review', 'glmEffort'],
+    group: 'review',
+    kind: 'select',
+    label: { zh: 'GLM 审核思考强度', en: 'GLM review thinking effort' },
+    options: ['low', 'high', 'max'],
+    optionLabels: {
+      low: { zh: '快速', en: 'Fast' },
+      high: { zh: '深度', en: 'Deep' },
+      max: { zh: '极致', en: 'Ultra' },
+    },
+    visibleWhen: { path: ['review', 'provider'], equals: 'glm' },
+    hint: {
+      zh: '每次审核前插件会在 GLM 页面自动切换并校验；极致最慢但审得最深。',
+      en: 'The plugin switches and verifies this on the GLM page before each review; Ultra is slowest but most thorough.',
     },
   },
   {
@@ -817,6 +936,27 @@ export const FIELDS: readonly FieldSpec[] = [
   },
 
   {
+    path: ['archiveCleanup', 'deleteOnArchive'],
+    group: 'archivecleanup',
+    kind: 'boolean',
+    label: { zh: '归档时删除网页端对话', en: 'Delete web chats on archive' },
+    hint: {
+      zh: '默认开。归档一个 DSH 会话时，把它在网页端产生过的对话一并删除；关掉后只归档，网页端保留，统计里会记为「待清理」。',
+      en: 'On by default. Archiving a DSH session also deletes the web chats it produced; when off, the web chats stay and show up as pending in the stats.',
+    },
+  },
+  {
+    path: ['archiveCleanup', 'includeRotatedChats'],
+    group: 'archivecleanup',
+    kind: 'boolean',
+    label: { zh: '连轮换产生的旧对话一起删', en: 'Include rotated chats' },
+    hint: {
+      zh: '默认开。一个会话可能因上下文超限轮换出多条网页对话；关掉后只删最后一条，旧的会留在网页端。',
+      en: 'On by default. One session may rotate through several web chats when the context fills up; when off, only the newest is deleted.',
+    },
+  },
+
+  {
     path: ['toolAllowlist'],
     group: 'tools',
     kind: 'list',
@@ -882,6 +1022,10 @@ export const FIELDS: readonly FieldSpec[] = [
     group: 'focus',
     kind: 'boolean',
     label: { zh: '自动聚焦总开关', en: 'Auto focus' },
+    hint: {
+      zh: '关掉后：首次拉起浏览器会最小化到任务栏，填字时也不抢前台；只有需要登录时才自动还原窗口。',
+      en: 'Off: the browser launches minimized and is never raised while filling; it is restored only when you need to log in.',
+    },
   },
   {
     path: ['focus', 'webWindow'],
@@ -906,6 +1050,128 @@ export const FIELDS: readonly FieldSpec[] = [
       zh: 'task 跟随任务语言；host 保留宿主要求；zh 中文；en 英文。',
       en: 'task follows the task language; host keeps the host request; zh Chinese; en English.',
     },
+  },
+
+  {
+    path: ['glmWeb', 'url'],
+    group: 'glmweb',
+    kind: 'text',
+    restart: true,
+    label: { zh: 'GLM 入口地址', en: 'GLM entry URL' },
+    hint: {
+      zh: '支持 chatglm.cn 与 chat.z.ai（含中国站 zchat.z.ai），插件按域名识别站点。改完重启 DSH 生效。',
+      en: 'chatglm.cn and chat.z.ai (including zchat.z.ai) are supported; the site is detected by hostname. Restart DSH after changing it.',
+    },
+  },
+  {
+    path: ['glmWeb', 'debugPort'],
+    group: 'glmweb',
+    kind: 'number',
+    restart: true,
+    min: 1024,
+    max: 65535,
+    label: { zh: 'GLM 浏览器端口', en: 'GLM browser port' },
+    hint: {
+      zh: '常驻 GLM 主通道浏览器的 CDP 端口，默认 9337（与审核 9335、豆包 9336 错开）。',
+      en: 'CDP port of the resident GLM main-channel browser; 9337 by default (review uses 9335, Doubao 9336).',
+    },
+  },
+  {
+    path: ['glmWeb', 'profileDir'],
+    group: 'glmweb',
+    kind: 'text',
+    restart: true,
+    label: { zh: 'GLM profile 目录', en: 'GLM profile directory' },
+    hint: {
+      zh: '留空使用 %LOCALAPPDATA%\\DshDeepSeekWeb\\glm-web-profile；首次需在该窗口登录。',
+      en: 'Empty uses %LOCALAPPDATA%\\DshDeepSeekWeb\\glm-web-profile. Sign in once in that window.',
+    },
+  },
+  {
+    path: ['glmWeb', 'autoSend'],
+    group: 'glmweb',
+    kind: 'boolean',
+    label: { zh: 'GLM 自动发送', en: 'GLM auto-send' },
+    hint: {
+      zh: '开启后填入即回车并确认发送（agent 链路必需）；关闭则每轮等你在网页点发送。',
+      en: 'On: fill, press Enter and confirm the send (needed for agent loops). Off: wait for you to click Send each turn.',
+    },
+  },
+  {
+    path: ['glmWeb', 'ackTimeoutMs'],
+    group: 'glmweb',
+    kind: 'number',
+    restart: true,
+    min: 10_000,
+    max: 1_800_000,
+    label: { zh: '首响应等待（毫秒）', en: 'First-response timeout (ms)' },
+    hint: {
+      zh: '发送确认后等网页响应头的上限，默认 900000（15 分钟）。GLM 极致档位长任务实测可达 9 分钟以上；审核通道不受此值影响。',
+      en: 'How long to wait for response headers after a confirmed send; defaults to 900000 (15 min). Ultra-effort long tasks can exceed 9 minutes in practice; the review channel is unaffected.',
+    },
+  },
+  {
+    path: ['doubao', 'enabled'],
+    group: 'doubao',
+    kind: 'boolean',
+    label: { zh: '启用豆包网页通道', en: 'Enable Doubao web channel' },
+    hint: {
+      zh: '开启后模型列表出现 doubao-web / doubao-web-auto；关闭时不注册、不启动豆包浏览器。',
+      en: 'On: doubao-web and doubao-web-auto appear in the model list. Off: no provider and no Doubao browser.',
+    },
+  },
+  {
+    path: ['doubao', 'url'],
+    group: 'doubao',
+    kind: 'text',
+    label: { zh: '豆包对话页地址', en: 'Doubao chat URL' },
+    hint: { zh: '默认 https://www.doubao.com/chat。', en: 'Defaults to https://www.doubao.com/chat.' },
+  },
+  {
+    path: ['doubao', 'profileDir'],
+    group: 'doubao',
+    kind: 'text',
+    restart: true,
+    label: { zh: '豆包独立 profile 目录', en: 'Doubao profile directory' },
+    hint: {
+      zh: '留空使用 %LOCALAPPDATA%\\DshDeepSeekWeb\\doubao-profile。登录态只保存在这个目录。',
+      en: 'Empty means %LOCALAPPDATA%\\DshDeepSeekWeb\\doubao-profile. The login lives only in this directory.',
+    },
+  },
+  {
+    path: ['doubao', 'debugPort'],
+    group: 'doubao',
+    kind: 'number',
+    min: 1024,
+    max: 65535,
+    restart: true,
+    label: { zh: '豆包浏览器 CDP 端口', en: 'Doubao CDP port' },
+    hint: { zh: '与 DeepSeek 通道分开，默认 9336。', en: 'Separate from the DeepSeek channel; default 9336.' },
+  },
+  {
+    path: ['doubao', 'maxSessionPages'],
+    group: 'doubao',
+    kind: 'number',
+    min: 1,
+    max: 16,
+    label: { zh: '豆包会话标签页上限', en: 'Doubao session tab limit' },
+    hint: { zh: '默认 4；超出时回收最久未用的会话页。', en: 'Default 4; the least-recently-used session page is recycled.' },
+  },
+  {
+    path: ['doubao', 'ackTimeoutMs'],
+    group: 'doubao',
+    kind: 'number',
+    min: 5000,
+    label: { zh: '豆包响应头超时（毫秒）', en: 'Doubao ack timeout (ms)' },
+    hint: { zh: '默认 120000。', en: 'Default 120000.' },
+  },
+  {
+    path: ['doubao', 'replyTimeoutMs'],
+    group: 'doubao',
+    kind: 'number',
+    min: 10000,
+    label: { zh: '豆包完整回复超时（毫秒）', en: 'Doubao reply timeout (ms)' },
+    hint: { zh: '默认 600000。', en: 'Default 600000.' },
   },
 ]
 

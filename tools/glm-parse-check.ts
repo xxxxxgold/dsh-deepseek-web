@@ -9,7 +9,7 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { parseGlmCompletion } from '../src/glm-channel.ts'
+import { matchesChatglmStream, matchesGlmCompletion, parseGlmChatglmStream, parseGlmCompletion } from '../src/glm-channel.ts'
 
 const dir = path.join(process.env.LOCALAPPDATA ?? '', 'DshDeepSeekWeb', 'calibration')
 const samples = (() => {
@@ -84,3 +84,41 @@ if (samples.length > 0) {
   }
   console.log('OK（合成样本 + 空解析保护）')
 }
+
+// —— chatglm.cn：消息快照协议 ——
+// 2026-10 实测：`assistant/stream` 的 data 是整条消息快照，`type=text` 会重复出现全文，
+// `type=think` 是增量片段，`type=tool_calls` 是站点内部 finish。
+const chatglmStream = [
+  'data:  {"id":"a","conversation_id":"c","parts":[{"content":[{"type":"think","think":"先分析"}]}],"status":"init"}',
+  'data:  {"id":"a","conversation_id":"c","parts":[{"content":[{"type":"think","think":"再回答"}]}],"status":"init"}',
+  'data:  {"id":"a","conversation_id":"c","parts":[{"content":[{"type":"tool_calls","tool_calls":{"name":"finish","arguments":"{}"}}]}],"status":"init"}',
+  'data:  {"id":"a","conversation_id":"c","parts":[{"content":[{"type":"text","text":"链路正常"}]}],"status":"init"}',
+  'data:  {"id":"a","conversation_id":"c","parts":[{"content":[{"type":"text","text":"链路正常"}]}],"status":"finish"}',
+  '',
+].join('\n')
+const parsedChatglm = parseGlmChatglmStream(chatglmStream)
+console.log('[chatglm]', JSON.stringify(parsedChatglm))
+if (parsedChatglm.text !== '链路正常' || parsedChatglm.reasoning !== '先分析再回答') {
+  console.error('FAIL: chatglm 快照解析错误（正文应取最后快照、think 应增量拼接）')
+  process.exit(1)
+}
+if (parsedChatglm.text.includes('finish') || parsedChatglm.text.includes('先分析')) {
+  console.error('FAIL: chatglm 正文混入了 tool_calls 或思考内容')
+  process.exit(1)
+}
+console.log('OK（chatglm 快照协议）')
+
+// —— 响应 URL 匹配：两个站点不能互相误判，否则监听挂错地址会一直等到超时 ——
+const urlCases: ReadonlyArray<readonly [boolean, boolean, string]> = [
+  [true, false, 'https://chatglm.cn/chatglm/backend-api/assistant/stream'],
+  [false, false, 'https://chatglm.cn/chatglm/mainchat-api/stream/update_status'],
+  [false, true, 'https://chat.z.ai/api/v1/chat/completions'],
+  [false, false, 'https://chat.z.ai/api/v1/models'],
+]
+for (const [chatglmHit, zaiHit, url] of urlCases) {
+  if (matchesChatglmStream(url) !== chatglmHit || matchesGlmCompletion(url) !== zaiHit) {
+    console.error(`FAIL: URL 匹配错误 ${url}（chatglm=${matchesChatglmStream(url)} zai=${matchesGlmCompletion(url)}）`)
+    process.exit(1)
+  }
+}
+console.log('OK（chatglm / z.ai 响应 URL 匹配）')

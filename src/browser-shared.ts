@@ -6,7 +6,8 @@
 
 import { chromium, type Browser, type BrowserContext, type Locator, type Page } from 'playwright-core'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -311,10 +312,15 @@ export async function markServerBusyToastsSeen(page: Page): Promise<number> {
 /** 同一 frame 上另一次导航接管时的报错文案；浏览器启动页/崩溃恢复期很常见。 */
 const NAVIGATION_INTERRUPTED = /interrupted by another navigation|net::ERR_ABORTED/i
 
-export async function ensureChatPage(page: Page, url: string): Promise<void> {
+export async function ensureChatPage(
+  page: Page,
+  url: string,
+  options: { activate?: boolean } = {},
+): Promise<void> {
   const current = page.url()
   if (current.startsWith(new URL(url).origin)) {
-    await page.bringToFront()
+    // 关掉聚焦开关后不能再激活窗口：最小化启动的窗口会被这一句直接拉回前台。
+    if (options.activate !== false) await page.bringToFront()
     return
   }
   // 浏览器启动器或崩溃恢复会在这个标签上继续自己的导航（典型是 Edge 的
@@ -358,20 +364,12 @@ export async function looksLoggedOut(page: Page, markers: readonly string[] = ['
  * 找不到发送控件时返回 false（例如只认回车的站点），不误判正常页面。
  */
 export async function looksSendBlocked(page: Page): Promise<boolean> {
-  const control = page.locator([
-    'button[class*="sendMessage" i]',
-    'button[aria-label*="发送"]',
-    'button[aria-label*="send" i]',
-    'button[title*="发送"]',
-    'button[title*="send" i]',
-    '[role="button"][aria-label*="发送"]',
-    '[role="button"][aria-label*="send" i]',
-  ].join(', ')).first()
+  // 与发送兜底共用同一套候选：DeepSeek 的按钮没有语义属性，只认 <button> /
+  // aria-label 会让登录墙判定在这类站点上永远返回 false。
+  const control = locateSendButton(page)
   if ((await control.count().catch(() => 0)) === 0) return false
   if (!(await control.isVisible().catch(() => false))) return false
-  return await control.evaluate(element => element.hasAttribute('disabled')
-    || element.getAttribute('aria-disabled') === 'true'
-    || /(^|[\s_-])disabled([\s_-]|$)/i.test(element.className)).catch(() => false)
+  return !(await isSendButtonEnabled(control))
 }
 
 /**
@@ -443,7 +441,14 @@ export function ensureFreshChatUrl(raw: string, param = 'chat_enter_method=new_c
   }
 }
 
-/** 发送按钮候选选择器（点击发送的兜底路径，与 looksSendBlocked 共用语义）。 */
+/**
+ * 发送按钮候选选择器（点击发送的兜底路径，与 looksSendBlocked 共用语义）。
+ *
+ * 最后两条是 DeepSeek 2026-10 改版后的真实结构：
+ * `<div role="button" class="ds-button ds-button--primary ds-button--filled ds-button--circle">`，
+ * 没有 aria-label / title / data-testid，也不是 `<button>`。旧候选对它 0 命中，
+ * 于是「按钮兜底」长期形同虚设——这是 WEB_SEND_NOT_TRIGGERED 的直接原因。
+ */
 export const SEND_BUTTON_CANDIDATES = [
   'button[class*="sendMessage" i]',
   'button[aria-label*="发送"]',
@@ -453,11 +458,56 @@ export const SEND_BUTTON_CANDIDATES = [
   '[role="button"][aria-label*="发送"]',
   '[role="button"][aria-label*="send" i]',
   '[data-testid*="send" i]',
+  'div[role="button"][class*="ds-button--primary"][class*="ds-button--circle"]',
+  'div[role="button"][class*="ds-button--primary"]',
 ]
 
 /** 定位发送按钮（不可用/不存在时返回未命中的 locator）。 */
 export function locateSendButton(page: Page): Locator {
   return page.locator(SEND_BUTTON_CANDIDATES.join(', ')).first()
+}
+
+/**
+ * 发送按钮当前是否可点击。
+ *
+ * 不能只看 `disabled` / `aria-disabled`：DeepSeek 用 `opacity: 0.4` 表达禁用，
+ * 两个属性都不存在。若只判属性，会把禁用态当成可点，点下去毫无反应，
+ * 最终仍然报「发送失败」却查不到原因。
+ */
+export async function isSendButtonEnabled(button: Locator): Promise<boolean> {
+  return await button.evaluate((element) => {
+    const node = element as HTMLElement
+    if (node.hasAttribute('disabled')) return false
+    if (node.getAttribute('aria-disabled') === 'true') return false
+    if (/(^|[\s_-])disabled([\s_-]|$)/i.test(String(node.className ?? ''))) return false
+    const style = getComputedStyle(node)
+    if (style.pointerEvents === 'none') return false
+    const opacity = Number(style.opacity)
+    if (Number.isFinite(opacity) && opacity < 0.5) return false
+    return true
+  }).catch(() => false)
+}
+
+/**
+ * 页面是否仍在生成回复。
+ *
+ * DeepSeek 把「发送」和「停止生成」合并在同一个按钮上：生成中按钮换成方块图标
+ * （SVG path 以 `M2 4.88` 开头），空闲/可发送时是向上箭头（`M8.3125` 开头），
+ * 且两种状态 opacity 都是 1，无法只靠透明度区分。误点这个按钮会中断上一轮，
+ * 所以发送前必须先认出来。
+ */
+export async function looksGenerating(page: Page): Promise<boolean> {
+  return await page.evaluate(() => {
+    const button = document.querySelector(
+      'div[role="button"][class*="ds-button--primary"][class*="ds-button--circle"]',
+    )
+    if (!button) return false
+    const label = `${button.getAttribute('aria-label') ?? ''} ${button.getAttribute('title') ?? ''}`
+    if (/停止|stop/i.test(label)) return true
+    const d = button.querySelector('svg path')?.getAttribute('d') ?? ''
+    // 方块（停止）图标的 path 起点；箭头（发送）是 M8.3125 0.980206…
+    return d.startsWith('M2 4.88')
+  }).catch(() => false)
 }
 
 /**
@@ -497,6 +547,13 @@ export interface SendEditorMessageOptions {
   hasResponse?: () => boolean
   /** 该回合是否已被取消；取消后不再继续尝试发送。 */
   isCancelled?: () => boolean
+  /** 页面仍在生成时的最长等待（毫秒）；0 = 不等待。默认 15000。 */
+  generatingWaitMs?: number
+  /**
+   * 自定义发送控件；缺省用 DeepSeek 的通用候选。
+   * 豆包这类站点把发送做成无 aria 的圆角 div，必须由通道自己传定位器。
+   */
+  sendButton?: Locator
 }
 
 /**
@@ -532,6 +589,7 @@ export async function sendEditorMessage(
   const pauseMaxMs = finiteInt(options.pauseMaxMs, pauseMinMs, pauseMinMs, 5_000)
   const isCancelled = options.isCancelled ?? (() => false)
   const hasResponse = options.hasResponse ?? (() => false)
+  const generatingWaitMs = finiteInt(options.generatingWaitMs, 15_000, 0, 120_000)
   const attempts: string[] = []
 
   const before = await readEditorText(editor)
@@ -560,8 +618,31 @@ export async function sendEditorMessage(
     await page.waitForTimeout(delay)
   }
 
+  /**
+   * 页面还在生成时，回车会被前端忽略，发送按钮也变成了「停止生成」——
+   * 这两种情况下硬发都只会失败，点按钮还会把上一轮中断。先等它结束，
+   * 最多 `generatingWaitMs`；仍不结束就记一条，交给后续尝试并如实上报。
+   */
+  const waitGenerationDone = async (attempt: number): Promise<void> => {
+    if (generatingWaitMs <= 0) return
+    if (!(await looksGenerating(page))) return
+    const startedAt = Date.now()
+    const deadline = startedAt + generatingWaitMs
+    while (Date.now() < deadline) {
+      if (isCancelled()) return
+      await page.waitForTimeout(250)
+      if (!(await looksGenerating(page))) {
+        attempts.push(`第 ${attempt} 轮：等待 ${Math.round((Date.now() - startedAt) / 1000)}s 后上一轮生成结束`)
+        return
+      }
+    }
+    attempts.push(`第 ${attempt} 轮：页面仍在生成（已等待 ${Math.round(generatingWaitMs / 1000)}s）`)
+  }
+
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     if (isCancelled()) break
+
+    await waitGenerationDone(attempt)
 
     // 路径一：回车。先聚焦，确保按键落到输入框而不是页面其它元素。
     await editor.focus().catch(() => {})
@@ -573,11 +654,10 @@ export async function sendEditorMessage(
 
     // 路径二：点发送按钮。回车被当成“换行”或焦点丢失时，这一步是主要兜底。
     if (isCancelled()) break
-    const button = locateSendButton(page)
+    const button = options.sendButton ?? locateSendButton(page)
     const visible = await button.isVisible().catch(() => false)
     if (visible) {
-      const enabled = await button.evaluate(element => !element.hasAttribute('disabled')
-        && element.getAttribute('aria-disabled') !== 'true').catch(() => false)
+      const enabled = await isSendButtonEnabled(button)
       if (enabled) {
         const clicked = await button.click({ timeout: 3_000 }).then(() => true).catch(() => false)
         attempts.push(`第 ${attempt} 轮点发送按钮：${clicked ? '已点击' : '点击失败'}`)
@@ -590,6 +670,12 @@ export async function sendEditorMessage(
     }
   }
 
+  // 失败现场：把「输入框还剩多少字、发送控件是否命中、页面是否仍在生成」
+  // 一次性写进错误信息，避免下次只能靠猜。
+  const remaining = (await readEditorText(editor).catch(() => before)).length
+  const hits = await (options.sendButton ?? locateSendButton(page)).count().catch(() => 0)
+  const generating = await looksGenerating(page)
+  attempts.push(`诊断：输入框剩 ${remaining} 字；发送控件命中 ${hits} 个；生成中 ${generating ? '是' : '否'}`)
   return { sent: false, via: 'none', attempts }
 }
 
@@ -727,11 +813,68 @@ export function spawnKeeper(options: { profileDir: string; port: number; url: st
   }).unref()
 }
 
+/**
+ * managed 浏览器端点记录。
+ *
+ * 背景：宿主的生命周期比浏览器短——`dsh headless` 退出、桌面版重启、或宿主崩溃后，
+ * 插件托管的 Edge/Chrome 仍会留在桌面上。下一次启动若照旧 `findAvailablePort` +
+ * `spawn`，Chromium 的单实例机制会把新进程交给已有实例，新端口永远等不到 CDP，
+ * 60 秒后才报 BROWSER_MANAGED_START_FAILED 并把浏览器全杀一遍。
+ *
+ * 这里把「上一次实际使用的 CDP 端口」按 profile 落盘，启动前先尝试连它：
+ * 连上就复用（不新开窗口），连不上再按原逻辑启动。文件只是提示，读写失败一律忽略。
+ */
+export interface ManagedBrowserEndpoint {
+  /** 上一次 managed 浏览器实际使用的 CDP 端口。 */
+  port: number
+  /** 启动器进程 pid；仅用于诊断（Edge 可能把窗口交给子进程）。 */
+  pid?: number
+  /** 写入时间，ISO 8601。 */
+  at: string
+}
+
+/** 端点文件名：profile 路径哈希，避免不同 profile 互相串。 */
+export function managedEndpointFile(profileDir: string): string {
+  const key = createHash('sha256').update(path.resolve(profileDir).toLowerCase()).digest('hex').slice(0, 12)
+  return path.join(path.dirname(path.resolve(profileDir)), `.managed-browser-${key}.json`)
+}
+
+export function readManagedEndpoint(profileDir: string): ManagedBrowserEndpoint | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(managedEndpointFile(profileDir), 'utf8')) as Partial<ManagedBrowserEndpoint>
+    if (typeof parsed.port !== 'number' || !Number.isInteger(parsed.port)) return undefined
+    if (parsed.port < 1024 || parsed.port > 65535) return undefined
+    return {
+      port: parsed.port,
+      pid: typeof parsed.pid === 'number' ? parsed.pid : undefined,
+      at: typeof parsed.at === 'string' ? parsed.at : '',
+    }
+  } catch {
+    return undefined
+  }
+}
+
+export function writeManagedEndpoint(profileDir: string, endpoint: ManagedBrowserEndpoint): void {
+  try {
+    writeFileSync(managedEndpointFile(profileDir), JSON.stringify(endpoint), 'utf8')
+  } catch {
+    // 只是加速复用的提示文件，写不了就退回“每次新起一个”的老路。
+  }
+}
+
+export function clearManagedEndpoint(profileDir: string): void {
+  try {
+    rmSync(managedEndpointFile(profileDir), { force: true })
+  } catch {
+    // 同上：清理失败不影响启动。
+  }
+}
+
 export interface ManagedBrowserConnection {
   browser: Browser
   context: BrowserContext
-  /** 浏览器启动器句柄；Edge/Chrome 可能在启动后把窗口交给子进程。 */
-  process: ChildProcess
+  /** 浏览器启动器句柄；Edge/Chrome 可能在启动后把窗口交给子进程。复用已有浏览器时不存在。 */
+  process?: ChildProcess
   /** 实际分配给本次 managed 浏览器的 CDP 端口。 */
   port: number
 }
@@ -789,18 +932,132 @@ async function findAvailablePort(preferredPort: number): Promise<number> {
 }
 
 /**
+ * 最小化启动时页面处于 hidden，Chromium 会节流定时器、把被遮挡窗口降优先级。
+ * 这三条只关节流，不改 UA 与指纹，避免「后台等回复」被拖慢。
+ */
+const BACKGROUND_KEEPALIVE_ARGS = [
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-renderer-backgrounding',
+]
+
+/** PowerShell 单引号字符串转义：值里的单引号写成两个。 */
+function psQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`
+}
+
+/**
+ * 用 `-EncodedCommand` 跑 PowerShell。
+ *
+ * 新脚本里带 C# here-string 和大量双引号，走 `-Command` 会被 Windows 命令行的
+ * 引号转义规则截断（老函数一直这么写只是运气好）；UTF-16LE base64 不经过命令行解析。
+ */
+function spawnPowerShell(script: string): ChildProcess {
+  const encoded = Buffer.from(script, 'utf16le').toString('base64')
+  return spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  })
+}
+
+/**
+ * 用 `Start-Process -WindowStyle Minimized` 拉起浏览器，避免新窗口抢前台。
+ *
+ * 为什么不用 spawn：Node 没有「指定 nCmdShow」的入口，`windowsHide` 只影响控制台窗口，
+ * Chromium 建 GUI 窗口时会自己 ShowWindow，于是必然抢一次前台。本机实测
+ * `Start-Process -WindowStyle Minimized` 拉起 Edge 后 `IsIconic=TRUE` 且前台窗口不变；
+ * 而 `--start-minimized` 参数实测无效（窗口仍是普通大小）。
+ *
+ * 返回 undefined 表示 PowerShell 起不来或退出码非 0，调用方回退普通 spawn。
+ */
+async function spawnBrowserMinimized(
+  executable: string,
+  args: readonly string[],
+): Promise<ChildProcess | undefined> {
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    `$exe = [string](ConvertFrom-Json ${psQuote(JSON.stringify(executable))})`,
+    `$raw = ConvertFrom-Json ${psQuote(JSON.stringify(args))}`,
+    // Windows PowerShell 5.1 的 ConvertFrom-Json 把 JSON 数组当**单个对象**返回，
+    // 直接 `@(...)` 只会得到 1 个元素（整个数组被拼成一行）。必须 foreach 逐项摊开。
+    // 另外 Start-Process 不会替我们给含空格的参数补引号（同样是 5.1 的行为）。
+    '$argv = @()',
+    "foreach ($a in $raw) { $s = [string]$a; if ($s -match '\\s') { $argv += '\"' + $s + '\"' } else { $argv += $s } }",
+    'Start-Process -FilePath $exe -ArgumentList $argv -WindowStyle Minimized',
+    "Write-Output '1'",
+  ].join('\n')
+  return await new Promise<ChildProcess | undefined>(resolve => {
+    const child = spawnPowerShell(script)
+    let out = ''
+    child.stdout?.on('data', chunk => { out += String(chunk) })
+    const timer = setTimeout(() => {
+      child.kill()
+      console.warn('[deepseek-web] 最小化启动超时，回退普通启动。')
+      resolve(undefined)
+    }, 8_000)
+    child.on('error', error => {
+      clearTimeout(timer)
+      console.warn('[deepseek-web] 无法启动 powershell.exe，回退普通启动：', error.message)
+      resolve(undefined)
+    })
+    child.on('close', code => {
+      clearTimeout(timer)
+      if (code === 0 && out.trim().endsWith('1')) {
+        resolve(child)
+        return
+      }
+      console.warn(`[deepseek-web] 最小化启动失败（exit=${code}），回退普通启动。`)
+      resolve(undefined)
+    })
+  })
+}
+
+/**
  * 启动插件自有的真实 Edge/Chrome，再通过 CDP 连接。
  *
  * 这里刻意不使用 Playwright 的 launchPersistentContext：直接启动用户安装的
  * 浏览器可以避免 Playwright 自动注入的启动参数，同时仍保留独立 profile 和
  * 可控的浏览器生命周期。
  */
+/** 尝试复用同一 profile 上仍在运行的 managed 浏览器；连不上返回 undefined。 */
+export async function reuseManagedBrowser(options: {
+  profileDir: string
+  url: string
+  label: string
+}): Promise<ManagedBrowserConnection | undefined> {
+  const saved = readManagedEndpoint(options.profileDir)
+  if (!saved) return undefined
+  try {
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${saved.port}`, { timeout: 3_000 })
+    const context = browser.contexts()[0]
+    if (!context) {
+      await browser.close().catch(() => {})
+      return undefined
+    }
+    // 防止端口被别的调试程序占用：至少得有一个本插件目标站或空白页。
+    const origin = new URL(options.url).origin
+    const ours = context.pages().some(page => page.url().startsWith(origin) || page.url() === 'about:blank')
+    if (!ours) {
+      await browser.close().catch(() => {})
+      clearManagedEndpoint(options.profileDir)
+      return undefined
+    }
+    console.info(`[deepseek-web] ${options.label}: 复用已在运行的浏览器（CDP ${saved.port}）`)
+    return { browser, context, port: saved.port }
+  } catch {
+    clearManagedEndpoint(options.profileDir)
+    return undefined
+  }
+}
+
 export async function launchManagedBrowser(options: {
   channel: 'msedge' | 'chrome'
   profileDir: string
   preferredPort: number
   url: string
   label: string
+  /** true = 以最小化方式启动，不让新窗口抢到前台（仅 Windows 生效）。 */
+  minimized?: boolean
 }): Promise<ManagedBrowserConnection> {
   const executable = resolveBrowserExecutable(options.channel)
   if (!executable) {
@@ -809,7 +1066,12 @@ export async function launchManagedBrowser(options: {
       'BROWSER_NOT_FOUND',
     )
   }
+  // 先复用同 profile 的已运行浏览器：宿主退出后浏览器可能还开着，
+  // 直接再 spawn 一个会被 Chromium 单实例接管，CDP 永远不就绪。
+  const reused = await reuseManagedBrowser(options)
+  if (reused) return reused
   const port = await findAvailablePort(options.preferredPort)
+  const minimized = options.minimized === true && process.platform === 'win32'
   const args = [
     `--user-data-dir=${options.profileDir}`,
     '--no-first-run',
@@ -817,6 +1079,7 @@ export async function launchManagedBrowser(options: {
     '--remote-debugging-address=127.0.0.1',
     `--remote-debugging-port=${port}`,
     ...(options.channel === 'msedge' ? ['--disable-features=msEdgeSidebarV2'] : []),
+    ...(minimized ? BACKGROUND_KEEPALIVE_ARGS : []),
     // 必须把目标地址作为启动标签一起传进去。只带 --no-first-run 时 Edge 仍会打开
     // 默认启动页（ntp.msn.cn/edge/ntp），该页加载中还会再做一次重定向，和随后的
     // page.goto 抢同一个 frame，Playwright 就会抛
@@ -824,24 +1087,35 @@ export async function launchManagedBrowser(options: {
     // attach 模式的 tools/browser-keeper.mjs 一直是这么传的，managed 模式此前漏了。
     options.url,
   ]
-  const child = spawn(executable, args, {
-    detached: false,
-    stdio: 'ignore',
-    windowsHide: false,
-  })
+  const child = (minimized ? await spawnBrowserMinimized(executable, args) : undefined)
+    ?? spawn(executable, args, {
+      detached: false,
+      stdio: 'ignore',
+      windowsHide: false,
+    })
   const endpoint = `http://127.0.0.1:${port}`
   for (let attempt = 0; attempt < 60; attempt++) {
     await new Promise(resolve => setTimeout(resolve, 1_000))
     try {
       const browser = await chromium.connectOverCDP(endpoint)
       const context = browser.contexts()[0]
-      if (context) return { browser, context, process: child, port }
+      if (context) {
+        writeManagedEndpoint(options.profileDir, { port, pid: child.pid, at: new Date().toISOString() })
+        return { browser, context, process: child, port }
+      }
       await browser.close().catch(() => {})
     } catch {
       // 浏览器启动器和 CDP 服务需要一点时间，继续等待。
     }
   }
   child.kill()
+  clearManagedEndpoint(options.profileDir)
+  // 最小化启动时 child 是 powershell，杀它不会带走浏览器；按 profile 清残留。
+  const killed = await killManagedBrowserProcesses({
+    profileDir: options.profileDir,
+    channel: options.channel,
+  }).catch(() => 0)
+  if (killed > 0) console.warn(`[deepseek-web] ${options.label}: 启动失败，已清理 ${killed} 个残留浏览器进程。`)
   throw new LlmError(
     `${options.label}: ${options.channel} 已启动，但 CDP ${port} 在 60 秒内未就绪。`,
     'BROWSER_MANAGED_START_FAILED',
@@ -1082,6 +1356,202 @@ export async function setBrowserWindowTopmost(options: {
       clearTimeout(timer)
       // $true 路径由参数写死（topmost 由调用方决定），这里只关心是否命中窗口
       resolve(code === 0 && out.trim() === '1')
+    })
+  })
+}
+
+/**
+ * 还原并激活插件专用的浏览器窗口。
+ *
+ * 最小化启动后，只有在「必须让人看」的时候才调用：检到未登录、即将抛
+ * `WEB_LOGIN_REQUIRED`。找不到窗口时静默返回 false，不影响主流程。
+ *
+ * 单靠 `SetForegroundWindow` 会被 Windows 前台锁拦下：实测窗口还原了，前台
+ * 仍是 DSH 主窗口。这里用 `AttachThreadInput` 临时挂到当前前台线程，再
+ * `HWND_TOPMOST` + `BringWindowToTop` + `SetForegroundWindow`，最后恢复普通
+ * 层级，尽量把登录页硬拽到最前面。
+ *
+ * 进程名按 `channel` 取，不再写死 msedge.exe——选 Chrome 时旧实现会静默失配。
+ *
+ * 返回值语义：`true` = 找到窗口且已抢到前台焦点；`false` = 没找到或没抢到。
+ */
+export async function restoreBrowserWindow(options: {
+  profileDir: string
+  channel: 'msedge' | 'chrome'
+}): Promise<boolean> {
+  if (process.platform !== 'win32') return false
+  const marker = String(options.profileDir ?? '').trim()
+  if (!marker) return false
+  const exeName = options.channel === 'chrome' ? 'chrome.exe' : 'msedge.exe'
+  const script = [
+    "$ErrorActionPreference='SilentlyContinue'",
+    `$marker = [string](ConvertFrom-Json ${psQuote(JSON.stringify(marker))})`,
+    `$ids = @(Get-CimInstance Win32_Process -Filter "Name='${exeName}'" | Where-Object { $_.CommandLine -like ('*' + $marker + '*') } | ForEach-Object { $_.ProcessId })`,
+    'if ($ids.Count -eq 0) { Write-Output "0"; exit }',
+    'Add-Type @"',
+    'using System;',
+    'using System.Runtime.InteropServices;',
+    'public class DshWinReveal {',
+    '  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);',
+    '  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);',
+    '  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
+    '  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
+    '  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);',
+    '  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);',
+    '  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+    '  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);',
+    '  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();',
+    '  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);',
+    '  [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool fAltTab);',
+    '  public static void Reveal(IntPtr h) {',
+    '    // SW_RESTORE 对最大化窗口等价于 SW_SHOWNORMAL，会把窗口缩回普通尺寸；',
+    '    // 只有最小化时才用 SW_RESTORE，其余保持原尺寸/最大化状态。',
+    '    if (IsIconic(h)) ShowWindow(h, 9); else ShowWindow(h, 5);',
+    '    IntPtr fg = GetForegroundWindow();',
+    '    uint fgThread = GetWindowThreadProcessId(fg, IntPtr.Zero);',
+    '    uint curThread = GetCurrentThreadId();',
+    '    bool attached = false;',
+    '    if (fgThread != 0 && fgThread != curThread) attached = AttachThreadInput(fgThread, curThread, true);',
+    '    SetWindowPos(h, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040);',
+    '    BringWindowToTop(h);',
+    '    SetForegroundWindow(h);',
+    '    if (attached) AttachThreadInput(fgThread, curThread, false);',
+    '  }',
+    '  public static void Retry(IntPtr h) {',
+    '    SwitchToThisWindow(h, true);',
+    '    SetForegroundWindow(h);',
+    '  }',
+    '  public static void Focus(IntPtr h) {',
+    '    IntPtr fg = GetForegroundWindow();',
+    '    uint fgThread = GetWindowThreadProcessId(fg, IntPtr.Zero);',
+    '    uint curThread = GetCurrentThreadId();',
+    '    bool attached = false;',
+    '    if (fgThread != 0 && fgThread != curThread) attached = AttachThreadInput(fgThread, curThread, true);',
+    '    BringWindowToTop(h);',
+    '    SetForegroundWindow(h);',
+    '    if (attached) AttachThreadInput(fgThread, curThread, false);',
+    '  }',
+    '  public static void DropTopmost(IntPtr h) {',
+    '    SetWindowPos(h, new IntPtr(-2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040);',
+    '  }',
+    '}',
+    '"@',
+    '$hit = 0',
+    'Get-Process -Id $ids | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object {',
+    '  if ([DshWinReveal]::IsWindowVisible($_.MainWindowHandle)) {',
+    '    [DshWinReveal]::Reveal($_.MainWindowHandle)',
+    '    $hit++',
+    '  }',
+    '}',
+    'if ($hit -eq 0) { Write-Output "0"; exit }',
+    'Start-Sleep -Milliseconds 300',
+    '$focused = $false',
+    '$fg = [DshWinReveal]::GetForegroundWindow().ToInt64()',
+    'Get-Process -Id $ids | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object {',
+    '  if ($fg -eq $_.MainWindowHandle.ToInt64()) { $focused = $true }',
+    '}',
+    'if (-not $focused) {',
+    '  Get-Process -Id $ids | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object {',
+    '    if ([DshWinReveal]::IsWindowVisible($_.MainWindowHandle)) { [DshWinReveal]::Retry($_.MainWindowHandle) }',
+    '  }',
+    '  Start-Sleep -Milliseconds 300',
+    '  $fg = [DshWinReveal]::GetForegroundWindow().ToInt64()',
+    '  Get-Process -Id $ids | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object {',
+    '    if ($fg -eq $_.MainWindowHandle.ToInt64()) { $focused = $true }',
+    '  }',
+    '}',
+    'Get-Process -Id $ids | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object {',
+    '  [DshWinReveal]::DropTopmost($_.MainWindowHandle)',
+    '}',
+    '# DropTopmost 可能让当前前台窗口接管焦点：恢复普通层级后再抢一次。',
+    '$focused = $false',
+    'Get-Process -Id $ids | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object {',
+    '  if ([DshWinReveal]::IsWindowVisible($_.MainWindowHandle)) { [DshWinReveal]::Focus($_.MainWindowHandle) }',
+    '}',
+    'Start-Sleep -Milliseconds 300',
+    '$fg = [DshWinReveal]::GetForegroundWindow().ToInt64()',
+    'Get-Process -Id $ids | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object {',
+    '  if ($fg -eq $_.MainWindowHandle.ToInt64()) { $focused = $true }',
+    '}',
+    '# 前台窗口由本进程设置；进程退出过早时系统会把前台还给原窗口。',
+    '# 多存活 2 秒，让焦点在调用方返回后仍然稳定；退出前再确认一次。',
+    'Start-Sleep -Milliseconds 2000',
+    '$focused = $false',
+    '$fg = [DshWinReveal]::GetForegroundWindow().ToInt64()',
+    'Get-Process -Id $ids | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object {',
+    '  if ($fg -eq $_.MainWindowHandle.ToInt64()) { $focused = $true }',
+    '}',
+    'if ($focused) { Write-Output "1" } else { Write-Output "2" }',
+  ].join('\n')
+  return await new Promise<boolean>(resolve => {
+    const child = spawnPowerShell(script)
+    let out = ''
+    const timer = setTimeout(() => {
+      child.kill()
+      console.warn('[deepseek-web] restoreBrowserWindow: 脚本执行超时（8s），已放弃并继续主流程。')
+      resolve(false)
+    }, 8_000)
+    child.stdout?.on('data', chunk => { out += String(chunk) })
+    child.on('error', error => {
+      clearTimeout(timer)
+      console.warn('[deepseek-web] restoreBrowserWindow: 无法启动 powershell.exe：', error.message)
+      resolve(false)
+    })
+    child.on('close', code => {
+      clearTimeout(timer)
+      const status = out.trim()
+      if (code === 0 && status === '1') {
+        resolve(true)
+        return
+      }
+      if (code === 0 && status === '2') {
+        console.warn('[deepseek-web] restoreBrowserWindow: 窗口已找到，但未抢到前台焦点。')
+      }
+      resolve(false)
+    })
+  })
+}
+
+/**
+ * 兜底关闭某个 profile 关联的全部浏览器进程。
+ *
+ * 最小化启动走 `Start-Process` 后，插件手上只有 powershell 的句柄，拿不到浏览器 PID；
+ * CDP 60 秒未就绪时必须按 profile 特征把残留的 Edge/Chrome 收掉，否则它会占住
+ * profile 与调试端口，下一次启动直接连到半死的实例。
+ */
+export async function killManagedBrowserProcesses(options: {
+  profileDir: string
+  channel: 'msedge' | 'chrome'
+}): Promise<number> {
+  if (process.platform !== 'win32') return 0
+  const marker = String(options.profileDir ?? '').trim()
+  if (!marker) return 0
+  const exeName = options.channel === 'chrome' ? 'chrome.exe' : 'msedge.exe'
+  const script = [
+    "$ErrorActionPreference='SilentlyContinue'",
+    `$marker = [string](ConvertFrom-Json ${psQuote(JSON.stringify(marker))})`,
+    `$ids = @(Get-CimInstance Win32_Process -Filter "Name='${exeName}'" | Where-Object { $_.CommandLine -like ('*' + $marker + '*') } | ForEach-Object { $_.ProcessId })`,
+    'if ($ids.Count -eq 0) { Write-Output "0"; exit }',
+    '$n = 0',
+    '$ids | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue; $n++ }',
+    'Write-Output "$n"',
+  ].join('\n')
+  return await new Promise<number>(resolve => {
+    const child = spawnPowerShell(script)
+    let out = ''
+    const timer = setTimeout(() => {
+      child.kill()
+      resolve(0)
+    }, 5_000)
+    child.stdout?.on('data', chunk => { out += String(chunk) })
+    child.on('error', () => {
+      clearTimeout(timer)
+      resolve(0)
+    })
+    child.on('close', () => {
+      clearTimeout(timer)
+      const parsed = Number.parseInt(out.trim(), 10)
+      resolve(Number.isFinite(parsed) ? parsed : 0)
     })
   })
 }
